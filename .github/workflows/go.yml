@@ -1,5 +1,7 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+# Build and test every push to main and every pull request. On a push to
+# main whose VERSION file holds a version not released yet (no tag
+# v<version>), also tag that commit and publish a GitHub release with the
+# archives of every platform. An unchanged VERSION only builds.
 
 name: Go
 
@@ -9,20 +11,90 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+
 jobs:
 
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: '1.27'
+        go-version-file: go.mod
 
-    - name: Build
-      run: go build -v ./...
+    - name: Version
+      id: version
+      run: |
+        version=$(tr -d '[:space:]' < VERSION)
+        if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+          echo "::error file=VERSION::invalid version '$version': expected MAJOR.MINOR or MAJOR.MINOR.PATCH"
+          exit 1
+        fi
+        release=false
+        if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+          # --exit-code: 0 = tag exists, 2 = no such tag, else a git error.
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null || rc=$?
+          case $rc in
+            0) echo "v$version is already released: build only" ;;
+            2) echo "v$version is new: it will be released"; release=true ;;
+            *) echo "::error::cannot list the tags of origin (git exit code $rc)"; exit 1 ;;
+          esac
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "release=$release" >> "$GITHUB_OUTPUT"
 
-    - name: Test
-      run: go test -v ./...
+    # vet, gofmt check and tests, then every platform.
+    - name: Check
+      run: make check
+
+    - name: Build and package
+      run: make package
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: snmp-poller-${{ steps.version.outputs.version }}
+        path: |
+          dist/*.tar.gz
+          dist/*.zip
+          dist/SHA256SUMS
+        if-no-files-found: error
+
+  release:
+    needs: build
+    if: needs.build.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag and the release
+    # Releases never run concurrently, so two quick pushes cannot race.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: snmp-poller-${{ needs.build.outputs.version }}
+        path: dist
+
+    - name: Create tag and release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: v${{ needs.build.outputs.version }}
+      run: |
+        # Checked again: another run may have released it meanwhile.
+        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "$TAG already released"
+          exit 0
+        fi
+        gh release create "$TAG" dist/* \
+          --repo "$GITHUB_REPOSITORY" \
+          --target "$GITHUB_SHA" \
+          --title "snmp-poller $TAG" \
+          --generate-notes

@@ -968,9 +968,10 @@ make              # vet, gofmt check and tests, then cross-build every platform 
 make dist         # cross-build every platform, without the checks
 make build        # this machine only: ./snmp-poller
 make check        # go vet, gofmt check, go test
+make package      # dist, then release archives and SHA256SUMS in dist/
 make clean        # remove dist/ and ./snmp-poller
 make help         # list targets
-make VERSION=1.2.3          # set the version printed by -version
+make VERSION=1.2.3          # override the version of the VERSION file
 go test -race ./...         # with the race detector (needs a C compiler)
 ```
 
@@ -992,5 +993,31 @@ credentials and the scheduler. The Vault client is tested against a fake Vault H
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
 | `etc/snmp-poller.yaml` | Default configuration. |
 | `etc/conf.d/` | Shipped capabilities (`system`, `interfaces`, `entity`). |
+
+### Versions and releases
+
+The version is in the `VERSION` file (`MAJOR.MINOR` or `MAJOR.MINOR.PATCH`, currently `0.1`).
+`snmp-poller -version` prints it with the git commit it was built from:
+`snmp-poller 0.1 (commit 10d59ad)`.
+
+GitHub Actions (`.github/workflows/go.yml`) runs on every push to `main` and every pull
+request: `make check`, then `make package`, with the archives kept as a build artifact. On a
+push to `main`, if no tag `v<VERSION>` exists yet, it also creates that tag on the pushed commit
+and a GitHub release named `snmp-poller v<VERSION>`, with release notes generated from the
+commits and pull requests since the previous release, and these files:
+
+| File | Content |
+|------|---------|
+| `snmp-poller-<version>-linux-amd64.tar.gz`, `-linux-arm64.tar.gz` | Linux |
+| `snmp-poller-<version>-darwin-amd64.tar.gz`, `-darwin-arm64.tar.gz` | macOS (Intel, Apple silicon) |
+| `snmp-poller-<version>-windows-amd64.zip`, `-windows-arm64.zip` | Windows |
+| `SHA256SUMS` | Checksums of the archives (`sha256sum -c SHA256SUMS`) |
+
+Each archive holds a `snmp-poller-<version>-<os>-<arch>/` directory with the binary, `etc/`
+(the configuration and `conf.d`), `README.md` and `LICENSE`, taken from the commit.
+
+To release: change `VERSION` (e.g. `0.2`) and push to `main`. Pushing without changing
+`VERSION` only builds and tests. A failing check releases nothing; once fixed, the next push
+releases that version. An invalid `VERSION` fails the build.
 
 New output types implement `output.Output` and call `output.Register` from an `init` function.

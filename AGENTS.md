@@ -8,8 +8,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 
 - **Language**: Go only. Build: `make` (default = `make check`, i.e. vet + gofmt + tests, then
   `make dist`: all platforms into `dist/`, linux, windows, darwin x amd64, arm64; static,
-  CGO_ENABLED=0, version from git describe; a failing check builds nothing), `make dist`
-  (without checks), `make build` (host). Plain `go build ./cmd/snmp-poller` / `go test ./...` work too.
+  CGO_ENABLED=0; a failing check builds nothing), `make dist` (without checks), `make package`
+  (archives with etc/ from the git commit + SHA256SUMS), `make build` (host).
+- **Version and releases**: version in `VERSION` (MAJOR.MINOR[.PATCH]), embedded with the commit
+  (`-version`). CI (`.github/workflows/go.yml`) builds every push/PR; a push to main whose
+  version has no tag `v<version>` yet creates the tag and a GitHub release with the archives.
+  Unchanged VERSION = build only. Never create release tags by hand for unreleased versions. Plain `go build ./cmd/snmp-poller` / `go test ./...` work too.
 - **Configuration**: YAML. Default file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
   The main file holds process settings, outputs, `vault` and devices only: **no SNMP metric
   definitions** (no profiles, no inline sets, no named credentials: reuse = YAML anchors). What to poll lives in `global.conf_dir`

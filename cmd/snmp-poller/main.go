@@ -17,8 +17,12 @@ import (
 	"github.com/airtg-io/snmp-poller/internal/poller"
 )
 
-// version is set at build time with -ldflags "-X main.version=...".
-var version = "dev"
+// version (the VERSION file) and commit are set at build time by the
+// Makefile with -ldflags "-X main.version=... -X main.commit=...".
+var (
+	version = "dev"
+	commit  = "unknown"
+)
 
 func main() {
 	os.Exit(run())
@@ -33,7 +37,7 @@ func run() int {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("snmp-poller", version)
+		fmt.Printf("snmp-poller %s (commit %s)\n", version, commit)
 		return 0
 	}
 
@@ -74,7 +78,7 @@ func run() int {
 		return 1
 	}
 	defer log.Close()
-	log.Info("starting AIrtg snmp-poller", "version", version, "config", *path)
+	log.Info("starting AIrtg snmp-poller", "version", version, "commit", commit, "config", *path)
 
 	// Encrypt the clear-text credentials of the (valid) configuration file.
 	// A read-only file is not fatal: polling works, the file stays in clear.
