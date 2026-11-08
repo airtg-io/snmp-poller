@@ -34,5 +34,7 @@ go.work.sum
 
 # snmp-poller runtime files
 /snmp-poller
+/snmp-poller.exe
+/dist/
 /data/
 /logs/

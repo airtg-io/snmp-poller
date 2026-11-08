@@ -83,11 +83,13 @@ func TestSaveDropsUnseenKeysAndResets(t *testing.T) {
 	}
 
 	store.SaveDiscovery("other", map[string]string{"x": "y"})
+	os.WriteFile(filepath.Join(dir, "key.dat"), []byte("k"), 0o600)
 	if err := store.Clean(); err != nil {
 		t.Fatal(err)
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Errorf("Clean left %d entries", len(entries))
+	// Device directories go, files (the credentials key) stay.
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 || entries[0].Name() != "key.dat" {
+		t.Errorf("Clean left %v, want key.dat only", entries)
 	}
 }
 

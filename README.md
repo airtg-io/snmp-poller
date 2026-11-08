@@ -4,7 +4,10 @@ A fast, free and open source SNMP poller for AIrtg, written in Go.
 
 - SNMP **v1**, **v2c** and **v3** (noAuthNoPriv, authNoPriv, authPriv; MD5, SHA, SHA-224, SHA-256,
   SHA-384, SHA-512; DES, AES-128, AES-192, AES-256 in both Blumenthal and Reeder/Cisco variants),
-  **contexts**, UDP and TCP.
+  **contexts**, UDP and TCP, GETBULK or GETNEXT walks, per device.
+- **Credentials encrypted at rest**: community strings and passwords written in clear text are
+  encrypted in place in the configuration file on startup (`~~HEX~~`, AES-256-GCM, key in
+  `data/key.dat`), or read from **HashiCorp Vault** and refreshed at every discovery.
 - **Capabilities**: what to poll lives in `etc/conf.d/`, one file per capability (system group,
   interfaces, inventory, ...). Discovery finds which capabilities each device has, and every one
   found is polled unless the device excludes it.
@@ -37,17 +40,28 @@ Licensed under the GNU GPL v3 (see [LICENSE](LICENSE)).
 Requires Go 1.27 or later.
 
 ```sh
-go build -o snmp-poller ./cmd/snmp-poller
+make build                               # or: go build -o snmp-poller ./cmd/snmp-poller
 ./snmp-poller -check                     # validate etc/snmp-poller.yaml and etc/conf.d, and exit
 ./snmp-poller                            # run with etc/snmp-poller.yaml
 ./snmp-poller -config /path/to/file.yaml # run with another file
+./snmp-poller -encrypt foobar            # encrypt a credential by hand, see below
 ./snmp-poller -version
 ```
+
+`make` alone runs the checks (`go vet`, gofmt, tests), then builds every platform into `dist/`
+(`make dist` skips the checks): `snmp-poller-linux-amd64`,
+`snmp-poller-linux-arm64`, `snmp-poller-windows-amd64.exe`, `snmp-poller-windows-arm64.exe`,
+`snmp-poller-darwin-amd64` (Intel Mac) and `snmp-poller-darwin-arm64` (Apple silicon). They are
+static binaries with no dependency: copy one with the `etc/` directory and run it.
 
 Stop with `Ctrl-C` or `SIGTERM`: in-flight polls get `global.shutdown_timeout` to finish.
 
 Relative paths (`data_dir`, log file) are relative to the working directory, except
 `conf_dir`, which is relative to the directory of the configuration file.
+
+On startup, once the configuration is valid, clear-text credentials in the configuration file
+are [encrypted in place](#credentials-encryption) with the key `data/key.dat`, generated on
+first start. `-check` never modifies anything.
 
 ## How it works
 
@@ -58,17 +72,19 @@ polled when its next slot comes, that slot is skipped and counted as `skipped`.
 Each poll:
 
 1. **Discovery**, when due: on the first poll, then every `discovery_interval`.
-   1. **Capabilities**: every capability of `conf_dir` not excluded by the device is a
+   1. **Credentials**: a device using [Vault](#vault) reads its secret again. If Vault fails,
+      the previous credentials are kept (a device that never got any fails its poll).
+   2. **Capabilities**: every capability of `conf_dir` not excluded by the device is a
       candidate. One without `detect` applies to every device. One with `detect` applies when
       every listed OID subtree exists on the agent (one GETNEXT each).
-   2. The discovery scalars of those capabilities are fetched (`sysDescr`, `sysObjectID`,
+   3. The discovery scalars of those capabilities are fetched (`sysDescr`, `sysObjectID`,
       `sysUpTime`, `sysContact`, `sysName`, `sysLocation` with the shipped `system`
       capability) and their discovery columns are walked (e.g. `ifDescr`, `ifSpeed`).
-   3. Table rows are selected from the label column and the `include` patterns. For
+   4. Table rows are selected from the label column and the `include` patterns. For
       `high_capacity` tables (the shipped `interfaces`), the probe OID is fetched for the first
       row: if the agent answers, rows faster than `above` use their 64-bit `hc_oid` columns
       (never over SNMPv1, which cannot carry 64-bit counters).
-   4. The result is saved to `data/<device_id>/discovery.json`. Every poll reads it back from
+   5. The result is saved to `data/<device_id>/discovery.json`. Every poll reads it back from
       there until the next discovery (it is not kept in memory). If the file is missing or
       corrupt, the device is rediscovered.
 
@@ -76,8 +92,8 @@ Each poll:
    A failed discovery fails the poll and is retried on the next poll.
 2. **Collection** of the metrics of the device's capabilities: scalars and labelled table
    rows are fetched with GET requests of at most `max_oids_per_request` OIDs. Tables without
-   a label are walked (GETBULK on v2c/v3, GETNEXT on v1) and filtered by row index. OIDs the
-   agent does not have are skipped.
+   a label are walked (GETBULK by default, GETNEXT with `walk: getnext` and always on v1) and
+   filtered by row index. OIDs the agent does not have are skipped.
 3. **Computation**: for every value, each configured mode is emitted:
    - `raw`: the value as returned (integer, unsigned, float or string).
    - `volume`: `v2 - v1`.
@@ -94,7 +110,7 @@ Each poll:
 ## Configuration reference
 
 The configuration is YAML: the main file (`etc/snmp-poller.yaml`) holds the process settings,
-outputs, credentials and devices, and `etc/conf.d/` holds what to poll, one
+outputs, Vault and devices (with their credentials), and `etc/conf.d/` holds what to poll, one
 [capability](#capabilities) per file. Unknown keys are rejected, so typos are caught by `-check`.
 Durations use Go syntax: `500ms`, `30s`, `5m`, `1h`.
 
@@ -110,7 +126,9 @@ Durations use Go syntax: `500ms`, `30s`, `5m`, `1h`.
 | `max_oids_per_request` | `30` | Default varbinds per GET (1-128). Requests are split automatically, and halved if the agent answers `tooBig`. |
 | `max_repetitions` | `25` | Default GETBULK max-repetitions for walks (v2c/v3). |
 | `port` | `161` | Default agent port. |
-| `data_dir` | `data` | On-disk state directory. Wiped on startup. |
+| `transport` | `udp` | Default transport: `udp` or `tcp`. |
+| `walk` | `bulk` | Default walk method: `bulk` (GETBULK) or `getnext` (GETNEXT, one OID per request, for agents with a broken GETBULK). SNMPv1 has no GETBULK: v1 devices always use `getnext`. |
+| `data_dir` | `data` | On-disk state directory. Device directories are wiped on startup; the credentials key `key.dat` is kept. |
 | `conf_dir` | `conf.d` | [Capabilities](#capabilities) directory. Relative to the directory of the configuration file (`etc/conf.d` by default). |
 | `stats_interval` | `1m` | Interval of the stats log line. |
 | `shutdown_timeout` | `30s` | Grace period for in-flight polls on shutdown. |
@@ -153,40 +171,17 @@ A list of destinations. With no `outputs` section, a single `null` output named 
 
 Devices send to every output by default, or to the subset listed in their `outputs`.
 
-### `credentials`
-
-Named, reusable SNMP settings (`name: { ... }`), referenced by devices with `credential:`.
-A device's inline `snmp:` block can be used instead, or on top of a credential to override
-some of its fields. Credentials are only validated when a device uses them.
-
-| Key | Applies to | Description |
-|-----|------------|-------------|
-| `version` | all | `1`, `2c` or `3` (also `v1`, `v2`, `v2c`, `v3`). Required. |
-| `transport` | all | `udp` (default) or `tcp`. |
-| `community` | v1, v2c | Community string. Required for v1/v2c. |
-| `username` | v3 | USM user name. Required for v3. |
-| `security_level` | v3 | `noAuthNoPriv`, `authNoPriv` or `authPriv`. Inferred when omitted: `authPriv` if `priv_protocol` is set, `authNoPriv` if `auth_protocol` is set, else `noAuthNoPriv`. |
-| `auth_protocol` | v3 | `MD5`, `SHA` (SHA-1), `SHA224`, `SHA256`, `SHA384`, `SHA512`. Case and dashes are ignored (`sha-256` works). |
-| `auth_passphrase` | v3 | At least 8 characters. |
-| `priv_protocol` | v3 | `DES`, `AES` (AES-128), `AES192`, `AES256` (Blumenthal key extension, used by net-snmp and most vendors), `AES192C`, `AES256C` (Reeder key extension, used by Cisco). |
-| `priv_passphrase` | v3 | At least 8 characters. |
-| `context_name` | v3 | SNMPv3 context name (e.g. a VRF or a bridge domain). |
-| `context_engine_id` | v3 | Context engine ID as hex (`80001f8880...`, optional `0x`). Defaults to the agent's engine ID. |
-
-**Secrets** (`community`, `auth_passphrase`, `priv_passphrase`) can reference environment
-variables with `${NAME}`, so they do not have to be stored in the file. They are never written
-to logs, error messages or data files.
-
 ### `devices`
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `id` | | Unique id (letters, digits, `.`, `_`, `-`). Used in logs and as the data directory name. |
-| `address` | | Hostname, IPv4 or IPv6 address. |
+| `id` | `<address>-<port>` | Unique id (letters, digits, `.`, `_`, `-`). Used in logs and as the data directory name. Without one, `192.0.2.10` on port 161 is `192.0.2.10-161`; other characters (IPv6 colons) become `_`: `2001_db8__1-161`. `key.dat` is reserved. |
+| `address` | | Hostname, IPv4 or IPv6 address. Required. Two devices may not use the same address and port (IPs compared in canonical form, host names case-insensitively, without DNS resolution), unless they poll two different SNMPv3 contexts. |
 | `port` | `global.port` | Agent port. |
+| `transport` | `global.transport` | `udp` or `tcp`. |
+| `walk` | `global.walk` | `bulk` or `getnext`. `bulk` on an SNMPv1 device is an error. |
 | `enabled` | `true` | `false` keeps the device in the file without polling it. |
-| `credential` | | Name of a `credentials` entry. |
-| `snmp` | | Inline SNMP settings (same keys as `credentials`); overrides `credential` fields. |
+| `snmp` | | SNMP version and credentials, see below. Required. |
 | `exclude` | | Capabilities never applied to this device, e.g. `[entity]`. Every other capability is polled when discovery finds it. |
 | `include` | | Per-table override of the capability's `include` patterns, e.g. `{ interfaces: ["^Gi"] }`. |
 | `poll_interval` | `global.poll_interval` | |
@@ -195,6 +190,121 @@ to logs, error messages or data files.
 | `max_oids_per_request`, `max_repetitions` | global | |
 | `outputs` | all outputs | Output names to send to. |
 | `trace` | `false` | Log debug details for this device only, whatever the global level. |
+
+### `devices[].snmp`
+
+SNMPv1 and v2c use a community string. SNMPv3 uses a username, a security level, and the
+authentication and privacy protocols and passwords.
+
+| Key | Applies to | Description |
+|-----|------------|-------------|
+| `version` | all | `1`, `2c` or `3` (also `v1`, `v2`, `v2c`, `v3`). Required. |
+| `community` | v1, v2c | Community string. Required for v1/v2c. |
+| `username` | v3 | USM user name. Required for v3. |
+| `security_level` | v3 | `noAuthNoPriv`, `authNoPriv` or `authPriv`. Inferred when omitted: `authPriv` if `priv_protocol` is set, `authNoPriv` if `auth_protocol` is set, else `noAuthNoPriv`. |
+| `auth_protocol` | v3 | `MD5`, `SHA` (SHA-1), `SHA224`, `SHA256`, `SHA384`, `SHA512`. Case and dashes are ignored (`sha-256` works). |
+| `auth_password` | v3 | At least 8 characters. |
+| `priv_protocol` | v3 | `DES`, `AES` (AES-128), `AES192`, `AES256` (Blumenthal key extension, used by net-snmp and most vendors), `AES192C`, `AES256C` (Reeder key extension, used by Cisco). |
+| `priv_password` | v3 | At least 8 characters. Defaults to `auth_password`, like net-snmp's `createUser`. |
+| `context_name` | v3 | SNMPv3 context name (e.g. a VRF or a bridge domain). |
+| `context_engine_id` | v3 | Context engine ID as hex (`80001f8880...`, optional `0x`). Defaults to the agent's engine ID. |
+| `vault` | all | Read the keys above from [Vault](#vault): `true` for the secret `<vault.prefix>/<device id>`, or a secret path (relative to the KV mount). |
+
+Many devices can share one block with a YAML anchor (`snmp: &campus { ... }` on the first
+device, `snmp: *campus` on the others), see [the example](#shared-credentials).
+
+### Credentials encryption
+
+Credentials (`community`, `auth_password`, `priv_password`, and the Vault `token`,
+`secret_id` and `password`) are written in one of three ways:
+
+- **Clear text**: on startup, once the whole configuration is valid, the value is encrypted
+  and written back to the configuration file in place of the clear text. Only the values
+  change: comments and layout are kept, and the file is replaced atomically, keeping its
+  permissions. Encrypted values are on one line, so a credential written as a block scalar
+  (`|`, `>`) is reported and left as is.
+- **Encrypted**: `~~` + hex digit pairs + `~~`, for example `~~9F3A...C2~~`: AES-256-GCM
+  (random nonce, authenticated) with the 32-byte key `<data_dir>/key.dat`. A value that does
+  not match this pattern exactly is clear text, and gets encrypted.
+- **Environment reference**: `${NAME}` is read from the environment on startup and never
+  rewritten.
+
+The key is generated on first start (mode `0600`) and kept when the data directory is
+cleaned. **Back it up**: encrypted values cannot be read without it, and a missing or other
+key makes the configuration invalid (`credentials are encrypted but the key data/key.dat does
+not exist`, `cannot decrypt credential: it was encrypted with another key`). To change a
+credential, write the new value in clear text: it is encrypted on the next start.
+
+When the file cannot be written (read-only mount), the poller logs a warning and runs with
+the credentials as they are. `-check` validates but never encrypts or creates the key.
+
+#### Encrypting a credential by hand
+
+To never write a credential in clear text, even briefly (read-only configuration, generated
+or templated files), encrypt it yourself and paste the result. The value can be given three
+ways:
+
+```sh
+$ ./snmp-poller -encrypt foobar              # as an argument
+~~DE25456B...C1C867E~~
+$ echo foobar | ./snmp-poller -encrypt       # piped: the first line, without its line ending
+~~8F7B2C6F...7576030F8~~
+$ ./snmp-poller -encrypt                     # typed twice, without echo
+Value to encrypt:
+Again:
+~~E086AC64...CCF8406948~~
+```
+
+An argument is the quickest, but it is visible in your shell history and, while the command
+runs, to other users through the process list: prefer the prompt on shared machines, and a
+pipe from a variable or a secret manager in scripts
+(`printf '%s\n' "$COMMUNITY" | ./snmp-poller -encrypt`). Quote a value with spaces or shell
+characters (`-encrypt 'my pa$$word'`), and put flags before it: `-encrypt -key k.dat foobar`.
+
+The key is `<global.data_dir>/key.dat` of the configuration file given by `-config` (default
+`etc/snmp-poller.yaml`, so `data/key.dat`), or the file given by `-key`. It is generated when
+missing, as on startup; encrypt with the key of the machine that runs the poller (or copy that
+key file). Each run gives a different output for the same value (random nonce); all of them
+decrypt to it.
+
+The output goes on stdout, messages on stderr. Put it in place of the clear-text value, e.g.
+`community: ~~3F0C9A51...D27B~~`.
+
+### `vault`
+
+[HashiCorp Vault](https://developer.hashicorp.com/vault) as an external store for device
+credentials. A device opts in with `snmp: { vault: true }` (or a path). Its secret is a KV
+secret whose keys are those of [`snmp`](#devicessnmp) (`version`, `community`, `username`,
+`security_level`, `auth_protocol`, `auth_password`, `priv_protocol`, `priv_password`,
+`context_name`, `context_engine_id`); any other key is an error. Secret keys override the same
+keys of the device's `snmp` block, so non-secret settings can stay in the file.
+
+The secret is read on every discovery (the first poll, then every `discovery_interval`, and
+every poll while discovery fails), so rotated credentials are picked up without a restart.
+It is kept in memory only. If Vault fails, the device keeps its previous credentials and a
+warning is logged.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `address` | | Vault URL, `http://` or `https://`. Required. |
+| `namespace` | | Vault Enterprise namespace. |
+| `mount` | `secret` | Mount path of the KV secrets engine. |
+| `kv_version` | `2` | KV engine version: `1` or `2`. |
+| `prefix` | `snmp-poller` | Parent path of the default secret of each device: `<mount>/<prefix>/<device id>`. |
+| `timeout` | `10s` | Timeout of one Vault request. |
+| `ca_cert` | system CAs | PEM file of the CA that signed Vault's certificate. |
+| `tls_skip_verify` | `false` | Do not verify Vault's certificate (tests only). |
+| `auth.method` | | `token`, `approle`, `userpass` or `kubernetes`. Required. |
+| `auth.mount` | method name | Mount path of the auth method. |
+| `auth.token` | | `token`: the Vault token (encrypted like other credentials). |
+| `auth.role_id`, `auth.secret_id` | | `approle`: role ID and secret ID (encrypted). |
+| `auth.username`, `auth.password` | | `userpass`: user name and password (encrypted). |
+| `auth.role` | | `kubernetes`: Vault role bound to the pod's service account. |
+| `auth.jwt_file` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | `kubernetes`: service account token, read at each login. |
+
+The poller logs in once for all devices and logs in again at 3/4 of the token's TTL, or when
+Vault rejects the token. The Vault section is only checked for the credentials it needs when an
+enabled device uses it.
 
 ## Capabilities
 
@@ -349,15 +459,41 @@ shipped in `etc/conf.d` (the test suite validates each of them).
 
 ```yaml
 devices:
-  - id: core-sw1
-    address: 192.0.2.10
+  - address: 192.0.2.10        # id: 192.0.2.10-161
     snmp:
       version: 2c
-      community: ${SNMP_COMMUNITY}
+      community: public        # encrypted in this file on startup
 ```
 
-Run it with `SNMP_COMMUNITY=... ./snmp-poller -config etc/minimal.yaml`: the device gets every
-capability of `etc/conf.d` it supports (system group, interfaces, inventory).
+Run it with `./snmp-poller -config etc/minimal.yaml`: the device gets every capability of
+`etc/conf.d` it supports (system group, interfaces, inventory). After the first start, the file
+reads `community: ~~6A0F...E1~~` (see [Credentials encryption](#credentials-encryption)).
+
+### Device ids
+
+`id` is optional and defaults to `<address>-<port>`. Set one for a stable, readable name in
+logs, outputs and the data directory.
+
+```yaml
+global:
+  port: 1161                   # default port for every device
+
+devices:
+  - address: 192.0.2.11        # id: 192.0.2.11-1161
+    snmp: { version: 2c, community: public }
+  - address: 192.0.2.11        # same address, other port: id 192.0.2.11-161
+    port: 161
+    snmp: { version: 2c, community: public }
+  - address: "2001:db8::12"    # id: 2001_db8__12-1161
+    snmp: { version: 2c, community: public }
+  - id: core-rtr1              # explicit id
+    address: core-rtr1.example.net
+    snmp: { version: 2c, community: public }
+```
+
+The same address and port twice (for example `10.0.0.1` and `::ffff:10.0.0.1`, or
+`Router.example.net` and `router.example.net`) is an invalid configuration, except for
+[SNMPv3 contexts](#snmpv3-contexts).
 
 ### SNMPv1
 
@@ -367,24 +503,41 @@ devices:
     address: 192.0.2.20
     snmp:
       version: 1
-      community: ${SNMP_COMMUNITY}
+      community: ${SNMP_COMMUNITY}   # from the environment, never rewritten
     exclude: [interfaces]    # nothing useful there on this UPS
 ```
 
 On v1, OIDs the agent does not have are removed from the request and retried, so one
-unsupported OID does not hide the others.
+unsupported OID does not hide the others. Walks always use GETNEXT (v1 has no GETBULK).
 
-### SNMPv2c over TCP, custom port
+### TCP transport, custom port
 
 ```yaml
+global:
+  transport: udp               # the default, for every device
+
 devices:
   - id: firewall
     address: fw.example.net
     port: 1161
-    snmp:
-      version: 2c
-      transport: tcp
-      community: ${SNMP_COMMUNITY}
+    transport: tcp
+    snmp: { version: 2c, community: public }
+```
+
+### Walk method: GETBULK or GETNEXT
+
+Tables are walked with GETBULK (`max_repetitions` OIDs per request) by default. Agents with a
+broken GETBULK implementation can be walked with GETNEXT, one OID per request.
+
+```yaml
+global:
+  walk: bulk                   # the default, for every device
+
+devices:
+  - id: old-printer
+    address: 192.0.2.25
+    walk: getnext
+    snmp: { version: 2c, community: public }
 ```
 
 ### SNMPv3 noAuthNoPriv
@@ -409,7 +562,7 @@ devices:
       username: monitor
       security_level: authNoPriv
       auth_protocol: SHA256
-      auth_passphrase: ${SNMP_AUTH_PASS}
+      auth_password: change-me-auth
 ```
 
 ### SNMPv3 authPriv, every protocol
@@ -419,56 +572,205 @@ All combinations of `auth_protocol` (`MD5`, `SHA`, `SHA224`, `SHA256`, `SHA384`,
 `security_level` is inferred as `authPriv` here.
 
 ```yaml
-credentials:
-  v3-md5-des:
-    { version: 3, username: mon, auth_protocol: MD5, auth_passphrase: "${SNMP_AUTH_PASS}", priv_protocol: DES, priv_passphrase: "${SNMP_PRIV_PASS}" }
-  v3-sha-aes128:
-    { version: 3, username: mon, auth_protocol: SHA, auth_passphrase: "${SNMP_AUTH_PASS}", priv_protocol: AES, priv_passphrase: "${SNMP_PRIV_PASS}" }
-  v3-sha256-aes256:
-    { version: 3, username: mon, auth_protocol: SHA256, auth_passphrase: "${SNMP_AUTH_PASS}", priv_protocol: AES256, priv_passphrase: "${SNMP_PRIV_PASS}" }
-  v3-sha512-aes192:
-    { version: 3, username: mon, auth_protocol: SHA512, auth_passphrase: "${SNMP_AUTH_PASS}", priv_protocol: AES192, priv_passphrase: "${SNMP_PRIV_PASS}" }
-  # Cisco devices using AES-192/256 need the Reeder key extension:
-  v3-cisco-aes256:
-    { version: 3, username: mon, auth_protocol: SHA, auth_passphrase: "${SNMP_AUTH_PASS}", priv_protocol: AES256C, priv_passphrase: "${SNMP_PRIV_PASS}" }
-
 devices:
-  - { id: r1, address: 192.0.2.41, credential: v3-md5-des }
-  - { id: r2, address: 192.0.2.42, credential: v3-sha-aes128 }
-  - { id: r3, address: 192.0.2.43, credential: v3-sha256-aes256 }
-  - { id: r4, address: 192.0.2.44, credential: v3-sha512-aes192 }
-  - { id: r5, address: 192.0.2.45, credential: v3-cisco-aes256 }
+  - id: r1
+    address: 192.0.2.41
+    snmp: { version: 3, username: mon, auth_protocol: MD5, auth_password: change-me-auth, priv_protocol: DES, priv_password: change-me-priv }
+  - id: r2
+    address: 192.0.2.42
+    snmp: { version: 3, username: mon, auth_protocol: SHA, auth_password: change-me-auth, priv_protocol: AES, priv_password: change-me-priv }
+  - id: r3
+    address: 192.0.2.43
+    snmp: { version: 3, username: mon, auth_protocol: SHA256, auth_password: change-me-auth, priv_protocol: AES256, priv_password: change-me-priv }
+  - id: r4                     # priv_password defaults to auth_password
+    address: 192.0.2.44
+    snmp: { version: 3, username: mon, auth_protocol: SHA512, auth_password: change-me-auth, priv_protocol: AES192 }
+  - id: r5                     # Cisco AES-192/256 need the Reeder key extension
+    address: 192.0.2.45
+    snmp: { version: 3, username: mon, auth_protocol: SHA, auth_password: "${SNMP_AUTH_PASS}", priv_protocol: AES256C, priv_password: "${SNMP_PRIV_PASS}" }
+```
+
+### Shared credentials
+
+A YAML anchor (`&name`) on the first `snmp` block, and an alias (`*name`) on the others,
+share one set of credentials. It is encrypted once, where the anchor is.
+
+```yaml
+devices:
+  - id: bldg1-sw1
+    address: 192.0.2.101
+    snmp: &campus
+      version: 3
+      username: monitor
+      auth_protocol: SHA256
+      auth_password: change-me-auth
+      priv_protocol: AES
+      priv_password: change-me-priv
+  - id: bldg1-sw2
+    address: 192.0.2.102
+    snmp: *campus
+    poll_interval: 5m
+    timeout: 10s
+    retries: 3
+  - id: bldg2-sw1
+    address: 192.0.2.103
+    snmp: *campus
 ```
 
 ### SNMPv3 contexts
 
-One device can be polled once per context, e.g. per VRF or per bridge instance: each context
-is a separate device, with its own discovery. `context_engine_id` is only needed by agents that
-proxy other engines.
+One agent can be polled once per context, e.g. per VRF or per bridge instance: each context
+is a separate device, with its own id and discovery. This is the only case where two devices
+may share an address and port. `context_engine_id` is only needed by agents that proxy other
+engines.
 
 ```yaml
-credentials:
-  v3:
-    version: 3
-    username: mon
-    auth_protocol: SHA256
-    auth_passphrase: ${SNMP_AUTH_PASS}
-    priv_protocol: AES
-    priv_passphrase: ${SNMP_PRIV_PASS}
-
 devices:
   - id: sw1-vlan10
     address: 192.0.2.50
-    credential: v3
-    snmp: { context_name: vlan-10 }
+    snmp: &v3
+      version: 3
+      username: mon
+      auth_protocol: SHA256
+      auth_password: change-me-auth
+      priv_protocol: AES
+      context_name: vlan-10
   - id: sw1-vlan20
     address: 192.0.2.50
-    credential: v3
-    snmp: { context_name: vlan-20 }
+    snmp: { version: 3, username: mon, auth_protocol: SHA256, auth_password: change-me-auth, priv_protocol: AES, context_name: vlan-20 }
   - id: proxied-engine
     address: 192.0.2.51
-    credential: v3
-    snmp: { context_name: remote, context_engine_id: "0x80001f888056dc3e5f5b6d2c61" }
+    snmp: { version: 3, username: mon, auth_protocol: SHA256, auth_password: change-me-auth, priv_protocol: AES, context_name: remote, context_engine_id: "0x80001f888056dc3e5f5b6d2c61" }
+```
+
+### Credentials encryption
+
+Before the first start:
+
+```yaml
+devices:
+  - id: core-1
+    address: 192.0.2.60
+    snmp:
+      version: 3
+      username: poller
+      auth_protocol: SHA256
+      auth_password: my-auth-pass    # encrypted on startup
+      priv_protocol: AES
+      priv_password: ${PRIV_PASS}    # from the environment
+```
+
+After it (the key is in `data/key.dat`):
+
+```text
+devices:
+  - id: core-1
+    address: 192.0.2.60
+    snmp:
+      version: 3
+      username: poller
+      auth_protocol: SHA256
+      auth_password: ~~5C1E09A7...4B3F~~    # encrypted on startup
+      priv_protocol: AES
+      priv_password: ${PRIV_PASS}    # from the environment
+```
+
+with these log lines:
+
+```text
+level=INFO msg="credentials key generated: back it up, encrypted credentials cannot be read without it" key=data/key.dat
+level=INFO msg="credentials encrypted in the configuration file" config=etc/snmp-poller.yaml count=1 key=data/key.dat
+```
+
+### Vault: AppRole, default secret paths
+
+Each device reads `secret/snmp-poller/<device id>` (KV v2), for example:
+
+```sh
+vault kv put secret/snmp-poller/core-1 version=3 username=poller \
+  auth_protocol=SHA256 auth_password=my-auth-pass priv_protocol=AES priv_password=my-priv-pass
+vault kv put secret/snmp-poller/edge-1 version=2c community=my-community
+```
+
+```yaml
+vault:
+  address: https://vault.example.net:8200
+  ca_cert: /etc/snmp-poller/vault-ca.pem
+  auth:
+    method: approle
+    role_id: 7c1f0b1e-5d2a-4f43-9d1c-1f4a7e3b9c20
+    secret_id: 3b1c...           # encrypted on startup
+
+devices:
+  - id: core-1
+    address: 192.0.2.80
+    snmp: { vault: true }        # secret/snmp-poller/core-1
+  - id: edge-1
+    address: 192.0.2.81
+    snmp: { vault: true }        # secret/snmp-poller/edge-1
+```
+
+### Vault: explicit paths, token, KV v1, namespace
+
+A path shared by many devices, a per-device path, and settings in the file with only the
+password in Vault (secret keys override the `snmp` block).
+
+```yaml
+vault:
+  address: https://vault.example.net:8200
+  namespace: network            # Vault Enterprise
+  mount: kv
+  kv_version: 1
+  auth:
+    method: token
+    token: ${VAULT_TOKEN}
+
+devices:
+  - id: branch-1
+    address: 192.0.2.84
+    snmp: &branches { vault: branches/v2c }   # kv/branches/v2c
+  - id: branch-2
+    address: 192.0.2.85
+    snmp: *branches
+  - id: dc-core
+    address: 192.0.2.86
+    snmp:                       # kv/dc/core holds auth_password and priv_password
+      version: 3
+      username: poller
+      auth_protocol: SHA512
+      priv_protocol: AES256
+      vault: dc/core
+```
+
+### Vault: userpass and Kubernetes
+
+```yaml
+vault:
+  address: http://vault.vault.svc:8200
+  prefix: network/snmp          # secrets: secret/network/snmp/<device id>
+  auth:
+    method: kubernetes          # the pod's service account
+    role: snmp-poller
+    # jwt_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+devices:
+  - address: 192.0.2.88          # secret/network/snmp/192.0.2.88-161
+    snmp: { vault: true }
+```
+
+```yaml
+vault:
+  address: https://vault.example.net:8200
+  auth:
+    method: userpass
+    mount: ldap-users           # auth mount, if not "userpass"
+    username: snmp-poller
+    password: change-me         # encrypted on startup
+
+devices:
+  - id: core-2
+    address: 192.0.2.89
+    snmp: { vault: true }
 ```
 
 ### Capabilities per device: exclude and row filter
@@ -478,21 +780,18 @@ Every capability found by discovery is polled. `exclude` removes some for one de
 is labelled by `ifDescr`, so the patterns match interface descriptions.
 
 ```yaml
-credentials:
-  v2c: { version: 2c, community: "${SNMP_COMMUNITY}" }
-
 devices:
   - id: core-rtr1              # everything it supports, every interface
     address: 192.0.2.70
-    credential: v2c
+    snmp: &v2c { version: 2c, community: public }
   - id: access-sw1             # uplinks and port-channels only
     address: 192.0.2.71
-    credential: v2c
+    snmp: *v2c
     include:
       interfaces: ["^(TenGigabitEthernet|HundredGigE)", "^Port-channel"]
   - id: pdu1                   # no inventory, no interfaces: system group only
     address: 192.0.2.72
-    credential: v2c
+    snmp: *v2c
     exclude: [entity, interfaces]
 ```
 
@@ -500,6 +799,7 @@ devices:
 
 Discovery runs on the first poll and every `discovery_interval`. Its results (capabilities,
 discovery scalars and columns, selected rows) are saved in `data/<device_id>/discovery.json`.
+Vault credentials are read again at each discovery.
 
 ```yaml
 global:
@@ -513,31 +813,6 @@ devices:
     address: 192.0.2.91
     snmp: { version: 2c, community: "${SNMP_COMMUNITY}" }
     discovery_interval: 10m     # this one changes often
-```
-
-### Credentials and overrides
-
-```yaml
-credentials:
-  campus:
-    version: 3
-    username: monitor
-    auth_protocol: SHA256
-    auth_passphrase: ${SNMP_AUTH_PASS}
-    priv_protocol: AES
-    priv_passphrase: ${SNMP_PRIV_PASS}
-
-devices:
-  - id: bldg1-sw1
-    address: 192.0.2.101
-    credential: campus
-  - id: bldg1-sw2
-    address: 192.0.2.102
-    credential: campus
-    snmp: { username: monitor-ro }    # same credential, other user
-    poll_interval: 5m
-    timeout: 10s
-    retries: 3
 ```
 
 ### Multiple outputs
@@ -651,13 +926,19 @@ Logs are meant to be read: there is no line per poll at `info` level.
   for that device only, all tagged with `device=<id>`: capabilities not detected, discovery
   results (capabilities, selected and high-capacity rows), poll
   duration and sample count, OIDs the agent did not return, skipped polls.
-- **Credentials are never logged**: community strings and passphrases are redacted in every
-  log line, error and data file.
+- **Credentials are never logged**: community strings, passwords and Vault tokens are
+  redacted in every log line, error and data file. Vault errors carry Vault's own error
+  messages only.
+- **Credentials**: on startup, `info` lines report a newly generated key and how many
+  credentials were encrypted in the configuration file, and a `warn` line why they could not
+  be (read-only file, block scalar). A device whose Vault refresh fails logs a `warn` and keeps
+  its previous credentials.
 
 ## Data directory
 
 ```text
 data/
+  key.dat            # credentials key (32 bytes, mode 0600): back it up, never deleted
   <device_id>/
     discovery.json   # discovery cache: capabilities, scalars, columns, selected rows
     state.json       # previous value and timestamp of every rate/volume OID
@@ -675,31 +956,37 @@ For example, for a switch with ifXTable:
 }
 ```
 
-The whole directory is wiped on startup, and a device's directory is wiped on each of its
-rediscoveries. Files are replaced atomically. The discovery and state of a device are only
+Device directories are wiped on startup (files such as `key.dat` are kept), and a device's
+directory is wiped on each of its rediscoveries. Files are replaced atomically. The discovery and state of a device are only
 loaded in memory while that device is being polled, so memory does not grow with the number
 of devices, rows or polled OIDs.
 
 ## Development
 
 ```sh
-go build ./...
-go vet ./...
-gofmt -l .
-go test -race ./...
+make              # vet, gofmt check and tests, then cross-build every platform into dist/
+make dist         # cross-build every platform, without the checks
+make build        # this machine only: ./snmp-poller
+make check        # go vet, gofmt check, go test
+make clean        # remove dist/ and ./snmp-poller
+make help         # list targets
+make VERSION=1.2.3          # set the version printed by -version
+go test -race ./...         # with the race detector (needs a C compiler)
 ```
 
 Integration tests run an in-process SNMP agent (`internal/testagent`) and exercise every SNMP
-version, every v3 auth/priv combination, contexts, capability detection, the shipped
-capabilities (with and without ifXTable), tables, rates and the scheduler.
+version, every v3 auth/priv combination, contexts, GETBULK and GETNEXT walks, capability
+detection, the shipped capabilities (with and without ifXTable), tables, rates, Vault
+credentials and the scheduler. The Vault client is tested against a fake Vault HTTP server.
 
 | Path | Purpose |
 |------|---------|
 | `cmd/snmp-poller` | Entry point. |
-| `internal/config` | Schema, defaults, validation, capabilities, resolution of credentials. |
+| `internal/config` | Schema, defaults, validation, capabilities, credentials encryption (`Seal`). |
 | `internal/logging` | Console and rotating file logging, per-device trace. |
 | `internal/snmp` | SNMP client (gosnmp) and value conversion. |
 | `internal/state` | On-disk previous values and rate/volume math. |
+| `internal/vault` | HashiCorp Vault client (KV v1/v2; token, AppRole, userpass, Kubernetes auth). |
 | `internal/output` | Output interface, registry and the `null` output. |
 | `internal/poller` | Scheduler, workers, discovery, collection, stats. |
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |

@@ -4,9 +4,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +19,16 @@ const (
 	Version1  = "1"
 	Version2c = "2c"
 	Version3  = "3"
+)
+
+// Transports and walk modes after normalization.
+const (
+	TransportUDP = "udp"
+	TransportTCP = "tcp"
+	// WalkBulk walks tables with GETBULK (SNMPv2c/v3), WalkGetNext with
+	// GETNEXT, one OID per request (the only way on SNMPv1).
+	WalkBulk    = "bulk"
+	WalkGetNext = "getnext"
 )
 
 // SNMPv3 security levels after normalization.
@@ -33,12 +46,16 @@ var (
 )
 
 // DeviceSpec is the fully resolved configuration of one enabled device:
-// defaults applied, credential merged, everything validated.
+// defaults applied, everything validated. When VaultPath is set, SNMP is
+// only complete once WithVaultSecret has merged the Vault secret.
 type DeviceSpec struct {
 	ID                string
 	Address           string
 	Port              uint16
+	Transport         string
+	Walk              string
 	SNMP              SNMP
+	VaultPath         string
 	PollInterval      time.Duration
 	DiscoveryInterval time.Duration
 	Timeout           time.Duration
@@ -51,6 +68,8 @@ type DeviceSpec struct {
 	// excluded), with the device's include overrides applied. Discovery
 	// decides which of them the device actually has.
 	Capabilities []*Capability
+
+	walkSet bool // walk set on the device itself, not inherited
 }
 
 // DeviceSpecs returns the resolved specification of every enabled device.
@@ -86,6 +105,12 @@ func (c *Config) validate() error {
 	if g.StatsInterval < time.Second {
 		add("global.stats_interval must be >= 1s")
 	}
+	if _, err := normTransport(g.Transport); err != nil {
+		add("global.%w", err)
+	}
+	if _, err := normWalk(g.Walk); err != nil {
+		add("global.%w", err)
+	}
 
 	switch strings.ToLower(c.Logging.Level) {
 	case "debug", "info", "warn", "warning", "error":
@@ -109,27 +134,56 @@ func (c *Config) validate() error {
 		outputs[o.Name] = true
 	}
 
-	// Credentials are validated where they are used (see resolve), so an
-	// unused credential may reference an unset ${ENV_VAR}.
+	// Credentials are validated where they are used (see resolve and
+	// Vault.validate), so an unused one may reference an unset ${ENV_VAR}.
+	usesVault := false
+	for _, d := range c.Devices {
+		if d.SNMP != nil && d.SNMP.Vault.Enabled && (d.Enabled == nil || *d.Enabled) {
+			usesVault = true
+		}
+	}
+	if c.Vault != nil {
+		if err := c.Vault.validate(usesVault); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
-	ids := map[string]bool{}
+	ids := map[string]string{}       // id -> label of the device using it
+	endpoints := map[string]string{} // address/port -> id
 	for i, d := range c.Devices {
 		label := fmt.Sprintf("devices[%d]", i)
-		if d.ID != "" {
-			label = fmt.Sprintf("device %q", d.ID)
-		}
-		switch {
-		case d.ID == "":
-			add("%s: id is required", label)
+		if d.Address == "" {
+			add("%s: address is required", label)
 			continue
+		}
+		port := firstNonZero(d.Port, c.Global.Port)
+		if d.ID == "" {
+			d.ID = DefaultID(d.Address, port)
+		}
+		label = fmt.Sprintf("device %q", d.ID)
+		switch {
 		case !idPattern.MatchString(d.ID):
 			add("%s: id may only contain letters, digits, '.', '_' and '-'", label)
 			continue
-		case ids[d.ID]:
-			add("%s: duplicate id", label)
+		case d.ID == KeyFile:
+			add("%s: id %q is reserved (the key file of the data directory)", label, KeyFile)
+			continue
+		case ids[d.ID] != "":
+			add("%s: duplicate id (also %s)", label, ids[d.ID])
 			continue
 		}
-		ids[d.ID] = true
+		ids[d.ID] = fmt.Sprintf("devices[%d]", i)
+		// The same agent may only be polled twice for two SNMPv3 contexts.
+		ep := endpoint(d.Address, port)
+		if d.SNMP != nil {
+			ep += " " + d.SNMP.ContextName
+		}
+		if other, ok := endpoints[ep]; ok {
+			add("%s: address %s port %d is already used by device %q", label, d.Address, port, other)
+			continue
+		}
+		endpoints[ep] = d.ID
+		c.Devices[i].ID = d.ID
 		if d.Enabled != nil && !*d.Enabled {
 			continue
 		}
@@ -141,6 +195,28 @@ func (c *Config) validate() error {
 		c.specs = append(c.specs, spec)
 	}
 	return errors.Join(errs...)
+}
+
+// DefaultID is the id of a device that has none: <address>-<port>, every
+// character an id may not contain replaced with '_' (IPv6 colons, zones).
+func DefaultID(address string, port uint16) string {
+	id := []byte(fmt.Sprintf("%s-%d", address, port))
+	for i, b := range id {
+		if !(b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '.' || b == '_' || b == '-') {
+			id[i] = '_'
+		}
+	}
+	return string(id)
+}
+
+// endpoint identifies an agent: the address (IPs in canonical form, host
+// names case-insensitive, not resolved) and the port.
+func endpoint(address string, port uint16) string {
+	a := strings.ToLower(strings.TrimSuffix(address, "."))
+	if ip, err := netip.ParseAddr(a); err == nil {
+		a = ip.Unmap().String()
+	}
+	return net.JoinHostPort(a, strconv.Itoa(int(port)))
 }
 
 func (c *Config) resolve(d Device, outputs map[string]bool) (DeviceSpec, error) {
@@ -170,24 +246,29 @@ func (c *Config) resolve(d Device, outputs map[string]bool) (DeviceSpec, error) 
 		return s, errors.New("retries must be >= 0 and max_oids_per_request between 1 and 128")
 	}
 
-	// Credentials: named credential first, inline snmp block overrides it.
-	if d.Credential != "" {
-		cred, ok := c.Credentials[d.Credential]
-		if !ok {
-			return s, fmt.Errorf("unknown credential %q", d.Credential)
+	var err error
+	if s.Transport, err = normTransport(firstNonZero(d.Transport, g.Transport)); err != nil {
+		return s, err
+	}
+	s.walkSet = d.Walk != ""
+	if s.Walk, err = normWalk(firstNonZero(d.Walk, g.Walk)); err != nil {
+		return s, err
+	}
+
+	if d.SNMP == nil {
+		return s, errors.New("snmp is required (version and community, or v3 username and passwords)")
+	}
+	s.SNMP = *d.SNMP
+	if v := d.SNMP.Vault; v.Enabled {
+		if c.Vault == nil {
+			return s, errors.New("snmp.vault requires a vault section")
 		}
-		s.SNMP = cred
-	}
-	if d.SNMP != nil {
-		overlaySNMP(&s.SNMP, *d.SNMP)
-	}
-	if d.Credential == "" && d.SNMP == nil {
-		return s, errors.New("either credential or snmp is required")
-	}
-	if err := normalizeSNMP(&s.SNMP); err != nil {
-		if d.Credential != "" {
-			return s, fmt.Errorf("credential %q: %w", d.Credential, err)
+		// Validated when the secret is read, at every discovery.
+		s.VaultPath = v.Path
+		if s.VaultPath == "" {
+			s.VaultPath = c.Vault.Prefix + "/" + d.ID
 		}
+	} else if err := s.finishSNMP(); err != nil {
 		return s, err
 	}
 
@@ -299,28 +380,39 @@ func normOID(oid string) string {
 	return "." + oid
 }
 
-func overlaySNMP(dst *SNMP, src SNMP) {
-	set := func(d *string, s string) {
-		if s != "" {
-			*d = s
-		}
+// finishSNMP normalizes and validates the SNMP settings, and settles the
+// walk mode: SNMPv1 has no GETBULK.
+func (s *DeviceSpec) finishSNMP() error {
+	if err := normalizeSNMP(&s.SNMP); err != nil {
+		return err
 	}
-	setSecret := func(d *Secret, s Secret) {
-		if s.IsSet() {
-			*d = s
+	if s.SNMP.Version == Version1 && s.Walk == WalkBulk {
+		if s.walkSet {
+			return errors.New("walk: bulk is not available in SNMPv1 (use getnext)")
 		}
+		s.Walk = WalkGetNext
 	}
-	set(&dst.Version, src.Version)
-	set(&dst.Transport, src.Transport)
-	setSecret(&dst.Community, src.Community)
-	set(&dst.Username, src.Username)
-	set(&dst.SecurityLevel, src.SecurityLevel)
-	set(&dst.AuthProtocol, src.AuthProtocol)
-	setSecret(&dst.AuthPassphrase, src.AuthPassphrase)
-	set(&dst.PrivProtocol, src.PrivProtocol)
-	setSecret(&dst.PrivPassphrase, src.PrivPassphrase)
-	set(&dst.ContextName, src.ContextName)
-	set(&dst.ContextEngineID, src.ContextEngineID)
+	return nil
+}
+
+func normTransport(t string) (string, error) {
+	switch strings.ToLower(t) {
+	case TransportUDP:
+		return TransportUDP, nil
+	case TransportTCP:
+		return TransportTCP, nil
+	}
+	return "", fmt.Errorf("transport %q: must be udp or tcp", t)
+}
+
+func normWalk(w string) (string, error) {
+	switch strings.ToLower(w) {
+	case WalkBulk:
+		return WalkBulk, nil
+	case WalkGetNext:
+		return WalkGetNext, nil
+	}
+	return "", fmt.Errorf("walk %q: must be bulk or getnext", w)
 }
 
 // normalizeSNMP canonicalizes and validates protocol settings in place.
@@ -337,15 +429,6 @@ func normalizeSNMP(s *SNMP) error {
 		return errors.New("snmp version is required (1, 2c or 3)")
 	default:
 		return fmt.Errorf("unsupported snmp version %q (1, 2c or 3)", s.Version)
-	}
-
-	switch strings.ToLower(s.Transport) {
-	case "", "udp":
-		s.Transport = "udp"
-	case "tcp":
-		s.Transport = "tcp"
-	default:
-		return fmt.Errorf("unsupported transport %q (udp or tcp)", s.Transport)
 	}
 
 	if s.Version != Version3 {
@@ -390,16 +473,19 @@ func normalizeSNMP(s *SNMP) error {
 		if s.AuthProtocol == "" {
 			return fmt.Errorf("security_level %s requires auth_protocol", s.SecurityLevel)
 		}
-		if len(s.AuthPassphrase.Reveal()) < 8 {
-			return errors.New("auth_passphrase must be at least 8 characters")
+		if len(s.AuthPassword.Reveal()) < 8 {
+			return errors.New("auth_password must be at least 8 characters")
 		}
 	}
 	if s.SecurityLevel == AuthPriv {
 		if s.PrivProtocol == "" {
 			return errors.New("security_level authPriv requires priv_protocol")
 		}
-		if len(s.PrivPassphrase.Reveal()) < 8 {
-			return errors.New("priv_passphrase must be at least 8 characters")
+		if !s.PrivPassword.IsSet() {
+			s.PrivPassword = s.AuthPassword
+		}
+		if len(s.PrivPassword.Reveal()) < 8 {
+			return errors.New("priv_password must be at least 8 characters")
 		}
 	}
 

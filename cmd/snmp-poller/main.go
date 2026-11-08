@@ -28,11 +28,21 @@ func run() int {
 	path := flag.String("config", config.DefaultPath, "path to the YAML configuration file")
 	check := flag.Bool("check", false, "validate the configuration and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	encrypt := flag.Bool("encrypt", false, "print a credential encrypted for the configuration file, and exit: -encrypt VALUE, or piped on stdin, or typed at the prompt")
+	keyPath := flag.String("key", "", "key file for -encrypt (default: <global.data_dir of -config>/"+config.KeyFile+")")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("snmp-poller", version)
 		return 0
+	}
+
+	if *encrypt {
+		return encryptCmd(*path, *keyPath, flag.Args(), os.Stdin, os.Stdout, os.Stderr)
+	}
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q (only -encrypt takes a value)\n", flag.Arg(0))
+		return 2
 	}
 
 	cfg, err := config.Load(*path)
@@ -64,7 +74,23 @@ func run() int {
 		return 1
 	}
 	defer log.Close()
-	log.Info("starting snmp-poller", "version", version, "config", *path)
+	log.Info("starting AIrtg snmp-poller", "version", version, "config", *path)
+
+	// Encrypt the clear-text credentials of the (valid) configuration file.
+	// A read-only file is not fatal: polling works, the file stays in clear.
+	sealed, err := cfg.Seal()
+	if sealed.KeyCreated {
+		log.Info("credentials key generated: back it up, encrypted credentials cannot be read without it",
+			"key", sealed.KeyPath)
+	}
+	switch {
+	case err != nil:
+		log.Warn("credentials not encrypted in the configuration file", "config", *path,
+			"key", sealed.KeyPath, "err", err)
+	case sealed.Encrypted > 0:
+		log.Info("credentials encrypted in the configuration file", "config", *path,
+			"count", sealed.Encrypted, "key", sealed.KeyPath)
+	}
 
 	outs, err := output.Build(cfg.Outputs, log.Logger)
 	if err != nil {

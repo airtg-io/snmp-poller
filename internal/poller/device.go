@@ -49,9 +49,18 @@ type device struct {
 	spec    config.DeviceSpec
 	log     *slog.Logger
 	outputs []output.Output
+	vault   secretReader // set when spec.VaultPath is
 
 	discoveredAt time.Time // zero until the first successful discovery
 	failing      bool
+	// fromVault is spec completed with the Vault secret, read at every
+	// discovery and only kept in memory.
+	fromVault *config.DeviceSpec
+}
+
+// secretReader reads a KV secret (see package vault).
+type secretReader interface {
+	Read(ctx context.Context, path string) (map[string]string, error)
 }
 
 // pollResult summarizes one poll for statistics.
@@ -68,13 +77,18 @@ func (d *device) poll(ctx context.Context, store *state.Store, now func() time.T
 	ctx, cancel := context.WithTimeout(ctx, d.deadline())
 	defer cancel()
 
-	c, err := snmp.Dial(ctx, &d.spec)
+	due := d.discoveredAt.IsZero() || now().Sub(d.discoveredAt) >= d.spec.DiscoveryInterval
+	spec, err := d.credentials(ctx, due)
+	if err != nil {
+		return res, err
+	}
+	c, err := snmp.Dial(ctx, spec)
 	if err != nil {
 		return res, err
 	}
 	defer c.Close()
 
-	disc, err := d.discovery(c, store, now, &res)
+	disc, err := d.discovery(c, store, now, due, &res)
 	if err != nil {
 		return res, err
 	}
@@ -96,8 +110,7 @@ func (d *device) poll(ctx context.Context, store *state.Store, now func() time.T
 
 // discovery returns the device's discovery: from the on-disk cache, or from
 // a new discovery run when one is due or the cache cannot be read.
-func (d *device) discovery(c *snmp.Client, store *state.Store, now func() time.Time, res *pollResult) (*Discovery, error) {
-	due := d.discoveredAt.IsZero() || now().Sub(d.discoveredAt) >= d.spec.DiscoveryInterval
+func (d *device) discovery(c *snmp.Client, store *state.Store, now func() time.Time, due bool, res *pollResult) (*Discovery, error) {
 	if !due {
 		disc := &Discovery{}
 		err := store.LoadDiscovery(d.spec.ID, disc)
@@ -126,6 +139,41 @@ func (d *device) discovery(c *snmp.Client, store *state.Store, now func() time.T
 		"capabilities", disc.Capabilities, "scalars", len(disc.Scalars),
 		"columns", len(disc.Columns), "rows", rowCount(disc))
 	return disc, nil
+}
+
+// credentials returns the spec to poll with. For a device whose credentials
+// live in Vault, the secret is read again when a discovery is due; if Vault
+// fails then, the previous credentials are kept.
+func (d *device) credentials(ctx context.Context, due bool) (*config.DeviceSpec, error) {
+	if d.spec.VaultPath == "" {
+		return &d.spec, nil
+	}
+	if d.fromVault != nil && !due {
+		return d.fromVault, nil
+	}
+	spec, err := d.readVault(ctx)
+	if err != nil {
+		if d.fromVault == nil {
+			return nil, err
+		}
+		d.log.Warn("credentials refresh failed, keeping the previous ones", "err", err)
+		return d.fromVault, nil
+	}
+	d.log.Debug("credentials read from vault", "path", d.spec.VaultPath)
+	d.fromVault = spec
+	return spec, nil
+}
+
+func (d *device) readVault(ctx context.Context) (*config.DeviceSpec, error) {
+	secret, err := d.vault.Read(ctx, d.spec.VaultPath)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := d.spec.WithVaultSecret(secret)
+	if err != nil {
+		return nil, fmt.Errorf("vault secret %s: %w", d.spec.VaultPath, err)
+	}
+	return spec, nil
 }
 
 // deadline bounds a whole poll so a stuck device cannot hold a worker forever.

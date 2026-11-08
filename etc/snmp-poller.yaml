@@ -11,6 +11,8 @@ global:
   max_oids_per_request: 30     # varbinds per GET request
   max_repetitions: 25          # GETBULK max-repetitions (v2c/v3 walks)
   port: 161
+  transport: udp               # default for devices: udp or tcp
+  walk: bulk                   # default for devices: bulk (GETBULK) or getnext; SNMPv1 always uses getnext
   data_dir: data               # on-disk state for rate/volume; wiped on startup
   conf_dir: conf.d             # SNMP capabilities, one file each (relative to this file)
   stats_interval: 1m           # periodic summary log line
@@ -33,16 +35,72 @@ outputs:
   - name: blackhole
     type: "null"               # discards everything (the only output type for now)
 
-credentials:
-  public-v2c:
-    version: 2c
-    community: ${SNMP_COMMUNITY}   # read from the environment
+# Credentials (community strings, passwords, Vault secrets) written in clear
+# text below are encrypted in place on startup, once the configuration is
+# valid: the value becomes ~~HEX~~ (AES-256-GCM), with the key data/key.dat,
+# generated on first start. Back that key up: encrypted values cannot be read
+# without it. ${ENV_VAR} references are read from the environment and left as is.
+
+# HashiCorp Vault, for devices with `snmp: { vault: ... }` only. Each such
+# device reads a KV secret (keys: version, community, username,
+# security_level, auth_protocol, auth_password, priv_protocol, priv_password,
+# context_name, context_engine_id) on every discovery.
+vault:
+  address: https://vault.example.net:8200
+  mount: secret                # KV secrets engine mount
+  kv_version: 2
+  prefix: snmp-poller          # default secret of a device: <mount>/<prefix>/<device id>
+  auth:
+    method: approle            # token, approle, userpass or kubernetes
+    role_id: snmp-poller
+    secret_id: ~~1DC1E68DA1208995AE1AB341AAAE75D6971A2DFAC90E05DEDEF1708E628BB7320B9F697592~~       # encrypted on startup
 
 devices:
-  # Example device, disabled. Set SNMP_COMMUNITY and enabled: true to try it.
-  - id: localhost
-    address: 127.0.0.1
+  # Examples, all disabled: set enabled: true (or remove it) to poll one.
+
+  # SNMPv2c. No id: it defaults to <address>-<port>, here "192.0.2.10-161".
+  - address: 192.0.2.10
     enabled: false
-    credential: public-v2c
+    snmp:
+      version: 2c
+      community: ~~F584A09EFEEF311B36DE0DC0BE89009A29123ED6A6620F091F342FCBA6D5254C80AA~~        # encrypted on startup
+
+  # SNMPv1 over TCP, custom port and id; v1 always walks with GETNEXT.
+  - id: legacy-ups
+    address: 192.0.2.11
+    port: 1161
+    transport: tcp
+    enabled: false
+    snmp:
+      version: 1
+      community: ${SNMP_COMMUNITY}   # read from the environment, never rewritten
+
+  # SNMPv3 authPriv, walked with GETNEXT (for agents with broken GETBULK).
+  - id: core-1
+    address: 192.0.2.12
+    walk: getnext
+    enabled: false
+    snmp:
+      version: 3
+      username: poller
+      security_level: authPriv       # noAuthNoPriv, authNoPriv or authPriv
+      auth_protocol: SHA256          # MD5, SHA, SHA224, SHA256, SHA384, SHA512
+      auth_password: ~~785E23F85926EC42E0184A16F5BEE60AAAD66E899A102F2F977281E179FBED5B7801DC6240C201C1AEFA~~  # encrypted on startup
+      priv_protocol: AES             # DES, AES, AES192, AES256, AES192C, AES256C
+      priv_password: ~~253EAF63802E8BADC7090147559CE3DF53C6A16F6C1650A5E677FC975EEB8CEEB8D38148A8244D308FA3~~  # defaults to auth_password; encrypted on startup
     # Every capability of etc/conf.d found on the device is polled, except:
     # exclude: [interfaces]
+
+  # Credentials from Vault, default path: secret/snmp-poller/edge-1.
+  - id: edge-1
+    address: 192.0.2.13
+    enabled: false
+    snmp:
+      vault: true
+
+  # Credentials from Vault, explicit path (relative to the mount).
+  - id: edge-2
+    address: 192.0.2.14
+    enabled: false
+    snmp:
+      vault: network/edge-v3

@@ -42,7 +42,8 @@ func (s *Store) Dir() string { return s.dir }
 // DeviceDir returns the directory holding a device's files.
 func (s *Store) DeviceDir(id string) string { return filepath.Join(s.dir, id) }
 
-// Clean removes every device directory. Called on startup.
+// Clean removes every device directory. Called on startup. Files, such as
+// the credentials key (config.KeyFile), are kept.
 func (s *Store) Clean() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -50,7 +51,9 @@ func (s *Store) Clean() error {
 	}
 	var errs []error
 	for _, e := range entries {
-		errs = append(errs, os.RemoveAll(filepath.Join(s.dir, e.Name())))
+		if e.IsDir() {
+			errs = append(errs, os.RemoveAll(filepath.Join(s.dir, e.Name())))
+		}
 	}
 	return errors.Join(errs...)
 }

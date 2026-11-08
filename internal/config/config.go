@@ -1,6 +1,6 @@
 // Package config defines the YAML configuration schema of the poller, its
-// defaults, validation, and the resolution of profiles and credentials into
-// a flat per-device specification.
+// defaults, validation, credential encryption, and the resolution of each
+// device into a flat specification.
 package config
 
 import (
@@ -20,14 +20,17 @@ const DefaultPath = "etc/snmp-poller.yaml"
 
 // Config is the root of the YAML document.
 type Config struct {
-	Global      Global          `yaml:"global"`
-	Logging     Logging         `yaml:"logging"`
-	Outputs     []Output        `yaml:"outputs"`
-	Credentials map[string]SNMP `yaml:"credentials"`
-	Devices     []Device        `yaml:"devices"`
+	Global  Global   `yaml:"global"`
+	Logging Logging  `yaml:"logging"`
+	Outputs []Output `yaml:"outputs"`
+	Vault   *Vault   `yaml:"vault"`
+	Devices []Device `yaml:"devices"`
 
 	capabilities []*Capability
 	specs        []DeviceSpec
+
+	path   string // file read by Load, rewritten by Seal
+	source []byte
 }
 
 // Global holds process-wide settings and the defaults inherited by devices.
@@ -40,6 +43,8 @@ type Global struct {
 	MaxOIDsPerRequest int           `yaml:"max_oids_per_request"`
 	MaxRepetitions    uint32        `yaml:"max_repetitions"`
 	Port              uint16        `yaml:"port"`
+	Transport         string        `yaml:"transport"`
+	Walk              string        `yaml:"walk"`
 	DataDir           string        `yaml:"data_dir"`
 	ConfDir           string        `yaml:"conf_dir"`
 	StatsInterval     time.Duration `yaml:"stats_interval"`
@@ -80,30 +85,34 @@ type Output struct {
 	Options map[string]any `yaml:",inline"`
 }
 
-// SNMP holds protocol settings and credentials. It is used both for named
-// entries under `credentials:` and for a device's inline `snmp:` block.
+// SNMP is a device's `snmp:` block: version and credentials. v1/v2c use a
+// community, v3 a username, a security level and the auth/priv protocols
+// and passwords. Credentials may instead (or also) come from Vault.
 type SNMP struct {
-	Version         string `yaml:"version"`
-	Transport       string `yaml:"transport"`
-	Community       Secret `yaml:"community"`
-	Username        string `yaml:"username"`
-	SecurityLevel   string `yaml:"security_level"`
-	AuthProtocol    string `yaml:"auth_protocol"`
-	AuthPassphrase  Secret `yaml:"auth_passphrase"`
-	PrivProtocol    string `yaml:"priv_protocol"`
-	PrivPassphrase  Secret `yaml:"priv_passphrase"`
-	ContextName     string `yaml:"context_name"`
-	ContextEngineID string `yaml:"context_engine_id"`
+	Version       string `yaml:"version"`
+	Community     Secret `yaml:"community"`
+	Username      string `yaml:"username"`
+	SecurityLevel string `yaml:"security_level"`
+	AuthProtocol  string `yaml:"auth_protocol"`
+	AuthPassword  Secret `yaml:"auth_password"`
+	PrivProtocol  string `yaml:"priv_protocol"`
+	// PrivPassword defaults to AuthPassword, like net-snmp's createUser.
+	PrivPassword    Secret   `yaml:"priv_password"`
+	ContextName     string   `yaml:"context_name"`
+	ContextEngineID string   `yaml:"context_engine_id"`
+	Vault           VaultRef `yaml:"vault"`
 }
 
 // Device is one SNMP agent to poll.
 type Device struct {
-	ID         string `yaml:"id"`
-	Address    string `yaml:"address"`
-	Port       uint16 `yaml:"port"`
-	Enabled    *bool  `yaml:"enabled"`
-	Credential string `yaml:"credential"`
-	SNMP       *SNMP  `yaml:"snmp"`
+	// ID defaults to <address>-<port>.
+	ID        string `yaml:"id"`
+	Address   string `yaml:"address"`
+	Port      uint16 `yaml:"port"`
+	Transport string `yaml:"transport"`
+	Walk      string `yaml:"walk"`
+	Enabled   *bool  `yaml:"enabled"`
+	SNMP      *SNMP  `yaml:"snmp"`
 	// Exclude lists capabilities never applied to this device, even when
 	// detected. Every other capability applies when detected.
 	Exclude []string `yaml:"exclude"`
@@ -132,6 +141,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	cfg.path = path
 	return cfg, nil
 }
 
@@ -142,13 +152,16 @@ func Parse(r io.Reader, baseDir string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
+	cfg := Config{source: data}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	cfg.applyDefaults()
+	if err := cfg.resolveSecrets(); err != nil {
+		return nil, err
+	}
 	if !filepath.IsAbs(cfg.Global.ConfDir) {
 		cfg.Global.ConfDir = filepath.Join(baseDir, cfg.Global.ConfDir)
 	}
@@ -190,6 +203,12 @@ func (c *Config) applyDefaults() {
 	if g.Port == 0 {
 		g.Port = 161
 	}
+	if g.Transport == "" {
+		g.Transport = TransportUDP
+	}
+	if g.Walk == "" {
+		g.Walk = WalkBulk
+	}
 	if g.DataDir == "" {
 		g.DataDir = "data"
 	}
@@ -230,6 +249,10 @@ func (c *Config) applyDefaults() {
 	}
 	if l.LocalTime == nil {
 		l.LocalTime = ptr(false)
+	}
+
+	if c.Vault != nil {
+		c.Vault.applyDefaults()
 	}
 
 	if len(c.Outputs) == 0 {

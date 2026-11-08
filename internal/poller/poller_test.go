@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -212,19 +213,19 @@ func TestVersionsAndSecurity(t *testing.T) {
 	}
 	for an, ap := range auths {
 		users = append(users, testagent.User{Name: "a-" + an, Auth: ap})
-		cases["v3-authNoPriv-"+an] = fmt.Sprintf(`version: 3, username: a-%s, auth_protocol: %s, auth_passphrase: %s`,
+		cases["v3-authNoPriv-"+an] = fmt.Sprintf(`version: 3, username: a-%s, auth_protocol: %s, auth_password: %s`,
 			an, an, testagent.AuthPass)
 		for pn, pp := range privs {
 			u := "ap-" + an + "-" + pn
 			users = append(users, testagent.User{Name: u, Auth: ap, Priv: pp})
 			cases["v3-authPriv-"+an+"-"+pn] = fmt.Sprintf(
-				`version: 3, username: %s, auth_protocol: %s, auth_passphrase: %s, priv_protocol: %s, priv_passphrase: %s`,
+				`version: 3, username: %s, auth_protocol: %s, auth_password: %s, priv_protocol: %s, priv_password: %s`,
 				u, an, testagent.AuthPass, pn, testagent.PrivPass)
 		}
 	}
 	agent := testagent.Start(t, users, testagent.NewMIB(sysMIB("default")),
 		map[string]*testagent.MIB{"ctx1": testagent.NewMIB(sysMIB("in-ctx1"))})
-	cases["v3-context"] = fmt.Sprintf(`version: 3, username: ap-SHA256-AES, auth_protocol: SHA256, auth_passphrase: %s, priv_protocol: AES, priv_passphrase: %s, context_name: ctx1`,
+	cases["v3-context"] = fmt.Sprintf(`version: 3, username: ap-SHA256-AES, auth_protocol: SHA256, auth_password: %s, priv_protocol: AES, priv_password: %s, context_name: ctx1`,
 		testagent.AuthPass, testagent.PrivPass)
 
 	for name, snmpCfg := range cases {
@@ -262,8 +263,8 @@ func TestWrongCredentialsFail(t *testing.T) {
 	agent := testagent.Start(t, []testagent.User{{Name: "u", Auth: gosnmp.SHA, Priv: gosnmp.AES}},
 		testagent.NewMIB(sysMIB("x")), nil)
 	for name, snmpCfg := range map[string]string{
-		"community":  `version: 2c, community: wrong`,
-		"passphrase": `version: 3, username: u, auth_protocol: SHA, auth_passphrase: wrong-pass, priv_protocol: AES, priv_passphrase: ` + testagent.PrivPass,
+		"community": `version: 2c, community: wrong`,
+		"password":  `version: 3, username: u, auth_protocol: SHA, auth_password: wrong-pass, priv_protocol: AES, priv_password: ` + testagent.PrivPass,
 	} {
 		t.Run(name, func(t *testing.T) {
 			d, store := newDevice(t, fmt.Sprintf(`
@@ -413,23 +414,29 @@ func TestShippedInterfaces(t *testing.T) {
 			caps: "[interfaces system]", rows: "[1 2]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, version := range []string{"1", "2c"} {
-				t.Run("v"+version, func(t *testing.T) {
+			for _, v := range []struct{ version, walk string }{{"1", ""}, {"2c", ""}, {"2c", "getnext"}} {
+				version := v.version
+				t.Run("v"+version+v.walk, func(t *testing.T) {
 					// SNMPv1 cannot carry Counter64: never high capacity.
 					hc, hcRows := tc.counters && version != "1", "[]"
 					if hc {
 						hcRows = "[1 2]" // 10G and 1G, not 100M
 					}
 					agent := testagent.Start(t, nil, interfacesMIB(tc.names, tc.counters), nil)
+					walk := "# walk inherited"
+					if v.walk != "" {
+						walk = "walk: " + v.walk
+					}
 					out := &capture{}
 					d, store := shippedDevice(t, fmt.Sprintf(`
 devices:
   - id: sw
     address: 127.0.0.1
     port: %d
+    %s
     snmp: { version: "%s", community: %s }
     %s
-`, agent.Port, version, testagent.Community, tc.include), out)
+`, agent.Port, walk, version, testagent.Community, tc.include), out)
 					clk := &clock{t: time.Unix(1_700_000_000, 0)}
 					for range 2 {
 						res, err := d.poll(context.Background(), store, clk.now)
@@ -440,6 +447,12 @@ devices:
 							t.Errorf("missing oids = %d, want 0", res.missing)
 						}
 						clk.advance(time.Minute)
+					}
+
+					// GETBULK unless walking with getnext, or on SNMPv1 (bulk
+					// is then the inherited default, not an explicit setting).
+					if bulk := agent.BulkRequests(); (bulk > 0) != (version != "1" && v.walk == "") {
+						t.Errorf("GETBULK requests = %d", bulk)
 					}
 
 					disc := loadDiscovery(t, store, "sw")
@@ -681,7 +694,11 @@ scalars:
 
 // TestRun runs the scheduler end to end with real time.
 func TestRun(t *testing.T) {
-	agent := testagent.Start(t, nil, testagent.NewMIB(sysMIB("run")), nil)
+	// One agent per device: the same agent twice is an invalid configuration.
+	var ports [3]uint16
+	for i := range ports {
+		ports[i] = testagent.Start(t, nil, testagent.NewMIB(sysMIB("run")), nil).Port
+	}
 	dir := t.TempDir()
 	stale := filepath.Join(dir, "data", "stale-device")
 	os.MkdirAll(stale, 0o755)
@@ -690,10 +707,10 @@ func TestRun(t *testing.T) {
 global: { poll_interval: 1s, stats_interval: 1s, data_dir: %s }
 outputs: [{ name: cap, type: "null" }]
 devices:
-  - { id: ok1, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s } }
-  - { id: ok2, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s } }
-  - { id: bad, address: 127.0.0.1, port: %[2]d, timeout: 200ms, retries: 0, snmp: { version: 2c, community: very-secret-value } }
-`, filepath.Join(dir, "data"), agent.Port, testagent.Community), basicCaps)
+  - { id: ok1, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[5]s } }
+  - { id: ok2, address: 127.0.0.1, port: %[3]d, snmp: { version: 2c, community: %[5]s } }
+  - { id: bad, address: 127.0.0.1, port: %[4]d, timeout: 200ms, retries: 0, snmp: { version: 2c, community: very-secret-value } }
+`, filepath.Join(dir, "data"), ports[0], ports[1], ports[2], testagent.Community), basicCaps)
 	var logs bytes.Buffer
 	var logMu sync.Mutex
 	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
@@ -780,5 +797,97 @@ func TestLessOID(t *testing.T) {
 	sortIndexes(idx)
 	if got := fmt.Sprint(idx); got != "[1 1.2 1.10 2 10]" {
 		t.Errorf("sorted = %s", got)
+	}
+}
+
+// fakeVault serves one secret, or an error.
+type fakeVault struct {
+	mu     sync.Mutex
+	secret map[string]string
+	err    error
+	reads  []string
+}
+
+func (f *fakeVault) Read(_ context.Context, path string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads = append(f.reads, path)
+	return maps.Clone(f.secret), f.err
+}
+
+// TestVaultCredentials: credentials are read at every discovery and only
+// then; a failing refresh keeps the previous credentials.
+func TestVaultCredentials(t *testing.T) {
+	agent := testagent.Start(t, []testagent.User{{Name: "u", Auth: gosnmp.SHA, Priv: gosnmp.AES}},
+		testagent.NewMIB(sysMIB("vaulted")), nil)
+	doc := fmt.Sprintf(`
+vault: { address: "https://vault.invalid", auth: { method: token, token: t0ken-value } }
+devices:
+  - { id: dev, address: 127.0.0.1, port: %d, timeout: 300ms, retries: 0, discovery_interval: 1h,
+      snmp: { version: 3, vault: true } }
+`, agent.Port)
+	good := map[string]string{"username": "u", "auth_protocol": "SHA", "auth_password": testagent.AuthPass,
+		"priv_protocol": "AES", "priv_password": testagent.PrivPass}
+
+	out := &capture{}
+	d, store := newDevice(t, doc, basicCaps, out)
+	var logs bytes.Buffer
+	d.log = slog.New(slog.NewTextHandler(&logs, nil))
+	fv := &fakeVault{secret: good}
+	d.vault = fv
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	poll := func() error {
+		t.Helper()
+		_, err := d.poll(context.Background(), store, clk.now)
+		clk.advance(time.Minute)
+		return err
+	}
+
+	if err := poll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := poll(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(fv.reads) != "[snmp-poller/dev]" {
+		t.Errorf("reads = %v, want one at the first discovery only", fv.reads)
+	}
+	if out.batches[0].Discovery["sysName"] != "vaulted" {
+		t.Errorf("batch = %+v", out.batches[0])
+	}
+
+	// Vault down at the next discovery: the previous credentials are kept.
+	clk.advance(time.Hour)
+	fv.err = errors.New("vault: connection refused")
+	if err := poll(); err != nil {
+		t.Fatalf("poll with previous credentials: %v", err)
+	}
+	if len(fv.reads) != 2 || !strings.Contains(logs.String(), `msg="credentials refresh failed, keeping the previous ones"`) {
+		t.Errorf("reads = %v, logs:\n%s", fv.reads, logs.String())
+	}
+
+	// Rotated (here: wrong) credentials are applied at the next discovery.
+	clk.advance(time.Hour)
+	fv.err = nil
+	fv.secret = maps.Clone(good)
+	fv.secret["auth_password"] = "rotated-wrong-pass"
+	if err := poll(); err == nil {
+		t.Error("expected the new (wrong) credentials to be used")
+	}
+	if strings.Contains(logs.String(), "rotated-wrong") || strings.Contains(logs.String(), testagent.AuthPass) ||
+		strings.Contains(logs.String(), "t0ken-value") {
+		t.Errorf("credentials in logs:\n%s", logs.String())
+	}
+
+	// A device that never got credentials fails, with the Vault error.
+	d2, store2 := newDevice(t, doc, basicCaps, &capture{})
+	d2.vault = &fakeVault{err: errors.New("vault: GET secret/data/snmp-poller/dev: 403 permission denied")}
+	if _, err := d2.poll(context.Background(), store2, time.Now); err == nil || !strings.Contains(err.Error(), "403 permission denied") {
+		t.Errorf("err = %v", err)
+	}
+	d2.vault = &fakeVault{secret: map[string]string{"community": "c"}}
+	if _, err := d2.poll(context.Background(), store2, time.Now); err == nil ||
+		err.Error() != "vault secret snmp-poller/dev: snmp v3 requires a username" {
+		t.Errorf("err = %v", err)
 	}
 }

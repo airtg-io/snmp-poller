@@ -1,7 +1,7 @@
 // Package snmp wraps gosnmp with the poller's needs: mapping of the resolved
 // configuration (v1, v2c, v3 with every auth/priv protocol and contexts),
-// chunked GETs that tolerate missing OIDs, version-aware walks, and value
-// conversion.
+// chunked GETs that tolerate missing OIDs, GETBULK or GETNEXT walks, and
+// value conversion.
 package snmp
 
 import (
@@ -39,7 +39,8 @@ var privProtocols = map[string]gosnmp.SnmpV3PrivProtocol{
 // Client is a connected SNMP session to one device. It is not safe for
 // concurrent use; each poll opens its own.
 type Client struct {
-	g *gosnmp.GoSNMP
+	g    *gosnmp.GoSNMP
+	walk string
 }
 
 // NewGoSNMP maps a device spec onto a gosnmp session (not yet connected).
@@ -49,7 +50,7 @@ func NewGoSNMP(ctx context.Context, d *config.DeviceSpec) (*gosnmp.GoSNMP, error
 		Context:        ctx,
 		Target:         d.Address,
 		Port:           d.Port,
-		Transport:      s.Transport,
+		Transport:      d.Transport,
 		Timeout:        d.Timeout,
 		Retries:        d.Retries,
 		MaxOids:        d.MaxOIDsPerRequest,
@@ -84,13 +85,13 @@ func NewGoSNMP(ctx context.Context, d *config.DeviceSpec) (*gosnmp.GoSNMP, error
 		case config.AuthNoPriv:
 			g.MsgFlags = gosnmp.AuthNoPriv
 			usm.AuthenticationProtocol = authProtocols[s.AuthProtocol]
-			usm.AuthenticationPassphrase = s.AuthPassphrase.Reveal()
+			usm.AuthenticationPassphrase = s.AuthPassword.Reveal()
 		case config.AuthPriv:
 			g.MsgFlags = gosnmp.AuthPriv
 			usm.AuthenticationProtocol = authProtocols[s.AuthProtocol]
-			usm.AuthenticationPassphrase = s.AuthPassphrase.Reveal()
+			usm.AuthenticationPassphrase = s.AuthPassword.Reveal()
 			usm.PrivacyProtocol = privProtocols[s.PrivProtocol]
-			usm.PrivacyPassphrase = s.PrivPassphrase.Reveal()
+			usm.PrivacyPassphrase = s.PrivPassword.Reveal()
 		}
 		g.SecurityParameters = usm
 	default:
@@ -108,7 +109,7 @@ func Dial(ctx context.Context, d *config.DeviceSpec) (*Client, error) {
 	if err := g.Connect(); err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-	return &Client{g: g}, nil
+	return &Client{g: g, walk: d.Walk}, nil
 }
 
 // Close releases the session.
@@ -228,10 +229,11 @@ func (c *Client) Has(root string) (bool, error) {
 	return ok, nil
 }
 
-// Walk visits every OID below root: GETBULK on v2c/v3, GETNEXT on v1.
+// Walk visits every OID below root, with GETBULK or GETNEXT requests as
+// configured (always GETNEXT on SNMPv1, which has no GETBULK).
 func (c *Client) Walk(root string, fn func(gosnmp.SnmpPDU) error) error {
 	walk := c.g.BulkWalk
-	if c.g.Version == gosnmp.Version1 {
+	if c.walk == config.WalkGetNext || c.g.Version == gosnmp.Version1 {
 		walk = c.g.Walk
 	}
 	err := walk(root, func(p gosnmp.SnmpPDU) error {

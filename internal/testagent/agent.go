@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
@@ -84,6 +85,23 @@ func (m *MIB) items() []*GoSNMPServer.PDUValueControlItem {
 // Agent is a running test agent.
 type Agent struct {
 	Port uint16
+	log  *countingLogger
+}
+
+// BulkRequests returns the number of GETBULK requests served.
+func (a *Agent) BulkRequests() int64 { return a.log.bulk.Load() }
+
+// countingLogger discards logs but counts GETBULK requests, which the
+// server announces with a debug line.
+type countingLogger struct {
+	GoSNMPServer.ILogger
+	bulk atomic.Int64
+}
+
+func (l *countingLogger) Debugf(format string, args ...any) {
+	if strings.HasPrefix(format, "serveGetBulkRequest") {
+		l.bulk.Add(1)
+	}
 }
 
 // Start serves def on the default context (community Community, empty v3
@@ -108,8 +126,9 @@ func Start(t testing.TB, users []User, def *MIB, contexts map[string]*MIB) *Agen
 	for name, m := range contexts {
 		subs = append(subs, &GoSNMPServer.SubAgent{CommunityIDs: []string{name}, OIDs: m.items()})
 	}
+	log := &countingLogger{ILogger: GoSNMPServer.NewDiscardLogger()}
 	srv := GoSNMPServer.NewSNMPServer(GoSNMPServer.MasterAgent{
-		Logger: GoSNMPServer.NewDiscardLogger(),
+		Logger: log,
 		SecurityConfig: GoSNMPServer.SecurityConfig{
 			AuthoritativeEngineBoots: 1,
 			Users:                    usm,
@@ -121,5 +140,5 @@ func Start(t testing.TB, users []User, def *MIB, contexts map[string]*MIB) *Agen
 	}
 	go srv.ServeForever()
 	t.Cleanup(srv.Shutdown)
-	return &Agent{Port: uint16(srv.Address().(*net.UDPAddr).Port)}
+	return &Agent{Port: uint16(srv.Address().(*net.UDPAddr).Port), log: log}
 }

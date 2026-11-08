@@ -15,6 +15,7 @@ import (
 	"github.com/airtg-io/snmp-poller/internal/logging"
 	"github.com/airtg-io/snmp-poller/internal/output"
 	"github.com/airtg-io/snmp-poller/internal/state"
+	"github.com/airtg-io/snmp-poller/internal/vault"
 )
 
 // Poller polls every configured device.
@@ -45,12 +46,25 @@ func New(cfg *config.Config, log *slog.Logger, outputs map[string]output.Output)
 		now:   time.Now,
 		busy:  make([]atomic.Bool, len(specs)),
 	}
+	var vc secretReader
+	for _, spec := range specs {
+		if spec.VaultPath != "" && vc == nil {
+			c, err := vault.New(cfg.Vault)
+			if err != nil {
+				return nil, err
+			}
+			vc = c
+		}
+	}
 	for _, spec := range specs {
 		dl := log.With("device", spec.ID)
 		if spec.Trace {
 			dl = logging.WithMinLevel(dl, slog.LevelDebug)
 		}
 		d := &device{spec: spec, log: dl}
+		if spec.VaultPath != "" {
+			d.vault = vc
+		}
 		for _, name := range spec.Outputs {
 			o, ok := outputs[name]
 			if !ok {

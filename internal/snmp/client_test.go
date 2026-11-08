@@ -12,14 +12,19 @@ import (
 
 func spec(t *testing.T, snmp string) *config.DeviceSpec {
 	t.Helper()
-	c := testconf.Parse(t, `devices: [{ id: d, address: 192.0.2.1, port: 1161, snmp: `+snmp+` }]`,
+	return specWith(t, "", snmp)
+}
+
+func specWith(t *testing.T, extra, snmp string) *config.DeviceSpec {
+	t.Helper()
+	c := testconf.Parse(t, `devices: [{ id: d, address: 192.0.2.1, port: 1161, `+extra+` snmp: `+snmp+` }]`,
 		map[string]string{"uptime": testconf.Uptime})
 	return &c.DeviceSpecs()[0]
 }
 
 func TestNewGoSNMPv3(t *testing.T) {
-	g, err := NewGoSNMP(context.Background(), spec(t, `{ version: 3, transport: tcp, username: u,
-		auth_protocol: SHA384, auth_passphrase: aaaaaaaa, priv_protocol: AES256C, priv_passphrase: bbbbbbbb,
+	g, err := NewGoSNMP(context.Background(), specWith(t, "transport: tcp,", `{ version: 3, username: u,
+		auth_protocol: SHA384, auth_password: aaaaaaaa, priv_protocol: AES256C, priv_password: bbbbbbbb,
 		context_name: vrf-a, context_engine_id: "0x8000000001020304" }`))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +40,7 @@ func TestNewGoSNMPv3(t *testing.T) {
 
 func TestNewGoSNMPv3AuthNoPrivIgnoresPriv(t *testing.T) {
 	g, err := NewGoSNMP(context.Background(), spec(t, `{ version: 3, username: u, security_level: authNoPriv,
-		auth_protocol: MD5, auth_passphrase: aaaaaaaa, priv_protocol: DES, priv_passphrase: bbbbbbbb }`))
+		auth_protocol: MD5, auth_password: aaaaaaaa, priv_protocol: DES, priv_password: bbbbbbbb }`))
 	if err != nil {
 		t.Fatal(err)
 	}

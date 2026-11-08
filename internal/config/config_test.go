@@ -83,7 +83,7 @@ func TestDefaults(t *testing.T) {
 	}
 	s := specs[0]
 	if s.Port != 161 || s.PollInterval != time.Minute || s.DiscoveryInterval != time.Hour ||
-		s.SNMP.Transport != "udp" || s.SNMP.Version != Version2c {
+		s.Transport != TransportUDP || s.Walk != WalkBulk || s.SNMP.Version != Version2c || s.VaultPath != "" {
 		t.Errorf("unexpected device spec: %+v", s)
 	}
 	if len(s.Capabilities) != 1 || s.Capabilities[0].Name != "uptime" {
@@ -148,6 +148,8 @@ func TestReadmeExamplesAreValid(t *testing.T) {
 	t.Setenv("SNMP_COMMUNITY", "from-env")
 	t.Setenv("SNMP_AUTH_PASS", "auth-pass-123")
 	t.Setenv("SNMP_PRIV_PASS", "priv-pass-123")
+	t.Setenv("VAULT_TOKEN", "vault-token")
+	t.Setenv("PRIV_PASS", "priv-pass-123")
 	blocks := strings.Split(string(data), "```yaml\n")
 	if len(blocks) < 2 {
 		t.Fatal("no yaml examples found in README.md")
@@ -183,19 +185,17 @@ global: { poll_interval: 30s, discovery_interval: 2h, timeout: 2s, retries: 3, p
 outputs:
   - { name: a, type: "null" }
   - { name: b, type: "null" }
-credentials:
-  v3:
-    version: 3
-    username: poller
-    auth_protocol: sha-256
-    auth_passphrase: authpass1
-    priv_protocol: aes128
-    priv_passphrase: privpass1
 devices:
   - id: r1
     address: 10.0.0.1
-    credential: v3
-    snmp: { context_name: vrf1, context_engine_id: "0x80001F88" }
+    snmp: &v3
+      version: 3
+      username: poller
+      auth_protocol: sha-256
+      auth_password: authpass1
+      priv_protocol: aes128
+      context_name: vrf1
+      context_engine_id: "0x80001F88"
     poll_interval: 10s
     discovery_interval: 5m
     retries: 0
@@ -204,7 +204,7 @@ devices:
     include: { if: ["^ge-"] }
   - id: r2
     address: 10.0.0.2
-    credential: v3
+    snmp: *v3 # a YAML alias reuses r1's block
 `, map[string]string{
 		"base.yaml": `
 discovery:
@@ -239,8 +239,11 @@ scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 }]
 		s.PrivProtocol != "AES" || s.ContextName != "vrf1" || s.ContextEngineID != "80001f88" {
 		t.Errorf("r1 snmp not normalized: %+v", s)
 	}
-	if r2.SNMP.ContextName != "" {
-		t.Errorf("r2 must not inherit r1's inline context")
+	if s.PrivPassword.Reveal() != "authpass1" {
+		t.Error("priv_password must default to auth_password")
+	}
+	if r2.SNMP.Username != "poller" || r2.SNMP.AuthPassword.Reveal() != "authpass1" || r2.SNMP.SecurityLevel != AuthPriv {
+		t.Errorf("r2 must reuse r1's snmp block through the alias: %+v", r2.SNMP)
 	}
 	if fmt.Sprint(r1.Outputs) != "[b]" || fmt.Sprint(r2.Outputs) != "[a b]" {
 		t.Errorf("outputs: r1=%v r2=%v", r1.Outputs, r2.Outputs)
@@ -293,8 +296,8 @@ scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 }]
 func TestSecurityLevelInference(t *testing.T) {
 	for _, tc := range []struct{ snmp, want string }{
 		{`{ version: 3, username: u }`, NoAuthNoPriv},
-		{`{ version: 3, username: u, auth_protocol: MD5, auth_passphrase: 12345678 }`, AuthNoPriv},
-		{`{ version: 3, username: u, auth_protocol: SHA512, auth_passphrase: 12345678, priv_protocol: AES256C, priv_passphrase: 12345678 }`, AuthPriv},
+		{`{ version: 3, username: u, auth_protocol: MD5, auth_password: 12345678 }`, AuthNoPriv},
+		{`{ version: 3, username: u, auth_protocol: SHA512, auth_password: 12345678, priv_protocol: AES256C, priv_password: 12345678 }`, AuthPriv},
 	} {
 		c := mustParse(t, `devices: [{ id: d, address: x, snmp: `+tc.snmp+` }]`)
 		if got := c.DeviceSpecs()[0].SNMP.SecurityLevel; got != tc.want {
@@ -314,15 +317,46 @@ func TestValidationErrors(t *testing.T) {
 		{`profiles: {}`, "field profiles not found"},
 		{`global: { conf_dir: nope }`, "capabilities: open"},
 		{`devices: [{ id: "bad id", address: x }]`, "id may only contain"},
-		{`devices: [{ id: d, snmp: { version: 2c, community: c } }]`, "address is required"},
+		{`devices: [{ id: key.dat, address: x }]`, "is reserved"},
+		{`devices: [{ id: d, snmp: { version: 2c, community: c } }]`, "devices[0]: address is required"},
+		{`devices: [{ id: d, address: x }]`, "snmp is required"},
+		{`credentials: {}`, "field credentials not found"},
+		{dev(`, credential: nope`), "field credential not found"},
+		{`devices: [{ address: x, snmp: { version: 2c, community: c, transport: tcp } }]`, "field transport not found in type config.SNMP"},
+		{`devices: [{ address: x, snmp: { version: 2c, community: c, auth_passphrase: x } }]`, "field auth_passphrase not found"},
+		// Same agent twice: by default id, explicit ids, or equivalent addresses.
+		{`devices: [{ address: 10.0.0.1, enabled: false }, { address: 10.0.0.1, port: 161 }]`, `device "10.0.0.1-161": duplicate id`},
+		{`devices: [{ id: a, address: 10.0.0.1 }, { id: b, address: 10.0.0.1 }]`, `device "b": address 10.0.0.1 port 161 is already used by device "a"`},
+		{`devices: [{ id: a, address: "::ffff:10.0.0.1" }, { id: b, address: 10.0.0.1 }]`, "already used"},
+		{`devices: [{ id: a, address: "2001:db8::1" }, { id: b, address: "2001:DB8:0::1" }]`, "already used"},
+		{`devices: [{ id: a, address: Router.example.net. }, { id: b, address: router.example.net }]`, "already used"},
+		{`devices: [{ id: a, address: x, snmp: { version: 3, username: u, context_name: c1 } }, { id: b, address: x, snmp: { version: 3, username: u, context_name: c1 } }]`, "already used"},
+		{`global: { transport: sctp }`, `global.transport "sctp": must be udp or tcp`},
+		{`global: { walk: fast }`, `global.walk "fast": must be bulk or getnext`},
+		{dev(`, transport: sctp`), `transport "sctp"`},
+		{dev(`, walk: fast`), `walk "fast"`},
+		{`devices: [{ id: d, address: x, walk: bulk, snmp: { version: 1, community: c } }]`, "bulk is not available in SNMPv1"},
+		{dev(`, snmp: { vault: true }`), "mapping key \"snmp\" already defined"},
+		{`devices: [{ id: d, address: x, snmp: { vault: true } }]`, "snmp.vault requires a vault section"},
+		{`devices: [{ id: d, address: x, snmp: { vault: [a] } }]`, "vault must be true, false or a secret path"},
+		{`devices: [{ id: d, address: x, snmp: { vault: "/" } }]`, "vault path is empty"},
+		{`vault: { address: "vault:8200", auth: { method: token } }`, "must be an http:// or https:// URL"},
+		{`vault: { auth: { method: token } }`, "vault.address is required"},
+		{`vault: { address: "https://v", auth: { method: ldap } }`, `vault.auth.method "ldap"`},
+		{`vault: { address: "https://v", kv_version: 3, auth: { method: token } }`, "kv_version must be 1 or 2"},
+		{`vault: { address: "https://v", auth: { method: token, bogus: 1 } }`, "field bogus not found"},
+		{vaultDev(`{ method: token }`), "method token requires token"},
+		{vaultDev(`{ method: approle, secret_id: s }`), "method approle requires role_id"},
+		{vaultDev(`{ method: approle, role_id: r }`), "method approle requires secret_id"},
+		{vaultDev(`{ method: userpass, username: u }`), "method userpass requires password"},
+		{vaultDev(`{ method: kubernetes }`), "method kubernetes requires role"},
 		{`devices: [{ id: d, address: x, snmp: { version: 4 } }]`, "unsupported snmp version"},
 		{`devices: [{ id: d, address: x, snmp: { version: 2c } }]`, "requires a community"},
 		{`devices: [{ id: d, address: x, snmp: { version: 3 } }]`, "requires a username"},
 		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD4 } }]`, "auth_protocol"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: short } }]`, "at least 8"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, security_level: authPriv, auth_protocol: MD5, auth_passphrase: 12345678 } }]`, "requires priv_protocol"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_password: short } }]`, "at least 8"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, security_level: authPriv, auth_protocol: MD5, auth_password: 12345678 } }]`, "requires priv_protocol"},
 		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, context_engine_id: zz } }]`, "hex"},
-		{dev(`, credential: nope`), "unknown credential"},
 		{dev(`, outputs: [nope]`), "unknown output"},
 		{dev(`, profiles: [x]`), "field profiles not found"},
 		{dev(`, scalars: []`), "field scalars not found"},
@@ -393,8 +427,74 @@ func TestDisabledDeviceSkipped(t *testing.T) {
 	}
 }
 
+// vaultDev is a device reading its credentials from Vault with auth.
+func vaultDev(auth string) string {
+	return `vault: { address: "https://vault:8200", auth: ` + auth + ` }
+devices: [{ id: d, address: x, snmp: { vault: true } }]`
+}
+
 func TestUnusedCredentialNotValidated(t *testing.T) {
-	mustParse(t, `credentials: { unused: { version: 2c, community: "${UNSET_VAR_FOR_TEST}" } }`)
+	// Neither the disabled device nor Vault (used by no enabled device) is
+	// validated beyond its syntax.
+	c := mustParse(t, `
+vault: { address: "https://vault:8200", auth: { method: token, token: "${UNSET_VAR_FOR_TEST}" } }
+devices:
+  - { address: x, enabled: false, snmp: { version: 2c, community: "${UNSET_VAR_FOR_TEST}" } }
+  - { address: y, enabled: false, snmp: { vault: true } }
+  - { address: z, snmp: { version: 2c, community: c } }
+`)
+	if len(c.DeviceSpecs()) != 1 {
+		t.Errorf("specs = %d, want 1", len(c.DeviceSpecs()))
+	}
+}
+
+func TestDefaultID(t *testing.T) {
+	c := mustParse(t, `
+global: { port: 1161 }
+devices:
+  - { address: 192.0.2.1, snmp: { version: 2c, community: c } }
+  - { address: 192.0.2.1, port: 161, snmp: { version: 2c, community: c } }
+  - { address: "2001:db8::1", snmp: { version: 2c, community: c } }
+  - { address: core-1.example.net, snmp: { version: 2c, community: c } }
+  - { id: named, address: 192.0.2.2, snmp: { version: 2c, community: c } }
+  # The same agent twice is only valid for two SNMPv3 contexts.
+  - { id: vrf-a, address: 192.0.2.3, snmp: { version: 3, username: u, context_name: a } }
+  - { id: vrf-b, address: 192.0.2.3, snmp: { version: 3, username: u, context_name: b } }
+`)
+	var ids []string
+	for _, s := range c.DeviceSpecs() {
+		ids = append(ids, s.ID)
+	}
+	want := "[192.0.2.1-1161 192.0.2.1-161 2001_db8__1-1161 core-1.example.net-1161 named vrf-a vrf-b]"
+	if fmt.Sprint(ids) != want {
+		t.Errorf("ids = %v, want %s", ids, want)
+	}
+	if c.Devices[0].ID != "192.0.2.1-1161" {
+		t.Errorf("Devices[0].ID = %q, want the default id", c.Devices[0].ID)
+	}
+}
+
+func TestTransportAndWalk(t *testing.T) {
+	c := mustParse(t, `
+global: { transport: TCP, walk: getnext }
+devices:
+  - { id: inherit, address: a, snmp: { version: 2c, community: c } }
+  - { id: override, address: b, transport: udp, walk: bulk, snmp: { version: 2c, community: c } }
+  - { id: v1, address: c, snmp: { version: 1, community: c } }
+`)
+	got := map[string]string{}
+	for _, s := range c.DeviceSpecs() {
+		got[s.ID] = s.Transport + "/" + s.Walk
+	}
+	want := map[string]string{"inherit": "tcp/getnext", "override": "udp/bulk", "v1": "tcp/getnext"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("transport/walk = %v, want %v", got, want)
+	}
+	// The bulk default does not apply to SNMPv1, which has no GETBULK.
+	c = mustParse(t, `devices: [{ id: v1, address: c, snmp: { version: 1, community: c } }]`)
+	if w := c.DeviceSpecs()[0].Walk; w != WalkGetNext {
+		t.Errorf("v1 walk = %s, want getnext", w)
+	}
 }
 
 func TestSecretNeverLeaks(t *testing.T) {
@@ -418,7 +518,7 @@ devices:
 		}
 	}
 	// Validation errors must not echo secrets either.
-	_, err := parse(t, `devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: leak } }]`)
+	_, err := parse(t, `devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_password: leak } }]`)
 	if err == nil || strings.Contains(err.Error(), "leak") {
 		t.Errorf("err = %v", err)
 	}
