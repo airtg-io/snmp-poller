@@ -53,7 +53,7 @@ vault:
   auth:
     method: approle            # token, approle, userpass or kubernetes
     role_id: snmp-poller
-    secret_id: ~~1DC1E68DA1208995AE1AB341AAAE75D6971A2DFAC90E05DEDEF1708E628BB7320B9F697592~~       # encrypted on startup
+    secret_id: change-me       # encrypted on startup
 
 devices:
   # Examples, all disabled: set enabled: true (or remove it) to poll one.
@@ -63,7 +63,7 @@ devices:
     enabled: false
     snmp:
       version: 2c
-      community: ~~F584A09EFEEF311B36DE0DC0BE89009A29123ED6A6620F091F342FCBA6D5254C80AA~~        # encrypted on startup
+      community: public        # encrypted on startup
 
   # SNMPv1 over TCP, custom port and id; v1 always walks with GETNEXT.
   - id: legacy-ups
@@ -85,9 +85,9 @@ devices:
       username: poller
       security_level: authPriv       # noAuthNoPriv, authNoPriv or authPriv
       auth_protocol: SHA256          # MD5, SHA, SHA224, SHA256, SHA384, SHA512
-      auth_password: ~~785E23F85926EC42E0184A16F5BEE60AAAD66E899A102F2F977281E179FBED5B7801DC6240C201C1AEFA~~  # encrypted on startup
+      auth_password: change-me-auth  # encrypted on startup
       priv_protocol: AES             # DES, AES, AES192, AES256, AES192C, AES256C
-      priv_password: ~~253EAF63802E8BADC7090147559CE3DF53C6A16F6C1650A5E677FC975EEB8CEEB8D38148A8244D308FA3~~  # defaults to auth_password; encrypted on startup
+      priv_password: change-me-priv  # defaults to auth_password; encrypted on startup
     # Every capability of etc/conf.d found on the device is polled, except:
     # exclude: [interfaces]
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -97,6 +98,23 @@ func TestDefaults(t *testing.T) {
 	}
 	if len(s.Outputs) != 1 || s.Outputs[0] != "null" {
 		t.Errorf("device outputs = %v", s.Outputs)
+	}
+}
+
+// The shipped configuration is a template: running the poller with it
+// encrypts its example credentials with a local key, which must not be
+// committed (nobody else has that key).
+func TestDefaultConfigFileNotSealed(t *testing.T) {
+	data, err := os.ReadFile(repoPath(DefaultPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		if encrypted := regexp.MustCompile(`~~(?:[0-9A-Fa-f]{2})+~~`).FindString(line); encrypted != "" {
+			t.Errorf("%s:%d holds an encrypted credential: the poller was run with the shipped file, "+
+				"which encrypted it with a local key. Put the clear example value back "+
+				"(git checkout %s) and run with a copy (-config).", DefaultPath, i+1, DefaultPath)
+		}
 	}
 }
 

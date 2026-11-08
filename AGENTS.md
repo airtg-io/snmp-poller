@@ -103,6 +103,9 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   `dpkg -x` each into a scratch dir, run `snmpd -C -c <conf> -I -smux` on a high port with
   `LD_LIBRARY_PATH`, `SNMP_PERSISTENT_DIR` and `MIBS=""` set. net-snmp supports every v3
   combination above (AES192/256 = Blumenthal), and contexts via `access ... <context> ...`.
+- Running the poller with the shipped `etc/snmp-poller.yaml` encrypts its example credentials
+  with a local `data/key.dat`: never commit that (`TestDefaultConfigFileNotSealed` fails). Run
+  with a copy (`-config`) and run the package (`go run ./cmd/snmp-poller`), not `main.go` alone.
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
 
