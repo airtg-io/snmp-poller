@@ -1,0 +1,76 @@
+# AIrtg SNMP Poller - default configuration.
+# Every option is documented in README.md. Values shown are the defaults
+# unless stated otherwise.
+
+global:
+  threads: 250                 # concurrent polls (worker pool size)
+  poll_interval: 60s           # default for devices
+  discovery_interval: 1h       # default for devices; discovery also runs on the first poll
+  timeout: 5s                  # per SNMP request
+  retries: 1
+  max_oids_per_request: 30     # varbinds per GET request
+  max_repetitions: 25          # GETBULK max-repetitions (v2c/v3 walks)
+  port: 161
+  data_dir: data               # on-disk state for rate/volume; wiped on startup
+  stats_interval: 1m           # periodic summary log line
+  shutdown_timeout: 30s        # grace period for in-flight polls on SIGINT/SIGTERM
+
+logging:
+  level: info                  # debug, info, warn, error
+  console:
+    enabled: true
+    format: text               # text or json
+  file:
+    enabled: true
+    path: logs/auto-rotate.log
+    format: text
+    max_size_mb: 50            # rotate when the file reaches this size
+    max_backups: 10            # rotated files to keep (0 = all)
+    max_age_days: 30           # delete rotated files older than this (0 = never)
+    compress: true             # gzip rotated files
+    local_time: true           # local time in rotated file names (false = UTC)
+
+outputs:
+  - name: blackhole
+    type: "null"               # discards everything (the only output type for now)
+
+credentials:
+  public-v2c:
+    version: 2c
+    community: ${SNMP_COMMUNITY}   # read from the environment
+
+profiles:
+  system:
+    discovery:
+      columns:
+        entPhysicalModelName: 1.3.6.1.2.1.47.1.1.1.1.13
+        entPhysicalSerialNum: 1.3.6.1.2.1.47.1.1.1.1.11
+    scalars:
+      - name: sysUpTime
+        oid: 1.3.6.1.2.1.1.3.0
+
+  if-mib:
+    discovery:
+      columns:
+        ifName: 1.3.6.1.2.1.31.1.1.1.1
+        ifDescr: 1.3.6.1.2.1.2.2.1.2
+        ifAlias: 1.3.6.1.2.1.31.1.1.1.18
+    tables:
+      - name: interfaces
+        label: ifName
+        labels: [ifDescr, ifAlias]
+        columns:
+          - { name: ifHCInOctets,  oid: 1.3.6.1.2.1.31.1.1.1.6,  modes: [rate, volume] }
+          - { name: ifHCOutOctets, oid: 1.3.6.1.2.1.31.1.1.1.10, modes: [rate, volume] }
+          - { name: ifInErrors,    oid: 1.3.6.1.2.1.2.2.1.14,    modes: [volume] }
+          - { name: ifOutErrors,   oid: 1.3.6.1.2.1.2.2.1.20,    modes: [volume] }
+          - { name: ifOperStatus,  oid: 1.3.6.1.2.1.2.2.1.8 }
+          - { name: ifHighSpeed,   oid: 1.3.6.1.2.1.31.1.1.1.15 }
+
+devices:
+  # Example device, disabled. Set SNMP_COMMUNITY and enabled: true to try it.
+  - id: localhost
+    address: 127.0.0.1
+    enabled: false
+    credential: public-v2c
+    profiles: [system, if-mib]
