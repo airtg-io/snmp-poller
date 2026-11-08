@@ -45,29 +45,30 @@ type Global struct {
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 }
 
-// Logging configures the console and rotating file log sinks.
+// Logging configures the console and rotating file log sinks. Records are
+// always text (logfmt) with RFC 3339 timestamps that carry their time zone.
 type Logging struct {
-	Level   string     `yaml:"level"`
-	Console ConsoleLog `yaml:"console"`
-	File    FileLog    `yaml:"file"`
+	Level string `yaml:"level"`
+	// LocalTime selects the local time zone for timestamps in records and in
+	// rotated file names. The default is UTC.
+	LocalTime *bool      `yaml:"local_time"`
+	Console   ConsoleLog `yaml:"console"`
+	File      FileLog    `yaml:"file"`
 }
 
 // ConsoleLog configures logging to stderr.
 type ConsoleLog struct {
-	Enabled *bool  `yaml:"enabled"`
-	Format  string `yaml:"format"`
+	Enabled *bool `yaml:"enabled"`
 }
 
 // FileLog configures logging to an automatically rotated file.
 type FileLog struct {
 	Enabled    *bool  `yaml:"enabled"`
 	Path       string `yaml:"path"`
-	Format     string `yaml:"format"`
 	MaxSizeMB  int    `yaml:"max_size_mb"`
 	MaxBackups *int   `yaml:"max_backups"`
 	MaxAgeDays *int   `yaml:"max_age_days"`
 	Compress   *bool  `yaml:"compress"`
-	LocalTime  *bool  `yaml:"local_time"`
 }
 
 // Output declares one destination for polled samples.
@@ -241,17 +242,11 @@ func (c *Config) applyDefaults() {
 	if l.Console.Enabled == nil {
 		l.Console.Enabled = ptr(true)
 	}
-	if l.Console.Format == "" {
-		l.Console.Format = "text"
-	}
 	if l.File.Enabled == nil {
 		l.File.Enabled = ptr(true)
 	}
 	if l.File.Path == "" {
-		l.File.Path = "logs/auto-rotate.log"
-	}
-	if l.File.Format == "" {
-		l.File.Format = "text"
+		l.File.Path = "logs/snmp-poller.log"
 	}
 	if l.File.MaxSizeMB == 0 {
 		l.File.MaxSizeMB = 50
@@ -265,8 +260,8 @@ func (c *Config) applyDefaults() {
 	if l.File.Compress == nil {
 		l.File.Compress = ptr(true)
 	}
-	if l.File.LocalTime == nil {
-		l.File.LocalTime = ptr(true)
+	if l.LocalTime == nil {
+		l.LocalTime = ptr(false)
 	}
 
 	if len(c.Outputs) == 0 {

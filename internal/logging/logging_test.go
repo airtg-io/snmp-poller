@@ -5,8 +5,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
 )
@@ -21,9 +23,9 @@ func cfg(t *testing.T, doc string) config.Logging {
 }
 
 func TestConsoleAndFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "logs", "auto-rotate.log")
+	path := filepath.Join(t.TempDir(), "logs", "snmp-poller.log")
 	var console bytes.Buffer
-	l, err := New(cfg(t, `logging: { level: warn, file: { path: `+path+`, format: json } }`), &console)
+	l, err := New(cfg(t, `logging: { level: warn, file: { path: `+path+` } }`), &console)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +40,7 @@ func TestConsoleAndFile(t *testing.T) {
 	if strings.Contains(console.String(), "hidden") || !strings.Contains(console.String(), "msg=shown device=r1") {
 		t.Errorf("console = %q", console.String())
 	}
-	if strings.Contains(string(data), "hidden") || !strings.Contains(string(data), `"msg":"shown"`) {
+	if strings.Contains(string(data), "hidden") || !strings.Contains(string(data), "msg=shown device=r1") {
 		t.Errorf("file = %q", data)
 	}
 }
@@ -80,5 +82,32 @@ func TestUnwritableFile(t *testing.T) {
 	_, err := New(cfg(t, `logging: { file: { path: `+filepath.Join(blocker, "x.log")+` } }`), &bytes.Buffer{})
 	if err == nil {
 		t.Error("expected an error for an unwritable log path")
+	}
+}
+
+func TestTimestampsCarryZone(t *testing.T) {
+	saved := time.Local
+	time.Local = time.FixedZone("TEST", 2*3600)
+	t.Cleanup(func() { time.Local = saved })
+	at := time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		doc  string
+		want *regexp.Regexp
+	}{
+		{`logging: { file: { enabled: false } }`,
+			regexp.MustCompile(`^time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z level=INFO msg=m at=2026-11-08T10:00:00\.000Z\n$`)},
+		{`logging: { local_time: true, file: { enabled: false } }`,
+			regexp.MustCompile(`^time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}\+02:00 level=INFO msg=m at=2026-11-08T12:00:00\.000\+02:00\n$`)},
+	} {
+		var console bytes.Buffer
+		l, err := New(cfg(t, tc.doc), &console)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l.Info("m", "at", at)
+		if !tc.want.MatchString(console.String()) {
+			t.Errorf("%s: got %q", tc.doc, console.String())
+		}
 	}
 }

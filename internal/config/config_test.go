@@ -43,7 +43,8 @@ func TestDefaults(t *testing.T) {
 		t.Errorf("unexpected global defaults: %+v", g)
 	}
 	l := c.Logging
-	if l.Level != "info" || !*l.Console.Enabled || !*l.File.Enabled || l.File.Path != "logs/auto-rotate.log" {
+	if l.Level != "info" || !*l.Console.Enabled || !*l.File.Enabled || l.File.Path != "logs/snmp-poller.log" ||
+		*l.LocalTime || !*l.File.Compress {
 		t.Errorf("unexpected logging defaults: %+v", l)
 	}
 	if len(c.Outputs) != 1 || c.Outputs[0].Type != "null" {

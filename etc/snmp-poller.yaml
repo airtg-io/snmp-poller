@@ -17,18 +17,16 @@ global:
 
 logging:
   level: info                  # debug, info, warn, error
+  local_time: false            # timestamps and rotated file names in UTC (true = local time zone)
   console:
     enabled: true
-    format: text               # text or json
   file:
     enabled: true
-    path: logs/auto-rotate.log
-    format: text
+    path: logs/snmp-poller.log # rotated to logs/snmp-poller-<time>.log.gz
     max_size_mb: 50            # rotate when the file reaches this size
     max_backups: 10            # rotated files to keep (0 = all)
     max_age_days: 30           # delete rotated files older than this (0 = never)
     compress: true             # gzip rotated files
-    local_time: true           # local time in rotated file names (false = UTC)
 
 outputs:
   - name: blackhole

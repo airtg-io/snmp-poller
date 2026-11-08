@@ -24,8 +24,11 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   The data dir is cleaned on startup, and a device's state is wiped on each rediscovery.
 - **Row based polling**: tables with an inclusive regex pattern list (`include`) matched against the
   row label (a discovery column, e.g. ifName) or the row index when no label is configured.
-- **Logging**: configurable. Default to console + file `logs/auto-rotate.log` with automatic rotation
-  (size, backups, age, compression) and configurable level.
+- **Logging**: configurable level and sinks. Default to console + file `logs/snmp-poller.log` with
+  automatic rotation (size, backups, age, gzip) to `logs/snmp-poller-<time>.log.gz`.
+  Format is always text (logfmt), not configurable (JSON was removed on purpose).
+  Every timestamp is RFC 3339 with ms and an explicit zone; UTC by default, `logging.local_time: true`
+  switches records and rotated file names to the local zone.
 - **Useful logs**: no per-poll noise at info. A stats line every `stats_interval` (default 1m) with
   polls in progress, queued, succeeded, failed, skipped (overrun), discoveries, samples, durations.
   Per-device tracing (`trace: true` on a device) logs debug details for that device only, always

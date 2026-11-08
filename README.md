@@ -98,16 +98,27 @@ Durations use Go syntax: `500ms`, `30s`, `5m`, `1h`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `level` | `info` | `debug`, `info`, `warn` or `error`. |
+| `local_time` | `false` | Use the local time zone instead of UTC for record timestamps and rotated file names. |
 | `console.enabled` | `true` | Log to stderr. |
-| `console.format` | `text` | `text` (logfmt) or `json`. |
 | `file.enabled` | `true` | Log to a file. |
-| `file.path` | `logs/auto-rotate.log` | Log file. Its directory is created if needed. |
-| `file.format` | `text` | `text` or `json`. |
+| `file.path` | `logs/snmp-poller.log` | Log file. Its directory is created if needed. |
 | `file.max_size_mb` | `50` | Rotate when the file reaches this size. |
 | `file.max_backups` | `10` | Rotated files to keep (`0` keeps all). |
 | `file.max_age_days` | `30` | Delete rotated files older than this (`0` never). |
 | `file.compress` | `true` | Gzip rotated files. |
-| `file.local_time` | `true` | Local time in rotated file names (`false` for UTC). |
+
+Records are always plain text (logfmt), on the console and in the file. Every timestamp is
+RFC 3339 with milliseconds and an explicit time zone: `2026-11-08T10:00:00.000Z` in UTC (the
+default), or `2026-11-08T11:00:00.000+01:00` with `local_time: true`.
+
+When `logs/snmp-poller.log` reaches `max_size_mb`, it is renamed with the rotation time and a
+new file is started. Rotated files are then gzipped:
+
+```text
+logs/snmp-poller.log                                # current file
+logs/snmp-poller-2026-11-08T10-00-00.000.log.gz     # rotated, compressed
+logs/snmp-poller-2026-11-07T22-41-17.512.log.gz
+```
 
 ### `outputs`
 
@@ -506,12 +517,13 @@ devices:
     scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]
 ```
 
-### Logging: JSON console only, debug level
+### Logging: console only, debug level, local time
 
 ```yaml
 logging:
   level: debug
-  console: { enabled: true, format: json }
+  local_time: true
+  console: { enabled: true }
   file: { enabled: false }
 
 devices:
@@ -528,13 +540,11 @@ logging:
   level: info
   console: { enabled: false }
   file:
-    path: /var/log/snmp-poller/poller.log
-    format: json
+    path: /var/log/snmp-poller/snmp-poller.log
     max_size_mb: 100
     max_backups: 5
     max_age_days: 14
     compress: true
-    local_time: false
 
 devices:
   - id: troublesome

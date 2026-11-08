@@ -1,5 +1,7 @@
 // Package logging builds the process logger: console and/or an automatically
 // rotated log file, with a configurable level, plus per-device overrides.
+// Records are text (logfmt). Every timestamp is RFC 3339 with milliseconds and
+// an explicit time zone, in UTC unless logging.local_time is set.
 package logging
 
 import (
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 
@@ -56,12 +59,16 @@ func New(cfg config.Logging, console io.Writer) (*Logger, error) {
 	}
 	// Sinks accept every record; filtering happens in the root handler so
 	// device-level trace can bypass the global level.
-	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	loc := time.UTC
+	if *cfg.LocalTime {
+		loc = time.Local
+	}
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug, ReplaceAttr: timeIn(loc)}
 	l := &Logger{}
 	var sinks []slog.Handler
 
 	if *cfg.Console.Enabled {
-		sinks = append(sinks, newHandler(console, cfg.Console.Format, opts))
+		sinks = append(sinks, slog.NewTextHandler(console, opts))
 	}
 	if *cfg.File.Enabled {
 		if err := os.MkdirAll(filepath.Dir(cfg.File.Path), 0o755); err != nil {
@@ -73,24 +80,32 @@ func New(cfg config.Logging, console io.Writer) (*Logger, error) {
 			MaxBackups: *cfg.File.MaxBackups,
 			MaxAge:     *cfg.File.MaxAgeDays,
 			Compress:   *cfg.File.Compress,
-			LocalTime:  *cfg.File.LocalTime,
+			LocalTime:  *cfg.LocalTime,
 		}
 		// Fail early on an unwritable path instead of on the first record.
 		if _, err := lj.Write(nil); err != nil {
 			return nil, fmt.Errorf("log file: %w", err)
 		}
 		l.closers = append(l.closers, lj)
-		sinks = append(sinks, newHandler(lj, cfg.File.Format, opts))
+		sinks = append(sinks, slog.NewTextHandler(lj, opts))
 	}
 	l.Logger = slog.New(&levelHandler{min: level, next: fanout(sinks)})
 	return l, nil
 }
 
-func newHandler(w io.Writer, format string, opts *slog.HandlerOptions) slog.Handler {
-	if format == "json" {
-		return slog.NewJSONHandler(w, opts)
+// TimeFormat is the layout of every timestamp in log records. The zone is
+// always present: "Z" for UTC, a numeric offset otherwise.
+const TimeFormat = "2006-01-02T15:04:05.000Z07:00"
+
+// timeIn renders the record time, and any time attribute, in loc using
+// TimeFormat.
+func timeIn(loc *time.Location) func([]string, slog.Attr) slog.Attr {
+	return func(_ []string, a slog.Attr) slog.Attr {
+		if a.Value.Kind() == slog.KindTime {
+			a.Value = slog.StringValue(a.Value.Time().In(loc).Format(TimeFormat))
+		}
+		return a
 	}
-	return slog.NewTextHandler(w, opts)
 }
 
 // WithMinLevel returns a logger derived from l whose records are emitted down

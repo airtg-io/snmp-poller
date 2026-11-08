@@ -397,6 +397,47 @@ devices:
 	}
 }
 
+// With no enabled device the poller must keep running until asked to stop,
+// not start shutting down immediately.
+func TestRunNoDevices(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(fmt.Sprintf(
+		`global: { data_dir: %s }`, filepath.Join(t.TempDir(), "data"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	var logMu sync.Mutex
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	p, err := New(cfg, log, map[string]output.Output{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.Run(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	logMu.Lock()
+	early := logs.String()
+	logMu.Unlock()
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before cancel: %v", err)
+	default:
+	}
+	if strings.Contains(early, "poller stopping") {
+		t.Errorf("poller stopping logged before any signal:\n%s", early)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }

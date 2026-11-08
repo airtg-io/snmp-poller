@@ -113,11 +113,6 @@ func (c *Config) validate() error {
 	default:
 		add("logging.level %q: must be debug, info, warn or error", c.Logging.Level)
 	}
-	for name, f := range map[string]string{"console": c.Logging.Console.Format, "file": c.Logging.File.Format} {
-		if f != "text" && f != "json" {
-			add("logging.%s.format %q: must be text or json", name, f)
-		}
-	}
 	if c.Logging.File.MaxSizeMB < 1 {
 		add("logging.file.max_size_mb must be >= 1")
 	}

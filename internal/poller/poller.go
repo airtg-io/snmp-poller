@@ -125,6 +125,11 @@ func (p *Poller) schedule(ctx context.Context, jobs chan<- int) {
 		q = append(q, due{at: start.Add(offset), dev: i})
 	}
 	heap.Init(&q)
+	if len(q) == 0 {
+		// Nothing to poll: keep running (stats included) until asked to stop.
+		<-ctx.Done()
+		return
+	}
 
 	timer := time.NewTimer(0)
 	defer timer.Stop()
