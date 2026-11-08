@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -23,11 +24,10 @@ type Config struct {
 	Logging     Logging         `yaml:"logging"`
 	Outputs     []Output        `yaml:"outputs"`
 	Credentials map[string]SNMP `yaml:"credentials"`
-	Profiles    map[string]Set  `yaml:"profiles"`
 	Devices     []Device        `yaml:"devices"`
 
-	specs       []DeviceSpec
-	badProfiles map[string]bool
+	capabilities []*Capability
+	specs        []DeviceSpec
 }
 
 // Global holds process-wide settings and the defaults inherited by devices.
@@ -41,6 +41,7 @@ type Global struct {
 	MaxRepetitions    uint32        `yaml:"max_repetitions"`
 	Port              uint16        `yaml:"port"`
 	DataDir           string        `yaml:"data_dir"`
+	ConfDir           string        `yaml:"conf_dir"`
 	StatsInterval     time.Duration `yaml:"stats_interval"`
 	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 }
@@ -95,91 +96,48 @@ type SNMP struct {
 	ContextEngineID string `yaml:"context_engine_id"`
 }
 
-// Set is a reusable group of discovery items and metrics. Profiles are Sets,
-// and a device can also declare a Set inline.
-type Set struct {
-	Discovery Discovery `yaml:"discovery"`
-	Scalars   []Scalar  `yaml:"scalars"`
-	Tables    []Table   `yaml:"tables"`
-}
-
-// Discovery lists slow-changing data collected on discovery runs.
-// Scalars maps a name to a scalar OID (e.g. sysDescr -> 1.3.6.1.2.1.1.1.0).
-// Columns maps a name to a table column OID that is walked (e.g. ifName).
-type Discovery struct {
-	Scalars map[string]string `yaml:"scalars"`
-	Columns map[string]string `yaml:"columns"`
-}
-
-// Mode selects how a value is emitted.
-type Mode string
-
-// Supported modes.
-const (
-	ModeRaw    Mode = "raw"
-	ModeRate   Mode = "rate"
-	ModeVolume Mode = "volume"
-)
-
-// Scalar is a single OID polled every cycle.
-type Scalar struct {
-	Name  string `yaml:"name"`
-	OID   string `yaml:"oid"`
-	Modes []Mode `yaml:"modes"`
-}
-
-// Table is a set of columns polled for every selected row.
-type Table struct {
-	Name    string   `yaml:"name"`
-	Label   string   `yaml:"label"`
-	Include []string `yaml:"include"`
-	Labels  []string `yaml:"labels"`
-	Columns []Column `yaml:"columns"`
-}
-
-// Column is one table column polled for each selected row.
-type Column struct {
-	Name  string `yaml:"name"`
-	OID   string `yaml:"oid"`
-	Modes []Mode `yaml:"modes"`
-}
-
 // Device is one SNMP agent to poll.
 type Device struct {
-	ID                string        `yaml:"id"`
-	Address           string        `yaml:"address"`
-	Port              uint16        `yaml:"port"`
-	Enabled           *bool         `yaml:"enabled"`
-	Credential        string        `yaml:"credential"`
-	SNMP              *SNMP         `yaml:"snmp"`
-	Profiles          []string      `yaml:"profiles"`
-	PollInterval      time.Duration `yaml:"poll_interval"`
-	DiscoveryInterval time.Duration `yaml:"discovery_interval"`
-	Timeout           time.Duration `yaml:"timeout"`
-	Retries           *int          `yaml:"retries"`
-	MaxOIDsPerRequest int           `yaml:"max_oids_per_request"`
-	MaxRepetitions    uint32        `yaml:"max_repetitions"`
-	Outputs           []string      `yaml:"outputs"`
-	Trace             bool          `yaml:"trace"`
-	Set               `yaml:",inline"`
+	ID         string `yaml:"id"`
+	Address    string `yaml:"address"`
+	Port       uint16 `yaml:"port"`
+	Enabled    *bool  `yaml:"enabled"`
+	Credential string `yaml:"credential"`
+	SNMP       *SNMP  `yaml:"snmp"`
+	// Exclude lists capabilities never applied to this device, even when
+	// detected. Every other capability applies when detected.
+	Exclude []string `yaml:"exclude"`
+	// Include overrides the include patterns of tables, by table name.
+	Include           map[string][]string `yaml:"include"`
+	PollInterval      time.Duration       `yaml:"poll_interval"`
+	DiscoveryInterval time.Duration       `yaml:"discovery_interval"`
+	Timeout           time.Duration       `yaml:"timeout"`
+	Retries           *int                `yaml:"retries"`
+	MaxOIDsPerRequest int                 `yaml:"max_oids_per_request"`
+	MaxRepetitions    uint32              `yaml:"max_repetitions"`
+	Outputs           []string            `yaml:"outputs"`
+	Trace             bool                `yaml:"trace"`
 }
 
-// Load reads, defaults and validates the configuration file at path.
+// Load reads, defaults and validates the configuration file at path and the
+// capabilities directory it refers to. A relative global.conf_dir is
+// resolved against the directory of path.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	cfg, err := Parse(f)
+	cfg, err := Parse(f, filepath.Dir(path))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return cfg, nil
 }
 
-// Parse decodes, defaults and validates a configuration document.
-func Parse(r io.Reader) (*Config, error) {
+// Parse decodes, defaults and validates a configuration document. A
+// relative global.conf_dir is resolved against baseDir.
+func Parse(r io.Reader, baseDir string) (*Config, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
@@ -191,6 +149,13 @@ func Parse(r io.Reader) (*Config, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
+	if !filepath.IsAbs(cfg.Global.ConfDir) {
+		cfg.Global.ConfDir = filepath.Join(baseDir, cfg.Global.ConfDir)
+	}
+	cfg.capabilities, err = LoadCapabilities(cfg.Global.ConfDir)
+	if err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -227,6 +192,9 @@ func (c *Config) applyDefaults() {
 	}
 	if g.DataDir == "" {
 		g.DataDir = "data"
+	}
+	if g.ConfDir == "" {
+		g.ConfDir = "conf.d"
 	}
 	if g.StatsInterval == 0 {
 		g.StatsInterval = time.Minute

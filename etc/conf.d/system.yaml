@@ -1,0 +1,18 @@
+# Capability "system": SNMPv2-MIB system group (1.3.6.1.2.1.1).
+# No `detect`: applies to every device (unless the device excludes it).
+# Discovery scalars are cached in data/<device_id>/discovery.json and
+# attached to every batch sent to outputs. sysUpTime is also polled every
+# cycle, so agent restarts show up right away.
+description: SNMPv2-MIB system group
+
+discovery:
+  scalars:
+    sysDescr:    1.3.6.1.2.1.1.1.0
+    sysObjectID: 1.3.6.1.2.1.1.2.0
+    sysUpTime:   1.3.6.1.2.1.1.3.0
+    sysContact:  1.3.6.1.2.1.1.4.0
+    sysName:     1.3.6.1.2.1.1.5.0
+    sysLocation: 1.3.6.1.2.1.1.6.0
+
+scalars:
+  - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }

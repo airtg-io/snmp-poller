@@ -11,15 +11,12 @@ import (
 	"time"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
+	"github.com/airtg-io/snmp-poller/internal/testconf"
 )
 
 func cfg(t *testing.T, doc string) config.Logging {
 	t.Helper()
-	c, err := config.Parse(strings.NewReader(doc))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return c.Logging
+	return testconf.Parse(t, doc, map[string]string{"uptime": testconf.Uptime}).Logging
 }
 
 func TestConsoleAndFile(t *testing.T) {

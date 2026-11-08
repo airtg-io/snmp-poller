@@ -40,6 +40,8 @@ type Sample struct {
 type Batch struct {
 	DeviceID string
 	Address  string
+	// Capabilities are the names of the capabilities found on the device.
+	Capabilities []string
 	// Discovery holds the device's discovery scalars (sysDescr, sysName, ...).
 	Discovery map[string]string
 	Samples   []Sample

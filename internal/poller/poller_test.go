@@ -3,11 +3,15 @@ package poller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +23,17 @@ import (
 	"github.com/airtg-io/snmp-poller/internal/output"
 	"github.com/airtg-io/snmp-poller/internal/state"
 	"github.com/airtg-io/snmp-poller/internal/testagent"
+	"github.com/airtg-io/snmp-poller/internal/testconf"
 )
+
+func loadDiscovery(t *testing.T, store *state.Store, id string) *Discovery {
+	t.Helper()
+	disc := &Discovery{}
+	if err := store.LoadDiscovery(id, disc); err != nil {
+		t.Fatalf("discovery cache: %v", err)
+	}
+	return disc
+}
 
 // capture is an output that records batches, for tests.
 type capture struct {
@@ -64,8 +78,50 @@ func sysMIB(name string) map[string]testagent.Value {
 		"1.3.6.1.2.1.1.1.0": {Type: gosnmp.OctetString, Value: "Test agent " + name},
 		"1.3.6.1.2.1.1.2.0": {Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.99999"},
 		"1.3.6.1.2.1.1.3.0": {Type: gosnmp.TimeTicks, Value: uint32(1000)},
+		"1.3.6.1.2.1.1.4.0": {Type: gosnmp.OctetString, Value: "noc@example.net"},
 		"1.3.6.1.2.1.1.5.0": {Type: gosnmp.OctetString, Value: name},
+		"1.3.6.1.2.1.1.6.0": {Type: gosnmp.OctetString, Value: "rack 1"},
 	}
+}
+
+// interfacesMIB has three interfaces: 10G (ifSpeed saturated), 1G and
+// 100M, in ifTable. names adds the ifXTable names and an ENTITY-MIB chassis,
+// counters the ifXTable 64-bit counters and ifHighSpeed.
+func interfacesMIB(names, counters bool) *testagent.MIB {
+	vals := sysMIB("sw")
+	for i, row := range []struct {
+		descr string
+		speed uint32
+	}{{"TenGigE0/1", math.MaxUint32}, {"GigE0/2", 1_000_000_000}, {"FastE0/3", 100_000_000}} {
+		idx := i + 1
+		set := func(oid string, typ gosnmp.Asn1BER, v any) {
+			vals[fmt.Sprintf("%s.%d", oid, idx)] = testagent.Value{Type: typ, Value: v}
+		}
+		set("1.3.6.1.2.1.2.2.1.2", gosnmp.OctetString, row.descr)
+		set("1.3.6.1.2.1.2.2.1.5", gosnmp.Gauge32, uint(row.speed))
+		for _, col := range []string{"7", "8"} {
+			set("1.3.6.1.2.1.2.2.1."+col, gosnmp.Integer, 1)
+		}
+		for _, col := range []string{"10", "11", "13", "14", "16", "17", "19", "20"} {
+			set("1.3.6.1.2.1.2.2.1."+col, gosnmp.Counter32, uint(1000))
+		}
+		if names {
+			set("1.3.6.1.2.1.31.1.1.1.1", gosnmp.OctetString, fmt.Sprintf("if%d", idx))
+			set("1.3.6.1.2.1.31.1.1.1.18", gosnmp.OctetString, "uplink")
+		}
+		if counters {
+			for _, col := range []string{"6", "7", "10", "11"} {
+				set("1.3.6.1.2.1.31.1.1.1."+col, gosnmp.Counter64, uint64(1000))
+			}
+			set("1.3.6.1.2.1.31.1.1.1.15", gosnmp.Gauge32, uint(row.speed/1_000_000))
+		}
+	}
+	if names {
+		vals["1.3.6.1.2.1.47.1.1.1.1.7.1"] = testagent.Value{Type: gosnmp.OctetString, Value: "Chassis"}
+		vals["1.3.6.1.2.1.47.1.1.1.1.11.1"] = testagent.Value{Type: gosnmp.OctetString, Value: "SN123"}
+		vals["1.3.6.1.2.1.47.1.1.1.1.13.1"] = testagent.Value{Type: gosnmp.OctetString, Value: "SW-48"}
+	}
+	return testagent.NewMIB(vals)
 }
 
 func ifMIB() *testagent.MIB {
@@ -84,12 +140,36 @@ func ifMIB() *testagent.MIB {
 	return testagent.NewMIB(vals)
 }
 
-func newDevice(t *testing.T, doc string, out output.Output) (*device, *state.Store) {
+// systemCap is the system group, as discovery scalars.
+const systemCap = `
+discovery:
+  scalars:
+    sysDescr: 1.3.6.1.2.1.1.1.0
+    sysObjectID: 1.3.6.1.2.1.1.2.0
+    sysName: 1.3.6.1.2.1.1.5.0
+`
+
+// basicCaps are the capabilities used by most tests.
+var basicCaps = map[string]string{"system": systemCap, "uptime": testconf.Uptime}
+
+func newDevice(t *testing.T, doc string, caps map[string]string, out output.Output) (*device, *state.Store) {
 	t.Helper()
-	cfg, err := config.Parse(strings.NewReader(doc))
+	return deviceFrom(t, testconf.Parse(t, doc, caps), out)
+}
+
+// shippedDevice uses the capabilities shipped in etc/conf.d.
+func shippedDevice(t *testing.T, doc string, out output.Output) (*device, *state.Store) {
+	t.Helper()
+	_, file, _, _ := runtime.Caller(0)
+	cfg, err := config.Parse(strings.NewReader(doc), filepath.Join(filepath.Dir(file), "..", "..", "etc"))
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
+	return deviceFrom(t, cfg, out)
+}
+
+func deviceFrom(t *testing.T, cfg *config.Config, out output.Output) (*device, *state.Store) {
+	t.Helper()
 	store, err := state.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -158,8 +238,7 @@ devices:
     port: %d
     timeout: 2s
     snmp: { %s }
-    scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]
-`, agent.Port, snmpCfg), out)
+`, agent.Port, snmpCfg), basicCaps, out)
 			if _, err := d.poll(context.Background(), store, time.Now); err != nil {
 				t.Fatalf("poll: %v", err)
 			}
@@ -189,8 +268,8 @@ func TestWrongCredentialsFail(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			d, store := newDevice(t, fmt.Sprintf(`
 devices:
-  - { id: dev, address: 127.0.0.1, port: %d, timeout: 300ms, retries: 0, snmp: { %s }, scalars: [{ name: a, oid: 1.3.6.1.2.1.1.3.0 }] }
-`, agent.Port, snmpCfg), &capture{})
+  - { id: dev, address: 127.0.0.1, port: %d, timeout: 300ms, retries: 0, snmp: { %s } }
+`, agent.Port, snmpCfg), basicCaps, &capture{})
 			res, err := d.poll(context.Background(), store, time.Now)
 			if err == nil || !res.discoveryErr {
 				t.Fatalf("expected discovery failure, got res=%+v err=%v", res, err)
@@ -215,27 +294,30 @@ devices:
     port: %d
     discovery_interval: 1h
     snmp: { version: 2c, community: %s }
-    discovery:
-      columns:
-        ifName: 1.3.6.1.2.1.31.1.1.1.1
-        ifAlias: 1.3.6.1.2.1.31.1.1.1.18
-    scalars:
-      - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate] }
-      - { name: absent, oid: 1.3.6.1.2.1.1.77.0 }
-    tables:
-      - name: if
-        label: ifName
-        labels: [ifAlias]
-        include: ["^eth"]
-        columns:
-          - { name: hcIn, oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [raw, rate, volume] }
-          - { name: in32, oid: 1.3.6.1.2.1.2.2.1.10, modes: [volume] }
-          - { name: oper, oid: 1.3.6.1.2.1.2.2.1.8 }
-      - name: storage
-        include: ["^2\\."]
-        columns:
-          - { name: used, oid: 1.3.6.1.2.1.25.2.3.1.6 }
-`, agent.Port, testagent.Community), out)
+`, agent.Port, testagent.Community), map[string]string{
+		"system": systemCap,
+		"metrics": `
+discovery:
+  columns:
+    ifName: 1.3.6.1.2.1.31.1.1.1.1
+    ifAlias: 1.3.6.1.2.1.31.1.1.1.18
+scalars:
+  - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate] }
+  - { name: absent, oid: 1.3.6.1.2.1.1.77.0 }
+tables:
+  - name: if
+    label: ifName
+    labels: [ifAlias]
+    include: ["^eth"]
+    columns:
+      - { name: hcIn, oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [raw, rate, volume] }
+      - { name: in32, oid: 1.3.6.1.2.1.2.2.1.10, modes: [volume] }
+      - { name: oper, oid: 1.3.6.1.2.1.2.2.1.8 }
+  - name: storage
+    include: ["^2\\."]
+    columns:
+      - { name: used, oid: 1.3.6.1.2.1.25.2.3.1.6 }
+`}, out)
 	clk := &clock{t: time.Unix(1_700_000_000, 0)}
 
 	// Poll 1: discovery + raw values only.
@@ -247,7 +329,8 @@ devices:
 		t.Errorf("poll 1: %+v", res)
 	}
 	b := out.batches[0]
-	if got := fmt.Sprint(d.discovery.Rows["if"]); got != "[1 2]" {
+	disc := loadDiscovery(t, store, "router")
+	if got := fmt.Sprint(disc.Tables["if"].Rows); got != "[1 2]" {
 		t.Errorf("selected rows = %s, want [1 2] (lo excluded)", got)
 	}
 	if _, ok := find(b, "hcIn", "3", config.ModeRaw); ok {
@@ -316,6 +399,262 @@ devices:
 	}
 }
 
+// TestShippedInterfaces polls agents with and without ifXTable using the
+// capabilities shipped in etc/conf.d.
+func TestShippedInterfaces(t *testing.T) {
+	for _, tc := range []struct {
+		name, include, caps, rows string
+		names, counters           bool
+	}{
+		{name: "ifXTable", names: true, counters: true, caps: "[entity interfaces system]", rows: "[1 2 3]"},
+		// Some agents have ifXTable names without its 64-bit counters.
+		{name: "ifXTable names only", names: true, caps: "[entity interfaces system]", rows: "[1 2 3]"},
+		{name: "ifTable only", include: `include: { interfaces: ["^(Ten|Gig)"] }`,
+			caps: "[interfaces system]", rows: "[1 2]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, version := range []string{"1", "2c"} {
+				t.Run("v"+version, func(t *testing.T) {
+					// SNMPv1 cannot carry Counter64: never high capacity.
+					hc, hcRows := tc.counters && version != "1", "[]"
+					if hc {
+						hcRows = "[1 2]" // 10G and 1G, not 100M
+					}
+					agent := testagent.Start(t, nil, interfacesMIB(tc.names, tc.counters), nil)
+					out := &capture{}
+					d, store := shippedDevice(t, fmt.Sprintf(`
+devices:
+  - id: sw
+    address: 127.0.0.1
+    port: %d
+    snmp: { version: "%s", community: %s }
+    %s
+`, agent.Port, version, testagent.Community, tc.include), out)
+					clk := &clock{t: time.Unix(1_700_000_000, 0)}
+					for range 2 {
+						res, err := d.poll(context.Background(), store, clk.now)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if res.missing != 0 {
+							t.Errorf("missing oids = %d, want 0", res.missing)
+						}
+						clk.advance(time.Minute)
+					}
+
+					disc := loadDiscovery(t, store, "sw")
+					if got := fmt.Sprint(disc.Capabilities); got != tc.caps {
+						t.Errorf("capabilities = %s, want %s", got, tc.caps)
+					}
+					for _, k := range []string{"sysDescr", "sysObjectID", "sysUpTime", "sysContact", "sysName", "sysLocation"} {
+						if disc.Scalars[k] == "" {
+							t.Errorf("discovery scalar %s not cached: %v", k, disc.Scalars)
+						}
+					}
+					ifs := disc.Tables["interfaces"]
+					if fmt.Sprint(ifs.Rows) != tc.rows || ifs.HighCapacity != hc ||
+						fmt.Sprint(append([]string{}, ifs.HighCapacityRows...)) != hcRows {
+						t.Errorf("interfaces discovery = %+v, want rows %s, high capacity %v on %s", ifs, tc.rows, hc, hcRows)
+					}
+					if tc.names && disc.Columns["entPhysicalModelName"]["1"] != "SW-48" {
+						t.Errorf("entity not discovered: %v", disc.Columns)
+					}
+
+					b := out.batches[1]
+					if fmt.Sprint(b.Capabilities) != tc.caps || b.Discovery["sysLocation"] != "rack 1" {
+						t.Errorf("batch capabilities %v, discovery %v", b.Capabilities, b.Discovery)
+					}
+					wantType := map[string]string{"1": "Counter32", "2": "Counter32", "3": "Counter32"}
+					if hc {
+						wantType["1"], wantType["2"] = "Counter64", "Counter64"
+					}
+					if !strings.Contains(tc.rows, "3") {
+						delete(wantType, "3") // filtered out by the device's include
+					}
+					highSpeed := map[string]uint64{"1": 4294, "2": 1000}
+					if s, ok := find(b, "sysUpTime", "", config.ModeRaw); !ok || s.Type != "TimeTicks" {
+						t.Errorf("sysUpTime must be polled every cycle: %+v", s)
+					}
+					for idx, typ := range wantType {
+						for _, m := range []string{"ifInOctets", "ifOutOctets", "ifInUcastPkts", "ifOutUcastPkts"} {
+							s, ok := find(b, m, idx, config.ModeRate)
+							if !ok || s.Type != typ || s.Value != 0.0 {
+								t.Errorf("%s.%s rate = %+v (found %v), want type %s", m, idx, s, ok, typ)
+							}
+						}
+						if s, ok := find(b, "ifInErrors", idx, config.ModeVolume); !ok || s.Type != "Counter32" {
+							t.Errorf("ifInErrors.%s = %+v", idx, s)
+						}
+						s, ok := find(b, "ifHighSpeed", idx, config.ModeRaw)
+						if wantHC := typ == "Counter64"; ok != wantHC || (ok && s.Value != highSpeed[idx]) {
+							t.Errorf("ifHighSpeed.%s = %+v (found %v), want only on high-capacity rows", idx, s, ok)
+						}
+					}
+					s, _ := find(b, "ifOperStatus", "1", config.ModeRaw)
+					if s.Labels["ifDescr"] != "TenGigE0/1" {
+						t.Errorf("labels = %v", s.Labels)
+					}
+					if tc.names && (s.Labels["ifName"] != "if1" || s.Labels["ifAlias"] != "uplink") {
+						t.Errorf("ifXTable labels = %v", s.Labels)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestCapabilityDetection covers detect (present, absent at the end of the
+// MIB, absent with a following subtree) and exclude, on v1 and v2c.
+func TestCapabilityDetection(t *testing.T) {
+	caps := map[string]string{
+		"always":   `scalars: [{ name: always, oid: 1.3.6.1.2.1.1.3.0 }]`,
+		"present":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.31.1.1.1.1]\nscalars: [{ name: present, oid: 1.3.6.1.2.1.1.3.0 }]",
+		"partial":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.88]\nscalars: [{ name: partial, oid: 1.3.6.1.2.1.1.3.0 }]",
+		"next":     "detect: [1.3.6.1.2.1.1.50]\nscalars: [{ name: next, oid: 1.3.6.1.2.1.1.3.0 }]",
+		"end":      "detect: [1.3.6.1.4.1.99999.1]\nscalars: [{ name: end, oid: 1.3.6.1.2.1.1.3.0 }]",
+		"excluded": `scalars: [{ name: excluded, oid: 1.3.6.1.2.1.1.3.0 }]`,
+	}
+	agent := testagent.Start(t, nil, ifMIB(), nil)
+	for _, version := range []string{"1", "2c"} {
+		t.Run("v"+version, func(t *testing.T) {
+			out := &capture{}
+			d, store := newDevice(t, fmt.Sprintf(`
+devices:
+  - { id: dev, address: 127.0.0.1, port: %d, snmp: { version: "%s", community: %s }, exclude: [excluded] }
+`, agent.Port, version, testagent.Community), caps, out)
+			if _, err := d.poll(context.Background(), store, time.Now); err != nil {
+				t.Fatal(err)
+			}
+			if got := fmt.Sprint(loadDiscovery(t, store, "dev").Capabilities); got != "[always present]" {
+				t.Errorf("capabilities = %s, want [always present]", got)
+			}
+			for _, m := range []string{"always", "present", "partial", "next", "end", "excluded"} {
+				_, ok := find(out.batches[0], m, "", config.ModeRaw)
+				if want := m == "always" || m == "present"; ok != want {
+					t.Errorf("%s polled = %v, want %v", m, ok, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDiscoveryCache checks that polls between discoveries read the
+// discovery from disk, and rediscover when the cache is gone.
+func TestDiscoveryCache(t *testing.T) {
+	agent := testagent.Start(t, nil, testagent.NewMIB(sysMIB("live")), nil)
+	out := &capture{}
+	d, store := newDevice(t, fmt.Sprintf(`
+devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, community: %s } }]
+`, agent.Port, testagent.Community), basicCaps, out)
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	poll := func() pollResult {
+		t.Helper()
+		res, err := d.poll(context.Background(), store, clk.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(time.Minute)
+		return res
+	}
+	if !poll().discovered {
+		t.Fatal("first poll must discover")
+	}
+	disc := loadDiscovery(t, store, "dev")
+	disc.Scalars["sysName"] = "from-cache"
+	if err := store.SaveDiscovery("dev", disc); err != nil {
+		t.Fatal(err)
+	}
+	if poll().discovered {
+		t.Error("second poll must use the cache")
+	}
+	if got := out.batches[1].Discovery["sysName"]; got != "from-cache" {
+		t.Errorf("sysName = %q: discovery not read from disk", got)
+	}
+	if err := os.Remove(filepath.Join(store.DeviceDir("dev"), "discovery.json")); err != nil {
+		t.Fatal(err)
+	}
+	if !poll().discovered {
+		t.Error("missing cache must trigger a rediscovery")
+	}
+	if got := out.batches[2].Discovery["sysName"]; got != "live" {
+		t.Errorf("sysName = %q after rediscovery", got)
+	}
+}
+
+// TestSharedOID reads one OID from several metrics in several capabilities
+// (scalars and walked tables): it is fetched once per poll, every metric gets
+// its samples, and rate and volume share one previous value stored per OID.
+func TestSharedOID(t *testing.T) {
+	mib := ifMIB()
+	agent := testagent.Start(t, nil, mib, nil)
+	out := &capture{}
+	d, store := newDevice(t, fmt.Sprintf(`
+devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, community: %s } }]
+`, agent.Port, testagent.Community), map[string]string{
+		"a": `
+discovery: { scalars: { name1: 1.3.6.1.2.1.1.5.0 } }
+scalars: [{ name: upA, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate, volume] }]
+tables: [{ name: storeA, columns: [{ name: usedA, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [volume] }] }]
+`,
+		"b": `
+discovery: { scalars: { name2: 1.3.6.1.2.1.1.5.0 } }
+scalars: [{ name: upB, oid: 1.3.6.1.2.1.1.3.0, modes: [rate] }]
+tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [raw, volume] }] }]
+`,
+	}, out)
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	for i := range 2 {
+		if _, err := d.poll(context.Background(), store, clk.now); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			clk.advance(10 * time.Second)
+			mib.Set("1.3.6.1.2.1.1.3.0", uint32(2000))
+			mib.Set("1.3.6.1.2.1.25.2.3.1.6.2.1", 25)
+		}
+	}
+	disc := loadDiscovery(t, store, "dev")
+	if disc.Scalars["name1"] != "router" || disc.Scalars["name2"] != "router" {
+		t.Errorf("discovery scalars sharing an OID = %v", disc.Scalars)
+	}
+	b := out.batches[1]
+	for _, w := range []struct {
+		metric, idx string
+		mode        config.Mode
+		want        any
+	}{
+		{"upA", "", config.ModeRaw, uint64(2000)},
+		{"upA", "", config.ModeRate, 100.0},
+		{"upA", "", config.ModeVolume, 1000.0},
+		{"upB", "", config.ModeRate, 100.0},
+		{"usedA", "1.1", config.ModeVolume, 0.0},
+		{"usedA", "2.1", config.ModeVolume, 5.0},
+		{"usedB", "2.1", config.ModeRaw, int64(25)},
+		{"usedB", "2.1", config.ModeVolume, 5.0},
+	} {
+		if s, ok := find(b, w.metric, w.idx, w.mode); !ok || s.Value != w.want {
+			t.Errorf("%s.%s %s = %v (found %v), want %v", w.metric, w.idx, w.mode, s.Value, ok, w.want)
+		}
+	}
+	if _, ok := find(b, "usedB", "1.1", config.ModeRaw); ok {
+		t.Error("usedB must keep its own include filter")
+	}
+	if len(b.Samples) != 8 {
+		t.Errorf("samples = %d, want 8: %+v", len(b.Samples), b.Samples)
+	}
+	data, err := os.ReadFile(filepath.Join(store.DeviceDir("dev"), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(slices.Sorted(maps.Keys(st))); got != "[.1.3.6.1.2.1.1.3.0 .1.3.6.1.2.1.25.2.3.1.6.1.1 .1.3.6.1.2.1.25.2.3.1.6.2.1]" {
+		t.Errorf("state keys = %s, want one per OID", got)
+	}
+}
+
 func TestV1MissingOID(t *testing.T) {
 	agent := testagent.Start(t, nil, testagent.NewMIB(sysMIB("v1")), nil)
 	out := &capture{}
@@ -325,11 +664,12 @@ devices:
     address: 127.0.0.1
     port: %d
     snmp: { version: 1, community: %s }
-    scalars:
-      - { name: a, oid: 1.3.6.1.2.1.1.77.0 }
-      - { name: up, oid: 1.3.6.1.2.1.1.3.0 }
-      - { name: b, oid: 1.3.6.1.2.1.1.78.0 }
-`, agent.Port, testagent.Community), out)
+`, agent.Port, testagent.Community), map[string]string{"v1": `
+scalars:
+  - { name: a, oid: 1.3.6.1.2.1.1.77.0 }
+  - { name: up, oid: 1.3.6.1.2.1.1.3.0 }
+  - { name: b, oid: 1.3.6.1.2.1.1.78.0 }
+`}, out)
 	res, err := d.poll(context.Background(), store, time.Now)
 	if err != nil {
 		t.Fatal(err)
@@ -346,17 +686,14 @@ func TestRun(t *testing.T) {
 	stale := filepath.Join(dir, "data", "stale-device")
 	os.MkdirAll(stale, 0o755)
 
-	cfg, err := config.Parse(strings.NewReader(fmt.Sprintf(`
+	cfg := testconf.Parse(t, fmt.Sprintf(`
 global: { poll_interval: 1s, stats_interval: 1s, data_dir: %s }
 outputs: [{ name: cap, type: "null" }]
 devices:
-  - { id: ok1, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s }, scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0 }] }
-  - { id: ok2, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s }, scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0 }] }
-  - { id: bad, address: 127.0.0.1, port: %[2]d, timeout: 200ms, retries: 0, snmp: { version: 2c, community: very-secret-value }, scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0 }] }
-`, filepath.Join(dir, "data"), agent.Port, testagent.Community)))
-	if err != nil {
-		t.Fatal(err)
-	}
+  - { id: ok1, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s } }
+  - { id: ok2, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[3]s } }
+  - { id: bad, address: 127.0.0.1, port: %[2]d, timeout: 200ms, retries: 0, snmp: { version: 2c, community: very-secret-value } }
+`, filepath.Join(dir, "data"), agent.Port, testagent.Community), basicCaps)
 	var logs bytes.Buffer
 	var logMu sync.Mutex
 	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
@@ -400,11 +737,7 @@ devices:
 // With no enabled device the poller must keep running until asked to stop,
 // not start shutting down immediately.
 func TestRunNoDevices(t *testing.T) {
-	cfg, err := config.Parse(strings.NewReader(fmt.Sprintf(
-		`global: { data_dir: %s }`, filepath.Join(t.TempDir(), "data"))))
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := testconf.Parse(t, fmt.Sprintf(`global: { data_dir: %s }`, filepath.Join(t.TempDir(), "data")), basicCaps)
 	var logs bytes.Buffer
 	var logMu sync.Mutex
 	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {

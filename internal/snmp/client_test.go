@@ -2,21 +2,18 @@ package snmp
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
+	"github.com/airtg-io/snmp-poller/internal/testconf"
 )
 
 func spec(t *testing.T, snmp string) *config.DeviceSpec {
 	t.Helper()
-	c, err := config.Parse(strings.NewReader(`devices: [{ id: d, address: 192.0.2.1, port: 1161, snmp: ` +
-		snmp + `, scalars: [{ name: a, oid: 1.3 }] }]`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := testconf.Parse(t, `devices: [{ id: d, address: 192.0.2.1, port: 1161, snmp: `+snmp+` }]`,
+		map[string]string{"uptime": testconf.Uptime})
 	return &c.DeviceSpecs()[0]
 }
 

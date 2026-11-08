@@ -12,9 +12,38 @@ import (
 	"time"
 )
 
+// uptime is a minimal capability, for tests that need one.
+const uptime = `scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]`
+
+// writeCaps creates dir/conf.d with one file per capability and returns dir.
+func writeCaps(t *testing.T, caps map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "conf.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, doc := range caps {
+		if err := os.WriteFile(filepath.Join(dir, "conf.d", name), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// parse parses doc with a single "uptime" capability.
 func parse(t *testing.T, doc string) (*Config, error) {
 	t.Helper()
-	return Parse(strings.NewReader(doc))
+	return parseWith(t, doc, map[string]string{"uptime.yaml": uptime})
+}
+
+func parseWith(t *testing.T, doc string, caps map[string]string) (*Config, error) {
+	t.Helper()
+	return Parse(strings.NewReader(doc), writeCaps(t, caps))
+}
+
+func repoPath(parts ...string) string {
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Join(append([]string{filepath.Dir(file), "..", ".."}, parts...)...)
 }
 
 func mustParse(t *testing.T, doc string) *Config {
@@ -31,8 +60,6 @@ devices:
   - id: r1
     address: 10.0.0.1
     snmp: { version: 2c, community: s3cret }
-    scalars:
-      - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }
 `
 
 func TestDefaults(t *testing.T) {
@@ -59,13 +86,14 @@ func TestDefaults(t *testing.T) {
 		s.SNMP.Transport != "udp" || s.SNMP.Version != Version2c {
 		t.Errorf("unexpected device spec: %+v", s)
 	}
-	if s.Scalars[0].OID != ".1.3.6.1.2.1.1.3.0" || s.Scalars[0].Modes[0] != ModeRaw {
-		t.Errorf("scalar not normalized: %+v", s.Scalars[0])
+	if len(s.Capabilities) != 1 || s.Capabilities[0].Name != "uptime" {
+		t.Fatalf("capabilities = %+v", s.Capabilities)
 	}
-	for name := range DefaultDiscoveryScalars {
-		if _, ok := s.Discovery.Scalars[name]; !ok {
-			t.Errorf("default discovery scalar %s missing", name)
-		}
+	if sc := s.Capabilities[0].Scalars[0]; sc.OID != ".1.3.6.1.2.1.1.3.0" || sc.Modes[0] != ModeRaw {
+		t.Errorf("scalar not normalized: %+v", sc)
+	}
+	if filepath.Base(g.ConfDir) != "conf.d" || !filepath.IsAbs(g.ConfDir) {
+		t.Errorf("conf_dir = %q, want <base dir>/conf.d", g.ConfDir)
 	}
 	if len(s.Outputs) != 1 || s.Outputs[0] != "null" {
 		t.Errorf("device outputs = %v", s.Outputs)
@@ -73,38 +101,84 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestDefaultConfigFileIsValid(t *testing.T) {
-	_, file, _, _ := runtime.Caller(0)
-	if _, err := Load(filepath.Join(filepath.Dir(file), "..", "..", DefaultPath)); err != nil {
+	c, err := Load(repoPath(DefaultPath))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if c.Global.ConfDir != repoPath("etc", "conf.d") {
+		t.Errorf("conf_dir = %q, want it relative to the config file", c.Global.ConfDir)
+	}
+	caps := map[string]*Capability{}
+	for _, cp := range c.Capabilities() {
+		caps[cp.Name] = cp
+	}
+	sys := caps["system"]
+	if sys == nil || len(sys.Detect) != 0 {
+		t.Fatalf("system capability missing or not applied to every device: %+v", sys)
+	}
+	for name, oid := range map[string]string{
+		"sysDescr": "1.1.0", "sysObjectID": "1.2.0", "sysUpTime": "1.3.0",
+		"sysContact": "1.4.0", "sysName": "1.5.0", "sysLocation": "1.6.0",
+	} {
+		if got := sys.Discovery.Scalars[name]; got != ".1.3.6.1.2.1."+oid {
+			t.Errorf("system discovery %s = %q", name, got)
+		}
+	}
+	ifs := caps["interfaces"]
+	if ifs == nil || len(ifs.Detect) != 0 || len(ifs.Tables) != 1 {
+		t.Fatalf("interfaces capability missing or not applied to every device: %+v", ifs)
+	}
+	hc := ifs.Tables[0].HighCapacity
+	if hc == nil || hc.Probe != ".1.3.6.1.2.1.31.1.1.1.6" || hc.Speed != "ifSpeed" || hc.Above != 100_000_000 {
+		t.Errorf("interfaces high_capacity = %+v", hc)
+	}
+	if e := caps["entity"]; e == nil || len(e.Detect) != 1 {
+		t.Errorf("entity capability must be detected: %+v", e)
 	}
 }
 
+// Every ```yaml block of the README must be valid. A block whose first line
+// is "# conf.d/<name>.yaml" is a capability file; any other block is a
+// complete main configuration, checked against the shipped etc/conf.d.
 func TestReadmeExamplesAreValid(t *testing.T) {
-	_, file, _, _ := runtime.Caller(0)
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(file), "..", "..", "README.md"))
+	data, err := os.ReadFile(repoPath("README.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("SNMP_COMMUNITY", "from-env")
 	t.Setenv("SNMP_AUTH_PASS", "auth-pass-123")
 	t.Setenv("SNMP_PRIV_PASS", "priv-pass-123")
-	// Every ```yaml block in the README must be a complete, valid config.
 	blocks := strings.Split(string(data), "```yaml\n")
 	if len(blocks) < 2 {
 		t.Fatal("no yaml examples found in README.md")
 	}
+	var caps, mains int
 	for i, b := range blocks[1:] {
 		doc, _, _ := strings.Cut(b, "```")
+		first, _, _ := strings.Cut(doc, "\n")
 		t.Run(fmt.Sprintf("example-%d", i+1), func(t *testing.T) {
-			if _, err := parse(t, doc); err != nil {
+			if file, ok := strings.CutPrefix(first, "# conf.d/"); ok {
+				file, _, _ = strings.Cut(file, " ")
+				caps++
+				name := strings.TrimSuffix(file, ".yaml")
+				if _, err := ParseCapability(name, strings.NewReader(doc)); err != nil {
+					t.Errorf("%v\n---\n%s", err, doc)
+				}
+				return
+			}
+			mains++
+			if _, err := Parse(strings.NewReader(doc), repoPath("etc")); err != nil {
 				t.Errorf("%v\n---\n%s", err, doc)
 			}
 		})
 	}
+	if caps == 0 || mains == 0 {
+		t.Errorf("found %d capability and %d main examples, want both", caps, mains)
+	}
 }
 
 func TestInheritanceAndOverrides(t *testing.T) {
-	c := mustParse(t, `
+	c, err := parseWith(t, `
 global: { poll_interval: 30s, discovery_interval: 2h, timeout: 2s, retries: 3, port: 1161 }
 outputs:
   - { name: a, type: "null" }
@@ -117,31 +191,42 @@ credentials:
     auth_passphrase: authpass1
     priv_protocol: aes128
     priv_passphrase: privpass1
-profiles:
-  base:
-    discovery:
-      scalars: { model: 1.3.6.1.2.1.47.1.1.1.1.13.1 }
-      columns: { ifName: 1.3.6.1.2.1.31.1.1.1.1 }
-    tables:
-      - name: if
-        label: ifName
-        include: ["^eth"]
-        columns: [{ name: in, oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume, rate] }]
 devices:
   - id: r1
     address: 10.0.0.1
     credential: v3
     snmp: { context_name: vrf1, context_engine_id: "0x80001F88" }
-    profiles: [base]
     poll_interval: 10s
     discovery_interval: 5m
     retries: 0
     outputs: [b]
+    exclude: [vendor]
+    include: { if: ["^ge-"] }
   - id: r2
     address: 10.0.0.2
     credential: v3
-    profiles: [base]
-`)
+`, map[string]string{
+		"base.yaml": `
+discovery:
+  scalars: { model: 1.3.6.1.2.1.47.1.1.1.1.13.1 }
+  columns: { ifName: 1.3.6.1.2.1.31.1.1.1.1, ifSpeed: 1.3.6.1.2.1.2.2.1.5 }
+tables:
+  - name: if
+    label: ifName
+    include: ["^eth"]
+    high_capacity: { probe: 1.3.6.1.2.1.31.1.1.1.1, speed: ifSpeed }
+    columns:
+      - { name: in, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume, rate] }
+`,
+		"vendor.yml": `
+detect: [1.3.6.1.4.1.9]
+scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 }]
+`,
+		"README.txt": "not a capability",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	r1, r2 := c.DeviceSpecs()[0], c.DeviceSpecs()[1]
 	if r1.PollInterval != 10*time.Second || r1.DiscoveryInterval != 5*time.Minute || r1.Retries != 0 || r1.Port != 1161 {
 		t.Errorf("r1 overrides not applied: %+v", r1)
@@ -160,15 +245,48 @@ devices:
 	if fmt.Sprint(r1.Outputs) != "[b]" || fmt.Sprint(r2.Outputs) != "[a b]" {
 		t.Errorf("outputs: r1=%v r2=%v", r1.Outputs, r2.Outputs)
 	}
-	tbl := r1.Tables[0]
-	if fmt.Sprint(tbl.Columns[0].Modes) != "[rate volume]" {
-		t.Errorf("modes not deduplicated: %v", tbl.Columns[0].Modes)
+
+	names := func(caps []*Capability) string {
+		var n []string
+		for _, c := range caps {
+			n = append(n, c.Name)
+		}
+		return fmt.Sprint(n)
 	}
-	if !tbl.Selects("eth0") || tbl.Selects("lo") {
-		t.Error("include pattern not applied")
+	if got := names(c.Capabilities()); got != "[base vendor]" {
+		t.Errorf("loaded capabilities = %s (.yaml and .yml only, sorted)", got)
 	}
-	if r1.Discovery.Scalars["model"] != ".1.3.6.1.2.1.47.1.1.1.1.13.1" {
-		t.Errorf("profile discovery not merged: %v", r1.Discovery.Scalars)
+	if got := names(r1.Capabilities); got != "[base]" {
+		t.Errorf("r1 capabilities = %s, want vendor excluded", got)
+	}
+	if got := names(r2.Capabilities); got != "[base vendor]" {
+		t.Errorf("r2 capabilities = %s, want every capability", got)
+	}
+
+	base := c.Capabilities()[0]
+	if base.Discovery.Scalars["model"] != ".1.3.6.1.2.1.47.1.1.1.1.13.1" {
+		t.Errorf("discovery not normalized: %v", base.Discovery.Scalars)
+	}
+	col := base.Tables[0].Columns[0]
+	if fmt.Sprint(col.Modes) != "[rate volume]" || col.HCOID != ".1.3.6.1.2.1.31.1.1.1.6" {
+		t.Errorf("column not normalized: %+v", col)
+	}
+	if hc := base.Tables[0].HighCapacity; hc.Above != DefaultHighCapacitySpeed {
+		t.Errorf("high_capacity.above default = %d", hc.Above)
+	}
+	if c.Capabilities()[1].Detect[0] != ".1.3.6.1.4.1.9" {
+		t.Errorf("detect not normalized: %v", c.Capabilities()[1].Detect)
+	}
+
+	r1t, r2t := r1.Capabilities[0].Tables[0], r2.Capabilities[0].Tables[0]
+	if !r2t.Selects("eth0") || r2t.Selects("ge-0/0/0") {
+		t.Error("capability include pattern not applied")
+	}
+	if !r1t.Selects("ge-0/0/0") || r1t.Selects("eth0") {
+		t.Error("device include override not applied")
+	}
+	if !base.Tables[0].Selects("eth0") || base.Tables[0].Selects("ge-0/0/0") {
+		t.Error("device include override leaked into the shared capability")
 	}
 }
 
@@ -178,7 +296,7 @@ func TestSecurityLevelInference(t *testing.T) {
 		{`{ version: 3, username: u, auth_protocol: MD5, auth_passphrase: 12345678 }`, AuthNoPriv},
 		{`{ version: 3, username: u, auth_protocol: SHA512, auth_passphrase: 12345678, priv_protocol: AES256C, priv_passphrase: 12345678 }`, AuthPriv},
 	} {
-		c := mustParse(t, `devices: [{ id: d, address: x, snmp: `+tc.snmp+`, scalars: [{ name: a, oid: 1.3 }] }]`)
+		c := mustParse(t, `devices: [{ id: d, address: x, snmp: `+tc.snmp+` }]`)
 		if got := c.DeviceSpecs()[0].SNMP.SecurityLevel; got != tc.want {
 			t.Errorf("%s: level = %s, want %s", tc.snmp, got, tc.want)
 		}
@@ -187,37 +305,84 @@ func TestSecurityLevelInference(t *testing.T) {
 
 func TestValidationErrors(t *testing.T) {
 	dev := func(extra string) string {
-		return `devices: [{ id: d, address: x, snmp: { version: 2c, community: c }, scalars: [{ name: a, oid: 1.3 }]` + extra + ` }]`
+		return `devices: [{ id: d, address: x, snmp: { version: 2c, community: c }` + extra + ` }]`
 	}
 	for _, tc := range []struct{ doc, want string }{
 		{`global: { threads: -1 }`, "threads"},
 		{`logging: { level: verbose }`, "logging.level"},
 		{`bogus: 1`, "field bogus not found"},
+		{`profiles: {}`, "field profiles not found"},
+		{`global: { conf_dir: nope }`, "capabilities: open"},
 		{`devices: [{ id: "bad id", address: x }]`, "id may only contain"},
 		{`devices: [{ id: d, snmp: { version: 2c, community: c } }]`, "address is required"},
-		{`devices: [{ id: d, address: x, snmp: { version: 4 }, scalars: [{ name: a, oid: 1.3 }] }]`, "unsupported snmp version"},
-		{`devices: [{ id: d, address: x, snmp: { version: 2c }, scalars: [{ name: a, oid: 1.3 }] }]`, "requires a community"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3 }, scalars: [{ name: a, oid: 1.3 }] }]`, "requires a username"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD4 }, scalars: [{ name: a, oid: 1.3 }] }]`, "auth_protocol"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: short }, scalars: [{ name: a, oid: 1.3 }] }]`, "at least 8"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, security_level: authPriv, auth_protocol: MD5, auth_passphrase: 12345678 }, scalars: [{ name: a, oid: 1.3 }] }]`, "requires priv_protocol"},
-		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, context_engine_id: zz }, scalars: [{ name: a, oid: 1.3 }] }]`, "hex"},
+		{`devices: [{ id: d, address: x, snmp: { version: 4 } }]`, "unsupported snmp version"},
+		{`devices: [{ id: d, address: x, snmp: { version: 2c } }]`, "requires a community"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3 } }]`, "requires a username"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD4 } }]`, "auth_protocol"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: short } }]`, "at least 8"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, security_level: authPriv, auth_protocol: MD5, auth_passphrase: 12345678 } }]`, "requires priv_protocol"},
+		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, context_engine_id: zz } }]`, "hex"},
 		{dev(`, credential: nope`), "unknown credential"},
-		{dev(`, profiles: [nope]`), "unknown profile"},
 		{dev(`, outputs: [nope]`), "unknown output"},
-		{dev(`, tables: [{ name: t, label: ifName, columns: [{ name: c, oid: 1.3 }] }]`), "not a discovery column"},
-		{dev(`, tables: [{ name: t, include: ["("], columns: [{ name: c, oid: 1.3 }] }]`), "include"},
-		{dev(`, tables: [{ name: t }]`), "at least one column"},
-		{`devices: [{ id: d, address: x, snmp: { version: 2c, community: c }, scalars: [{ name: a, oid: x.y }] }]`, "invalid oid"},
-		{`devices: [{ id: d, address: x, snmp: { version: 2c, community: c }, scalars: [{ name: a, oid: 1.3, modes: [delta] }] }]`, "invalid mode"},
-		{`devices: [{ id: d, address: x, snmp: { version: 2c, community: c } }]`, "nothing to poll"},
-		{`devices: [{ id: d, address: x, snmp: { version: 2c, community: c }, scalars: [{ name: a, oid: 1.3 }, { name: a, oid: 1.4 }] }]`, "duplicate scalar"},
+		{dev(`, profiles: [x]`), "field profiles not found"},
+		{dev(`, scalars: []`), "field scalars not found"},
+		{dev(`, exclude: [nope]`), `unknown capability "nope"`},
+		{dev(`, exclude: [uptime]`), "every capability is excluded"},
+		{dev(`, include: { nope: [x] }`), `unknown table "nope"`},
+		{dev(`, include: { nope: ["("] }`), "missing closing )"},
 		{dev(``) + "\n" + `outputs: [{ name: a, type: "null" }, { name: a, type: "null" }]`, "duplicate name"},
 	} {
 		_, err := parse(t, tc.doc)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s\n  err = %v, want containing %q", tc.doc, err, tc.want)
 		}
+	}
+}
+
+func TestCapabilityErrors(t *testing.T) {
+	for _, tc := range []struct {
+		caps map[string]string
+		want string
+	}{
+		{map[string]string{"e.yaml": ``}, "empty capability"},
+		{map[string]string{"e.yaml": `bogus: 1`}, "field bogus not found"},
+		{map[string]string{"bad name.yaml": uptime}, "may only contain"},
+		{map[string]string{"a.yaml": uptime, "a.yml": uptime}, "defined by both a.yaml and a.yml"},
+		{map[string]string{"a.yaml": `detect: [x]` + "\n" + uptime}, "detect: invalid oid"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: x.y }]`}, "invalid oid"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, modes: [delta] }]`}, "invalid mode"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3 }, { name: a, oid: 1.4 }]`}, "duplicate scalar"},
+		{map[string]string{"a.yaml": `tables: [{ name: t }]`}, "at least one column"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, include: ["("], columns: [{ name: c, oid: 1.3 }] }]`}, "include"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c }] }]`}, "oid or hc_oid is required"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, hc_oid: 1.4 }] }]`}, "hc_oid requires high_capacity"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3 }] }]`}, "high_capacity requires a label"},
+		{map[string]string{"a.yaml": `
+discovery: { columns: { n: 1.3.1 } }
+tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3 }] }]`}, `high_capacity.speed "s" is not a discovery column`},
+		// Labels must come from the same capability: another one may not apply.
+		{map[string]string{
+			"a.yaml": `discovery: { columns: { ifName: 1.3.1 } }`,
+			"b.yaml": `tables: [{ name: t, label: ifName, columns: [{ name: c, oid: 1.3 }] }]`,
+		}, `label "ifName" is not a discovery column of this capability`},
+		{map[string]string{"a.yaml": `scalars: [{ name: x, oid: 1.3 }]`, "b.yaml": `scalars: [{ name: x, oid: 1.4 }]`},
+			`scalar "x" is defined by both "a" and "b"`},
+		{map[string]string{"a.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.3 }] }]`, "b.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.4 }] }]`},
+			`table "x" is defined by both "a" and "b"`},
+		{map[string]string{"a.yaml": `discovery: { scalars: { x: 1.3 } }`, "b.yaml": `discovery: { scalars: { x: 1.4 } }`},
+			`discovery scalar "x" has different oids`},
+	} {
+		_, err := parseWith(t, `devices: []`, tc.caps)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v\n  err = %v, want containing %q", tc.caps, err, tc.want)
+		}
+	}
+	// The same discovery entry may be shared when its OID is the same.
+	if _, err := parseWith(t, `devices: []`, map[string]string{
+		"a.yaml": `discovery: { columns: { ifName: 1.3.1 } }`,
+		"b.yaml": `discovery: { columns: { ifName: .1.3.1 } }`,
+	}); err != nil {
+		t.Errorf("shared discovery column: %v", err)
 	}
 }
 
@@ -239,7 +404,6 @@ devices:
   - id: d
     address: x
     snmp: { version: 2c, community: "${TEST_COMMUNITY}" }
-    scalars: [{ name: a, oid: 1.3 }]
 `)
 	s := c.DeviceSpecs()[0].SNMP
 	if s.Community.Reveal() != "super-secret-community" {
@@ -254,7 +418,7 @@ devices:
 		}
 	}
 	// Validation errors must not echo secrets either.
-	_, err := parse(t, `devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: leak } , scalars: [{ name: a, oid: 1.3 }] }]`)
+	_, err := parse(t, `devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_passphrase: leak } }]`)
 	if err == nil || strings.Contains(err.Error(), "leak") {
 		t.Errorf("err = %v", err)
 	}

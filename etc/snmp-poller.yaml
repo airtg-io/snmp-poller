@@ -12,6 +12,7 @@ global:
   max_repetitions: 25          # GETBULK max-repetitions (v2c/v3 walks)
   port: 161
   data_dir: data               # on-disk state for rate/volume; wiped on startup
+  conf_dir: conf.d             # SNMP capabilities, one file each (relative to this file)
   stats_interval: 1m           # periodic summary log line
   shutdown_timeout: 30s        # grace period for in-flight polls on SIGINT/SIGTERM
 
@@ -37,38 +38,11 @@ credentials:
     version: 2c
     community: ${SNMP_COMMUNITY}   # read from the environment
 
-profiles:
-  system:
-    discovery:
-      columns:
-        entPhysicalModelName: 1.3.6.1.2.1.47.1.1.1.1.13
-        entPhysicalSerialNum: 1.3.6.1.2.1.47.1.1.1.1.11
-    scalars:
-      - name: sysUpTime
-        oid: 1.3.6.1.2.1.1.3.0
-
-  if-mib:
-    discovery:
-      columns:
-        ifName: 1.3.6.1.2.1.31.1.1.1.1
-        ifDescr: 1.3.6.1.2.1.2.2.1.2
-        ifAlias: 1.3.6.1.2.1.31.1.1.1.18
-    tables:
-      - name: interfaces
-        label: ifName
-        labels: [ifDescr, ifAlias]
-        columns:
-          - { name: ifHCInOctets,  oid: 1.3.6.1.2.1.31.1.1.1.6,  modes: [rate, volume] }
-          - { name: ifHCOutOctets, oid: 1.3.6.1.2.1.31.1.1.1.10, modes: [rate, volume] }
-          - { name: ifInErrors,    oid: 1.3.6.1.2.1.2.2.1.14,    modes: [volume] }
-          - { name: ifOutErrors,   oid: 1.3.6.1.2.1.2.2.1.20,    modes: [volume] }
-          - { name: ifOperStatus,  oid: 1.3.6.1.2.1.2.2.1.8 }
-          - { name: ifHighSpeed,   oid: 1.3.6.1.2.1.31.1.1.1.15 }
-
 devices:
   # Example device, disabled. Set SNMP_COMMUNITY and enabled: true to try it.
   - id: localhost
     address: 127.0.0.1
     enabled: false
     credential: public-v2c
-    profiles: [system, if-mib]
+    # Every capability of etc/conf.d found on the device is polled, except:
+    # exclude: [interfaces]

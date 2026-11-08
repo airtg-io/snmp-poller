@@ -1,7 +1,8 @@
-// Package state persists the previous value of every rate/volume metric on
-// disk, under <data_dir>/<device_id>/, so memory usage does not grow with the
-// number of polled OIDs. A device's state is only held in memory while that
-// device is being polled.
+// Package state persists, under <data_dir>/<device_id>/, the discovery
+// result of every device and the previous value of every rate/volume metric,
+// so memory usage does not grow with the number of devices, rows or polled
+// OIDs. A device's data is only held in memory while that device is being
+// polled.
 package state
 
 import (
@@ -60,9 +61,23 @@ func (s *Store) ResetDevice(id string) error {
 	return os.RemoveAll(s.DeviceDir(id))
 }
 
-// SaveDiscovery writes the device's discovery result as JSON, for operators.
+// SaveDiscovery writes the device's discovery result as JSON. It is the
+// device's discovery cache: read back by every poll until the next
+// discovery, and readable by operators.
 func (s *Store) SaveDiscovery(id string, v any) error {
 	return s.writeJSON(id, discoveryFile, v)
+}
+
+// LoadDiscovery reads the discovery result saved by SaveDiscovery into v.
+func (s *Store) LoadDiscovery(id string, v any) error {
+	data, err := os.ReadFile(filepath.Join(s.DeviceDir(id), discoveryFile))
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("corrupt %s: %w", discoveryFile, err)
+	}
+	return nil
 }
 
 // entry is one previous value. Short JSON keys keep files small.

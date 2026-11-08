@@ -201,6 +201,33 @@ func (c *Client) bisect(oids []string) ([]gosnmp.SnmpPDU, error) {
 	return append(a, b...), err
 }
 
+// Has reports whether the agent has at least one object below the subtree
+// root, with a single GETNEXT. An agent answering an error status (SNMPv1
+// noSuchName at the end of its MIB) does not have it.
+func (c *Client) Has(root string) (bool, error) {
+	pkt, err := c.g.GetNext([]string{root})
+	if err != nil {
+		return false, fmt.Errorf("getnext %s: %w", root, err)
+	}
+	switch pkt.Error {
+	case gosnmp.NoError:
+	case gosnmp.NoSuchName:
+		return false, nil
+	default:
+		return false, fmt.Errorf("getnext %s: agent returned %s", root, pkt.Error)
+	}
+	if len(pkt.Variables) != 1 {
+		return false, nil
+	}
+	v := pkt.Variables[0]
+	switch v.Type {
+	case gosnmp.NoSuchObject, gosnmp.NoSuchInstance, gosnmp.EndOfMibView:
+		return false, nil
+	}
+	_, ok := Index(root, v.Name)
+	return ok, nil
+}
+
 // Walk visits every OID below root: GETBULK on v2c/v3, GETNEXT on v1.
 func (c *Client) Walk(root string, fn func(gosnmp.SnmpPDU) error) error {
 	walk := c.g.BulkWalk

@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
@@ -15,26 +18,39 @@ import (
 	"github.com/airtg-io/snmp-poller/internal/state"
 )
 
-// Discovery is the result of a discovery run on one device.
+// Discovery is the result of a discovery run on one device. It is cached on
+// disk (data/<device_id>/discovery.json) and read back by every poll until
+// the next discovery.
 type Discovery struct {
-	Time    time.Time         `json:"time"`
-	Scalars map[string]string `json:"scalars"`
+	Time time.Time `json:"time"`
+	// Capabilities are the names of the capabilities the device has.
+	Capabilities []string          `json:"capabilities"`
+	Scalars      map[string]string `json:"scalars"`
 	// Columns maps a discovery column name to index -> value.
 	Columns map[string]map[string]string `json:"columns"`
-	// Rows maps a table name to its selected row indexes, in OID order.
-	Rows map[string][]string `json:"rows"`
+	// Tables holds the row selection of every labelled table.
+	Tables map[string]*TableDiscovery `json:"tables"`
+}
+
+// TableDiscovery is the row selection of one labelled table.
+type TableDiscovery struct {
+	// Rows are the selected row indexes, in OID order.
+	Rows []string `json:"rows"`
+	// HighCapacity reports whether the agent answered the high_capacity
+	// probe. HighCapacityRows are the selected rows polled with hc_oid.
+	HighCapacity     bool     `json:"high_capacity"`
+	HighCapacityRows []string `json:"high_capacity_rows,omitempty"`
 }
 
 // device is the runtime state of one configured device. Fields are only
 // touched by the worker currently polling it (the scheduler guarantees at
-// most one poll per device at a time).
+// most one poll per device at a time). Discovery data lives on disk.
 type device struct {
 	spec    config.DeviceSpec
 	log     *slog.Logger
 	outputs []output.Output
 
-	discovery    *Discovery
-	discoveredAt time.Time
+	discoveredAt time.Time // zero until the first successful discovery
 	failing      bool
 }
 
@@ -58,27 +74,12 @@ func (d *device) poll(ctx context.Context, store *state.Store, now func() time.T
 	}
 	defer c.Close()
 
-	if d.discovery == nil || now().Sub(d.discoveredAt) >= d.spec.DiscoveryInterval {
-		res.discovered = true
-		start := now()
-		disc, err := d.discover(c, now)
-		if err != nil {
-			res.discoveryErr = true
-			return res, fmt.Errorf("discovery: %w", err)
-		}
-		// Row indexes may have changed: previous values are meaningless.
-		if err := store.ResetDevice(d.spec.ID); err != nil {
-			return res, fmt.Errorf("reset state: %w", err)
-		}
-		if err := store.SaveDiscovery(d.spec.ID, disc); err != nil {
-			return res, fmt.Errorf("save discovery: %w", err)
-		}
-		d.discovery, d.discoveredAt = disc, start
-		d.log.Debug("discovery done", "duration", roundDur(now().Sub(start)),
-			"scalars", len(disc.Scalars), "columns", len(disc.Columns), "rows", rowCount(disc))
+	disc, err := d.discovery(c, store, now, &res)
+	if err != nil {
+		return res, err
 	}
 
-	batch, missing, err := d.collect(c, store, now)
+	batch, missing, err := d.collect(c, store, disc, now)
 	if err != nil {
 		return res, err
 	}
@@ -93,6 +94,40 @@ func (d *device) poll(ctx context.Context, store *state.Store, now func() time.T
 	return res, nil
 }
 
+// discovery returns the device's discovery: from the on-disk cache, or from
+// a new discovery run when one is due or the cache cannot be read.
+func (d *device) discovery(c *snmp.Client, store *state.Store, now func() time.Time, res *pollResult) (*Discovery, error) {
+	due := d.discoveredAt.IsZero() || now().Sub(d.discoveredAt) >= d.spec.DiscoveryInterval
+	if !due {
+		disc := &Discovery{}
+		err := store.LoadDiscovery(d.spec.ID, disc)
+		if err == nil {
+			return disc, nil
+		}
+		d.log.Warn("discovery cache unreadable, rediscovering", "err", err)
+	}
+
+	res.discovered = true
+	start := now()
+	disc, err := d.discover(c, now)
+	if err != nil {
+		res.discoveryErr = true
+		return nil, fmt.Errorf("discovery: %w", err)
+	}
+	// Row indexes may have changed: previous values are meaningless.
+	if err := store.ResetDevice(d.spec.ID); err != nil {
+		return nil, fmt.Errorf("reset state: %w", err)
+	}
+	if err := store.SaveDiscovery(d.spec.ID, disc); err != nil {
+		return nil, fmt.Errorf("save discovery: %w", err)
+	}
+	d.discoveredAt = start
+	d.log.Debug("discovery done", "duration", roundDur(now().Sub(start)),
+		"capabilities", disc.Capabilities, "scalars", len(disc.Scalars),
+		"columns", len(disc.Columns), "rows", rowCount(disc))
+	return disc, nil
+}
+
 // deadline bounds a whole poll so a stuck device cannot hold a worker forever.
 func (d *device) deadline() time.Duration {
 	per := d.spec.Timeout * time.Duration(d.spec.Retries+1)
@@ -101,38 +136,61 @@ func (d *device) deadline() time.Duration {
 
 func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, error) {
 	disc := &Discovery{
-		Time:    now(),
-		Scalars: map[string]string{},
-		Columns: map[string]map[string]string{},
-		Rows:    map[string][]string{},
+		Time:         now().UTC(),
+		Capabilities: []string{},
+		Scalars:      map[string]string{},
+		Columns:      map[string]map[string]string{},
+		Tables:       map[string]*TableDiscovery{},
 	}
 
-	names := make([]string, 0, len(d.spec.Discovery.Scalars))
-	byOID := map[string]string{}
-	oids := make([]string, 0, len(names))
-	for name, oid := range d.spec.Discovery.Scalars {
-		names = append(names, name)
-		byOID[oid] = name
-		oids = append(oids, oid)
+	// 1. Capabilities: those without detect always apply, the others when
+	// every detect subtree exists on the agent.
+	var active []*config.Capability
+	for _, cp := range d.spec.Capabilities {
+		ok, err := detect(c, cp)
+		if err != nil {
+			return nil, err // already names the OID; usually the agent being unreachable
+		}
+		if !ok {
+			d.log.Debug("capability not detected", "capability", cp.Name)
+			continue
+		}
+		active = append(active, cp)
+		disc.Capabilities = append(disc.Capabilities, cp.Name)
 	}
-	sort.Strings(oids)
+
+	// Every OID is fetched once, whatever the number of names using it.
+	scalars := map[string][]string{} // oid -> names
+	columns := map[string][]string{}
+	for _, cp := range active {
+		for name, oid := range cp.Discovery.Scalars {
+			if !slices.Contains(scalars[oid], name) {
+				scalars[oid] = append(scalars[oid], name)
+			}
+		}
+		for name, oid := range cp.Discovery.Columns {
+			if !slices.Contains(columns[oid], name) {
+				columns[oid] = append(columns[oid], name)
+			}
+		}
+	}
+
+	// 2. Scalars, in one chunked GET.
+	oids := slices.Sorted(maps.Keys(scalars))
 	pdus, err := c.Get(oids)
 	if err != nil {
 		return nil, err
 	}
 	for _, p := range pdus {
 		if v, ok := snmp.Convert(p); ok {
-			disc.Scalars[byOID[p.Name]] = v.String()
+			for _, name := range scalars[p.Name] {
+				disc.Scalars[name] = v.String()
+			}
 		}
 	}
 
-	colNames := make([]string, 0, len(d.spec.Discovery.Columns))
-	for name := range d.spec.Discovery.Columns {
-		colNames = append(colNames, name)
-	}
-	sort.Strings(colNames)
-	for _, name := range colNames {
-		root := d.spec.Discovery.Columns[name]
+	// 3. Columns, walked.
+	for _, root := range slices.Sorted(maps.Keys(columns)) {
 		vals := map[string]string{}
 		err := c.Walk(root, func(p gosnmp.SnmpPDU) error {
 			idx, ok := snmp.Index(root, p.Name)
@@ -147,41 +205,103 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		if err != nil {
 			return nil, err
 		}
-		disc.Columns[name] = vals
+		for _, name := range columns[root] {
+			disc.Columns[name] = vals
+		}
 	}
 
-	// Row selection for labelled tables is fixed until the next discovery.
-	for _, t := range d.spec.Tables {
-		if t.Label == "" {
-			continue
-		}
-		var rows []string
-		for idx, label := range disc.Columns[t.Label] {
-			if t.Selects(label) {
-				rows = append(rows, idx)
+	// 4. Row selection of labelled tables, fixed until the next discovery.
+	for _, cp := range active {
+		for i := range cp.Tables {
+			t := &cp.Tables[i]
+			if t.Label == "" {
+				continue
 			}
+			td, err := d.selectRows(c, t, disc)
+			if err != nil {
+				return nil, fmt.Errorf("table %s: %w", t.Name, err)
+			}
+			disc.Tables[t.Name] = td
 		}
-		sortIndexes(rows)
-		disc.Rows[t.Name] = rows
-		d.log.Debug("table rows selected", "table", t.Name, "selected", len(rows),
-			"total", len(disc.Columns[t.Label]))
 	}
 	return disc, nil
 }
 
-// collect polls every metric. missing counts requested OIDs the agent did
-// not return (wrong OID, row gone, unsupported MIB).
-func (d *device) collect(c *snmp.Client, store *state.Store, now func() time.Time) (batch *output.Batch, missing int, err error) {
+func detect(c *snmp.Client, cp *config.Capability) (bool, error) {
+	for _, oid := range cp.Detect {
+		ok, err := c.Has(oid)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// selectRows applies the include patterns to the label of every row and,
+// for high_capacity tables, decides which rows use hc_oid: the device must
+// not be SNMPv1, the agent must answer the probe for the first row, and the
+// row speed must be above the threshold.
+func (d *device) selectRows(c *snmp.Client, t *config.TableSpec, disc *Discovery) (*TableDiscovery, error) {
+	names := disc.Columns[t.Label]
+	all := make([]string, 0, len(names))
+	for idx := range names {
+		all = append(all, idx)
+	}
+	sortIndexes(all)
+	td := &TableDiscovery{Rows: []string{}}
+	for _, idx := range all {
+		if t.Selects(names[idx]) {
+			td.Rows = append(td.Rows, idx)
+		}
+	}
+	// SNMPv1 cannot carry Counter64 (RFC 3584): agents hide 64-bit counters.
+	if hc := t.HighCapacity; hc != nil && len(all) > 0 && d.spec.SNMP.Version != config.Version1 {
+		pdus, err := c.Get([]string{hc.Probe + "." + all[0]})
+		if err != nil {
+			return nil, fmt.Errorf("high_capacity probe: %w", err)
+		}
+		td.HighCapacity = len(pdus) > 0
+		if td.HighCapacity {
+			for _, idx := range td.Rows {
+				speed, err := strconv.ParseUint(disc.Columns[hc.Speed][idx], 10, 64)
+				if err == nil && speed > hc.Above {
+					td.HighCapacityRows = append(td.HighCapacityRows, idx)
+				}
+			}
+		}
+	}
+	d.log.Debug("table rows selected", "table", t.Name, "selected", len(td.Rows), "total", len(all),
+		"high_capacity", td.HighCapacity, "high_capacity_rows", len(td.HighCapacityRows))
+	return td, nil
+}
+
+// active returns the device's capabilities found by discovery.
+func (d *device) active(disc *Discovery) []*config.Capability {
+	var caps []*config.Capability
+	for _, cp := range d.spec.Capabilities {
+		if slices.Contains(disc.Capabilities, cp.Name) {
+			caps = append(caps, cp)
+		}
+	}
+	return caps
+}
+
+// collect polls every metric of the device's capabilities. missing counts
+// requested OIDs the agent did not return (wrong OID, row gone, unsupported
+// MIB).
+func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, now func() time.Time) (batch *output.Batch, missing int, err error) {
 	st, err := store.Load(d.spec.ID)
 	if err != nil {
 		d.log.Warn("state reset", "err", err)
 	}
 	batch = &output.Batch{
-		DeviceID:  d.spec.ID,
-		Address:   d.spec.Address,
-		Discovery: d.discovery.Scalars,
+		DeviceID:     d.spec.ID,
+		Address:      d.spec.Address,
+		Capabilities: disc.Capabilities,
+		Discovery:    disc.Scalars,
 	}
-	em := emitter{batch: batch, state: st, log: d.log}
+	em := emitter{batch: batch, state: st, log: d.log, deltas: map[string]delta{}}
+	caps := d.active(disc)
 
 	// Scalars and labelled tables: one chunked GET for everything.
 	type target struct {
@@ -190,23 +310,42 @@ func (d *device) collect(c *snmp.Client, store *state.Store, now func() time.Tim
 		scalar *config.Scalar
 		index  string
 	}
+	// Several metrics may share an OID: it is fetched once and emitted for each.
 	var oids []string
-	targets := map[string]target{}
-	for i := range d.spec.Scalars {
-		s := &d.spec.Scalars[i]
-		oids = append(oids, s.OID)
-		targets[s.OID] = target{scalar: s}
-	}
-	for i := range d.spec.Tables {
-		t := &d.spec.Tables[i]
-		if t.Label == "" {
-			continue
+	targets := map[string][]target{}
+	add := func(oid string, tg target) {
+		if _, ok := targets[oid]; !ok {
+			oids = append(oids, oid)
 		}
-		for _, idx := range d.discovery.Rows[t.Name] {
-			for j := range t.Columns {
-				oid := t.Columns[j].OID + "." + idx
-				oids = append(oids, oid)
-				targets[oid] = target{table: t, column: &t.Columns[j], index: idx}
+		targets[oid] = append(targets[oid], tg)
+	}
+	for _, cp := range caps {
+		for i := range cp.Scalars {
+			add(cp.Scalars[i].OID, target{scalar: &cp.Scalars[i]})
+		}
+		for i := range cp.Tables {
+			t := &cp.Tables[i]
+			td := disc.Tables[t.Name]
+			if t.Label == "" || td == nil {
+				continue
+			}
+			hcRows := make(map[string]bool, len(td.HighCapacityRows))
+			for _, idx := range td.HighCapacityRows {
+				hcRows[idx] = true
+			}
+			for _, idx := range td.Rows {
+				hc := hcRows[idx]
+				for j := range t.Columns {
+					col := &t.Columns[j]
+					base := col.OID
+					if hc && col.HCOID != "" {
+						base = col.HCOID
+					}
+					if base == "" {
+						continue // hc_oid only, on a row that is not high-capacity
+					}
+					add(base+"."+idx, target{table: t, column: col, index: idx})
+				}
 			}
 		}
 	}
@@ -230,42 +369,59 @@ func (d *device) collect(c *snmp.Client, store *state.Store, now func() time.Tim
 	}
 	ts := now()
 	for _, p := range pdus {
-		tg, ok := targets[p.Name]
-		if !ok {
-			continue
-		}
 		v, ok := snmp.Convert(p)
 		if !ok {
 			continue
 		}
-		if tg.scalar != nil {
-			em.emit(tg.scalar.Name, "", "", nil, tg.scalar.Modes, v, ts)
-			continue
+		for _, tg := range targets[p.Name] {
+			if tg.scalar != nil {
+				em.emit(p.Name, tg.scalar.Name, "", "", nil, tg.scalar.Modes, v, ts)
+				continue
+			}
+			em.emit(p.Name, tg.column.Name, tg.table.Name, tg.index, labels(tg.table, tg.index, disc),
+				tg.column.Modes, v, ts)
 		}
-		em.emit(tg.column.Name, tg.table.Name, tg.index, d.labels(tg.table, tg.index),
-			tg.column.Modes, v, ts)
 	}
 
-	// Unlabelled tables: walk each column, filter on the index.
-	for i := range d.spec.Tables {
-		t := &d.spec.Tables[i]
-		if t.Label != "" {
-			continue
-		}
-		for _, col := range t.Columns {
-			err := c.Walk(col.OID, func(p gosnmp.SnmpPDU) error {
-				idx, ok := snmp.Index(col.OID, p.Name)
-				if !ok || !t.Selects(idx) {
-					return nil
-				}
-				if v, ok := snmp.Convert(p); ok {
-					em.emit(col.Name, t.Name, idx, d.labels(t, idx), col.Modes, v, now())
-				}
-				return nil
-			})
-			if err != nil {
-				return nil, 0, err
+	// Unlabelled tables: walk each column once, filter on the index of each
+	// table using it.
+	type walked struct {
+		table  *config.TableSpec
+		column *config.Column
+	}
+	walks := map[string][]walked{}
+	for _, cp := range caps {
+		for i := range cp.Tables {
+			t := &cp.Tables[i]
+			if t.Label != "" {
+				continue
 			}
+			for j := range t.Columns {
+				col := &t.Columns[j]
+				walks[col.OID] = append(walks[col.OID], walked{table: t, column: col})
+			}
+		}
+	}
+	for _, root := range slices.Sorted(maps.Keys(walks)) {
+		err := c.Walk(root, func(p gosnmp.SnmpPDU) error {
+			idx, ok := snmp.Index(root, p.Name)
+			if !ok {
+				return nil
+			}
+			v, ok := snmp.Convert(p)
+			if !ok {
+				return nil
+			}
+			ts := now()
+			for _, w := range walks[root] {
+				if w.table.Selects(idx) {
+					em.emit(p.Name, w.column.Name, w.table.Name, idx, labels(w.table, idx, disc), w.column.Modes, v, ts)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, 0, err
 		}
 	}
 
@@ -275,16 +431,16 @@ func (d *device) collect(c *snmp.Client, store *state.Store, now func() time.Tim
 	return batch, missing, nil
 }
 
-func (d *device) labels(t *config.TableSpec, idx string) map[string]string {
+func labels(t *config.TableSpec, idx string, disc *Discovery) map[string]string {
 	if t.Label == "" && len(t.Labels) == 0 {
 		return nil
 	}
 	l := make(map[string]string, len(t.Labels)+1)
 	if t.Label != "" {
-		l[t.Label] = d.discovery.Columns[t.Label][idx]
+		l[t.Label] = disc.Columns[t.Label][idx]
 	}
 	for _, name := range t.Labels {
-		if v, ok := d.discovery.Columns[name][idx]; ok {
+		if v, ok := disc.Columns[name][idx]; ok {
 			l[name] = v
 		}
 	}
@@ -295,9 +451,19 @@ type emitter struct {
 	batch *output.Batch
 	state *state.Device
 	log   *slog.Logger
+	// deltas caches this poll's delta of every OID: previous values are
+	// stored per OID, and every metric reading that OID shares them.
+	deltas map[string]delta
 }
 
-func (e *emitter) emit(metric, table, idx string, labels map[string]string,
+type delta struct {
+	volume, seconds float64
+	ok              bool
+}
+
+// emit adds the samples of one value read from oid: one per mode. Rate and
+// volume come from the same delta.
+func (e *emitter) emit(oid, metric, table, idx string, labels map[string]string,
 	modes []config.Mode, v snmp.Value, ts time.Time,
 ) {
 	sample := output.Sample{Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Time: ts}
@@ -318,14 +484,15 @@ func (e *emitter) emit(metric, table, idx string, labels map[string]string,
 		e.log.Debug("rate/volume skipped: value is not numeric", "metric", metric, "index", idx, "type", v.Type)
 		return
 	}
-	key := metric
-	if table != "" {
-		key = table + "/" + metric + "/" + idx
+	dl, seen := e.deltas[oid]
+	if !seen {
+		dl.volume, dl.seconds, dl.ok = e.state.Delta(oid, v, ts)
+		e.deltas[oid] = dl
 	}
-	vol, secs, ok := e.state.Delta(key, v, ts)
-	if !ok {
+	if !dl.ok {
 		return
 	}
+	vol, secs := dl.volume, dl.seconds
 	for _, m := range modes {
 		s := sample
 		s.Mode = m
@@ -343,8 +510,8 @@ func (e *emitter) emit(metric, table, idx string, labels map[string]string,
 
 func rowCount(d *Discovery) int {
 	n := 0
-	for _, r := range d.Rows {
-		n += len(r)
+	for _, t := range d.Tables {
+		n += len(t.Rows)
 	}
 	return n
 }

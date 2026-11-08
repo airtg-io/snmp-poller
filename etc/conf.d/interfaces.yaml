@@ -1,0 +1,41 @@
+# Capability "interfaces": IF-MIB ifTable (1.3.6.1.2.1.2.2) and ifXTable
+# (1.3.6.1.2.1.31.1.1).
+# No `detect`: applies to every device (unless the device excludes it).
+#
+# At discovery, ifHCInOctets of the first interface is fetched. If the agent
+# has it, the 64-bit ifXTable counters are available, and interfaces faster
+# than 100 Mbit/s (ifSpeed) are polled with them (hc_oid): a 32-bit octet
+# counter wraps every 34 s at 1 Gbit/s, every 344 s at 100 Mbit/s. Every other
+# interface uses the 32-bit ifTable counters (oid), and so does every
+# interface over SNMPv1, which cannot carry 64-bit counters. Metric names do
+# not change: the sample type (Counter32 or Counter64) tells them apart.
+description: IF-MIB interfaces, 64-bit counters on interfaces faster than 100 Mbit/s
+
+discovery:
+  columns:
+    ifDescr: 1.3.6.1.2.1.2.2.1.2        # ifTable, always present
+    ifSpeed: 1.3.6.1.2.1.2.2.1.5        # bit/s, saturates at 4294967295
+    ifName:  1.3.6.1.2.1.31.1.1.1.1     # ifXTable
+    ifAlias: 1.3.6.1.2.1.31.1.1.1.18    # ifXTable
+
+tables:
+  - name: interfaces
+    label: ifDescr                      # row name matched by `include`
+    labels: [ifName, ifAlias]
+    high_capacity:
+      probe: 1.3.6.1.2.1.31.1.1.1.6     # ifHCInOctets.<first interface>
+      speed: ifSpeed
+      above: 100000000                  # 100 Mbit/s
+    columns:
+      - { name: ifInOctets,     oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6,  modes: [rate, volume] }
+      - { name: ifOutOctets,    oid: 1.3.6.1.2.1.2.2.1.16, hc_oid: 1.3.6.1.2.1.31.1.1.1.10, modes: [rate, volume] }
+      - { name: ifInUcastPkts,  oid: 1.3.6.1.2.1.2.2.1.11, hc_oid: 1.3.6.1.2.1.31.1.1.1.7,  modes: [rate, volume] }
+      - { name: ifOutUcastPkts, oid: 1.3.6.1.2.1.2.2.1.17, hc_oid: 1.3.6.1.2.1.31.1.1.1.11, modes: [rate, volume] }
+      - { name: ifInDiscards,   oid: 1.3.6.1.2.1.2.2.1.13, modes: [volume] }
+      - { name: ifOutDiscards,  oid: 1.3.6.1.2.1.2.2.1.19, modes: [volume] }
+      - { name: ifInErrors,     oid: 1.3.6.1.2.1.2.2.1.14, modes: [volume] }
+      - { name: ifOutErrors,    oid: 1.3.6.1.2.1.2.2.1.20, modes: [volume] }
+      - { name: ifAdminStatus,  oid: 1.3.6.1.2.1.2.2.1.7 }
+      - { name: ifOperStatus,   oid: 1.3.6.1.2.1.2.2.1.8 }
+      - { name: ifSpeed,        oid: 1.3.6.1.2.1.2.2.1.5 }
+      - { name: ifHighSpeed,    hc_oid: 1.3.6.1.2.1.31.1.1.1.15 }   # Mbit/s, high-capacity rows only

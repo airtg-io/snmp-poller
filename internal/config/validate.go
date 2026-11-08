@@ -5,17 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 )
-
-// DefaultDiscoveryScalars are collected on every discovery run, for every device.
-var DefaultDiscoveryScalars = map[string]string{
-	"sysDescr":    ".1.3.6.1.2.1.1.1.0",
-	"sysObjectID": ".1.3.6.1.2.1.1.2.0",
-	"sysName":     ".1.3.6.1.2.1.1.5.0",
-}
 
 // SNMP versions after normalization.
 const (
@@ -39,7 +33,7 @@ var (
 )
 
 // DeviceSpec is the fully resolved configuration of one enabled device:
-// defaults applied, credential and profiles merged, everything validated.
+// defaults applied, credential merged, everything validated.
 type DeviceSpec struct {
 	ID                string
 	Address           string
@@ -53,33 +47,18 @@ type DeviceSpec struct {
 	MaxRepetitions    uint32
 	Outputs           []string
 	Trace             bool
-	Discovery         Discovery
-	Scalars           []Scalar
-	Tables            []TableSpec
-}
-
-// TableSpec is a validated table with its include patterns compiled.
-type TableSpec struct {
-	Table
-	IncludeRE []*regexp.Regexp
-}
-
-// Selects reports whether a row whose match key is key must be polled.
-// With no include pattern every row is selected.
-func (t *TableSpec) Selects(key string) bool {
-	if len(t.IncludeRE) == 0 {
-		return true
-	}
-	for _, re := range t.IncludeRE {
-		if re.MatchString(key) {
-			return true
-		}
-	}
-	return false
+	// Capabilities are the candidates for this device (every capability not
+	// excluded), with the device's include overrides applied. Discovery
+	// decides which of them the device actually has.
+	Capabilities []*Capability
 }
 
 // DeviceSpecs returns the resolved specification of every enabled device.
 func (c *Config) DeviceSpecs() []DeviceSpec { return c.specs }
+
+// Capabilities returns every capability loaded from the capabilities
+// directory, sorted by name.
+func (c *Config) Capabilities() []*Capability { return c.capabilities }
 
 func (c *Config) validate() error {
 	var errs []error
@@ -132,13 +111,6 @@ func (c *Config) validate() error {
 
 	// Credentials are validated where they are used (see resolve), so an
 	// unused credential may reference an unset ${ENV_VAR}.
-	c.badProfiles = map[string]bool{}
-	for _, name := range sortedKeys(c.Profiles) {
-		if err := checkSet(c.Profiles[name], "profile "+name); err != nil {
-			c.badProfiles[name] = true
-			errs = append(errs, err)
-		}
-	}
 
 	ids := map[string]bool{}
 	for i, d := range c.Devices {
@@ -232,136 +204,66 @@ func (c *Config) resolve(d Device, outputs map[string]bool) (DeviceSpec, error) 
 		s.Outputs = append(s.Outputs, o)
 	}
 
-	// Metric sets: profiles in order, then the inline set.
-	s.Discovery = Discovery{Scalars: map[string]string{}, Columns: map[string]string{}}
-	for k, v := range DefaultDiscoveryScalars {
-		s.Discovery.Scalars[k] = v
-	}
-	sets := make([]Set, 0, len(d.Profiles)+1)
-	for _, p := range d.Profiles {
-		set, ok := c.Profiles[p]
-		if !ok {
-			return s, fmt.Errorf("unknown profile %q", p)
-		}
-		if c.badProfiles[p] {
-			return s, fmt.Errorf("profile %q is invalid", p)
-		}
-		sets = append(sets, set)
-	}
-	if err := checkSet(d.Set, "inline"); err != nil {
+	caps, err := c.deviceCapabilities(d)
+	if err != nil {
 		return s, err
 	}
-	sets = append(sets, d.Set)
-
-	scalarNames := map[string]bool{}
-	tableNames := map[string]bool{}
-	for _, set := range sets {
-		for k, v := range set.Discovery.Scalars {
-			s.Discovery.Scalars[k] = normOID(v)
-		}
-		for k, v := range set.Discovery.Columns {
-			s.Discovery.Columns[k] = normOID(v)
-		}
-		for _, sc := range set.Scalars {
-			if scalarNames[sc.Name] {
-				return s, fmt.Errorf("duplicate scalar %q", sc.Name)
-			}
-			scalarNames[sc.Name] = true
-			sc.OID = normOID(sc.OID)
-			sc.Modes = normModes(sc.Modes)
-			s.Scalars = append(s.Scalars, sc)
-		}
-		for _, t := range set.Tables {
-			if tableNames[t.Name] {
-				return s, fmt.Errorf("duplicate table %q", t.Name)
-			}
-			tableNames[t.Name] = true
-			ts := TableSpec{Table: t}
-			ts.Columns = make([]Column, len(t.Columns))
-			for i, col := range t.Columns {
-				col.OID = normOID(col.OID)
-				col.Modes = normModes(col.Modes)
-				ts.Columns[i] = col
-			}
-			for _, p := range t.Include {
-				ts.IncludeRE = append(ts.IncludeRE, regexp.MustCompile(p)) // already checked
-			}
-			s.Tables = append(s.Tables, ts)
-		}
-	}
-	for _, t := range s.Tables {
-		for _, l := range append([]string{t.Label}, t.Labels...) {
-			if l == "" {
-				continue
-			}
-			if _, ok := s.Discovery.Columns[l]; !ok {
-				return s, fmt.Errorf("table %q: label %q is not a discovery column", t.Name, l)
-			}
-		}
-	}
-	if len(s.Scalars) == 0 && len(s.Tables) == 0 {
-		return s, errors.New("nothing to poll: no scalars or tables (check profiles)")
-	}
+	s.Capabilities = caps
 	return s, nil
 }
 
-// checkSet validates the syntax of a metric set on its own.
-func checkSet(set Set, where string) error {
-	var errs []error
-	add := func(format string, a ...any) {
-		errs = append(errs, fmt.Errorf(where+": "+format, a...))
+// deviceCapabilities returns every capability not excluded by d, with d's
+// include overrides applied (on copies: capabilities are shared).
+func (c *Config) deviceCapabilities(d Device) ([]*Capability, error) {
+	excluded := map[string]bool{}
+	for _, name := range d.Exclude {
+		if !slices.ContainsFunc(c.capabilities, func(c *Capability) bool { return c.Name == name }) {
+			return nil, fmt.Errorf("exclude: unknown capability %q", name)
+		}
+		excluded[name] = true
 	}
-	for _, k := range sortedKeys(set.Discovery.Scalars) {
-		if !oidPattern.MatchString(set.Discovery.Scalars[k]) {
-			add("discovery scalar %q: invalid oid %q", k, set.Discovery.Scalars[k])
-		}
-	}
-	for _, k := range sortedKeys(set.Discovery.Columns) {
-		if !oidPattern.MatchString(set.Discovery.Columns[k]) {
-			add("discovery column %q: invalid oid %q", k, set.Discovery.Columns[k])
-		}
-	}
-	for i, sc := range set.Scalars {
-		if sc.Name == "" {
-			add("scalars[%d]: name is required", i)
-		}
-		if !oidPattern.MatchString(sc.OID) {
-			add("scalar %q: invalid oid %q", sc.Name, sc.OID)
-		}
-		if err := checkModes(sc.Modes); err != nil {
-			add("scalar %q: %w", sc.Name, err)
-		}
-	}
-	for i, t := range set.Tables {
-		if t.Name == "" {
-			add("tables[%d]: name is required", i)
-		}
-		if len(t.Columns) == 0 {
-			add("table %q: at least one column is required", t.Name)
-		}
-		for _, p := range t.Include {
+	for _, name := range sortedKeys(d.Include) {
+		for _, p := range d.Include[name] {
 			if _, err := regexp.Compile(p); err != nil {
-				add("table %q: include %q: %w", t.Name, p, err)
-			}
-		}
-		cols := map[string]bool{}
-		for j, col := range t.Columns {
-			switch {
-			case col.Name == "":
-				add("table %q: columns[%d]: name is required", t.Name, j)
-			case cols[col.Name]:
-				add("table %q: duplicate column %q", t.Name, col.Name)
-			}
-			cols[col.Name] = true
-			if !oidPattern.MatchString(col.OID) {
-				add("table %q: column %q: invalid oid %q", t.Name, col.Name, col.OID)
-			}
-			if err := checkModes(col.Modes); err != nil {
-				add("table %q: column %q: %w", t.Name, col.Name, err)
+				return nil, fmt.Errorf("include: table %q: %q: %w", name, p, err)
 			}
 		}
 	}
-	return errors.Join(errs...)
+	tables := map[string]bool{}
+	var caps []*Capability
+	for _, cp := range c.capabilities {
+		if excluded[cp.Name] {
+			continue
+		}
+		override := false
+		for _, t := range cp.Tables {
+			tables[t.Name] = true
+			_, ok := d.Include[t.Name]
+			override = override || ok
+		}
+		if override {
+			cp2 := *cp
+			cp2.Tables = slices.Clone(cp.Tables)
+			for i := range cp2.Tables {
+				t := &cp2.Tables[i]
+				if p, ok := d.Include[t.Name]; ok {
+					t.Include = p
+					t.IncludeRE = compile(p)
+				}
+			}
+			cp = &cp2
+		}
+		caps = append(caps, cp)
+	}
+	if len(caps) == 0 {
+		return nil, errors.New("every capability is excluded: nothing to poll")
+	}
+	for _, name := range sortedKeys(d.Include) {
+		if !tables[name] {
+			return nil, fmt.Errorf("include: unknown table %q (or its capability is excluded)", name)
+		}
+	}
+	return caps, nil
 }
 
 func checkModes(modes []Mode) error {

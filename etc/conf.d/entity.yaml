@@ -1,0 +1,14 @@
+# Capability "entity": ENTITY-MIB physical inventory (model, serial numbers).
+# Applies only to devices that have entPhysicalModelName (detected at
+# discovery). Collected on discovery only, cached in
+# data/<device_id>/discovery.json.
+description: ENTITY-MIB physical inventory
+
+detect:
+  - 1.3.6.1.2.1.47.1.1.1.1.13            # entPhysicalModelName
+
+discovery:
+  columns:
+    entPhysicalName:      1.3.6.1.2.1.47.1.1.1.1.7
+    entPhysicalModelName: 1.3.6.1.2.1.47.1.1.1.1.13
+    entPhysicalSerialNum: 1.3.6.1.2.1.47.1.1.1.1.11

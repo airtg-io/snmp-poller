@@ -8,6 +8,26 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 
 - **Language**: Go only. Build: `go build ./cmd/snmp-poller`. Test: `go test ./...`. Lint: `go vet ./...` and `gofmt -l .`.
 - **Configuration**: YAML. Default file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
+  The main file holds process settings, outputs, credentials and devices only: **no SNMP metric
+  definitions** (no profiles, no inline sets). What to poll lives in `global.conf_dir`
+  (default `conf.d`, relative to the main file, so `etc/conf.d`).
+- **Capabilities**: one `*.yaml`/`*.yml` file per capability in conf_dir, named after the file.
+  No `detect` = applies to every device; `detect: [oid...]` = applies when every OID subtree
+  exists (one GETNEXT each, at discovery). Every capability found is polled unless the device
+  lists it in `exclude` (only explicit exclusion removes one). Devices may override a table's
+  `include` with `include: {table: [...]}`. Names are unique across capabilities; labels must
+  come from the same capability. Shipped: `system` (always; sysDescr, sysObjectID, sysUpTime,
+  sysContact, sysName, sysLocation as discovery scalars, plus sysUpTime polled every cycle),
+  `interfaces` (always), `entity` (detected).
+- **Shared OIDs**: an OID used by several metrics (same or different capabilities, discovery or
+  polling) is fetched/walked once per cycle and emitted for each. Previous values in state.json
+  are keyed by OID, so rate and volume (and every metric on that OID) share one delta.
+- **Interfaces**: ifXTable 64-bit counters are used per interface when the agent answers a GET
+  of ifHCInOctets.<first ifIndex> (`high_capacity.probe`) and that interface's ifSpeed is
+  > 100 Mbit/s (`hc_oid` columns; 32-bit octets wrap in 34 s at 1G); otherwise ifTable (`oid`). Never on SNMPv1 (no Counter64,
+  net-snmp hides them: found E2E). The probe is a counter, not ifName: some agents have ifXTable
+  names without counters. Same metric names either way. Rows are labelled by ifDescr so
+  ifTable-only agents work.
 - **Global config**: worker thread count (default **250**), default poll interval, default discovery interval, timeouts, retries, data dir, stats interval.
 - **Outputs**: configurable, multiple destinations, each device can target a subset (default: all).
   Only the `null` output exists for now (discards everything). Do not write SNMP data anywhere else yet.
@@ -15,11 +35,13 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   (noAuthNoPriv, authNoPriv, authPriv), all auth protocols (MD5, SHA, SHA224, SHA256, SHA384, SHA512)
   and all priv protocols (DES, AES, AES192, AES256, AES192C, AES256C). UDP and TCP transports.
 - **Discovery**: runs on the first poll of a device and then every hour by default
-  (`discovery_interval`, configurable globally and per device). Discovery collects slow-changing data:
-  system scalars (sysDescr, sysObjectID, sysName are always collected), model, and table columns
-  such as ifName/ifDescr used for row labels and row filtering. Saved to `data/<device_id>/discovery.json`.
+  (`discovery_interval`, configurable globally and per device). It detects capabilities, then
+  collects slow-changing data: discovery scalars, model, and table columns (ifDescr, ifSpeed, ...)
+  used for row labels, filtering and high-capacity selection. The result (capabilities, scalars,
+  columns, rows, high-capacity rows) is the device's **on-disk cache** `data/<device_id>/discovery.json`,
+  read back by every poll (not kept in memory); an unreadable cache triggers a rediscovery.
 - **Value modes**: `raw` (value as-is), `rate` ((v2-v1)/(t2-t1), per second) and `volume` (v2-v1).
-  Previous values for rate/volume are **stored on disk, not in memory**, in `data/<device_id>/state.json`.
+  Previous values for rate/volume are **stored on disk, not in memory**, in `data/<device_id>/state.json`, keyed by OID.
   Counter32 wraps are handled; Counter64 going backwards is treated as a reset.
   The data dir is cleaned on startup, and a device's state is wiped on each rediscovery.
 - **Row based polling**: tables with an inclusive regex pattern list (`include`) matched against the
@@ -44,7 +66,8 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Scheduling**: first polls spread over one interval; a device is never polled twice at once
   (overrun = `skipped`); graceful shutdown waits `shutdown_timeout` for in-flight polls.
 - **Config strictness**: unknown YAML keys are errors; credentials are validated only when used;
-  every ```yaml block in README.md must be a complete valid config (enforced by a test).
+  every ```yaml block in README.md must be valid (enforced by a test): a complete main config
+  checked against `etc/conf.d`, or a capability file when its first line is `# conf.d/<name>.yaml`.
 
 ## Testing notes
 
@@ -66,4 +89,5 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - `internal/output` - `Output` interface, registry, `null` output.
 - `internal/poller` - scheduler, worker pool, discovery, polling, stats.
 - `internal/testagent` - in-process SNMP agent used by integration tests (v1/v2c/v3).
-- `etc/snmp-poller.yaml` - default configuration.
+- `internal/testconf` - test helper writing a config plus its conf.d to a temp dir.
+- `etc/snmp-poller.yaml` - default configuration; `etc/conf.d/` - shipped capabilities.

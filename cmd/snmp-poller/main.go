@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
@@ -48,8 +49,12 @@ func run() int {
 			return 2
 		}
 		output.CloseAll(outs)
-		fmt.Printf("configuration OK: %d enabled device(s), %d output(s)\n",
-			len(cfg.DeviceSpecs()), len(cfg.Outputs))
+		names := make([]string, 0, len(cfg.Capabilities()))
+		for _, c := range cfg.Capabilities() {
+			names = append(names, c.Name)
+		}
+		fmt.Printf("configuration OK: %d enabled device(s), %d output(s), %d capabilities from %s (%s)\n",
+			len(cfg.DeviceSpecs()), len(cfg.Outputs), len(names), cfg.Global.ConfDir, strings.Join(names, ", "))
 		return 0
 	}
 
