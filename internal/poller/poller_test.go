@@ -678,6 +678,92 @@ devices: [{ id: sw, address: 127.0.0.1, port: %d, snmp: { version: "%s", communi
 	}
 }
 
+// ciscoMIB is the multi-CPU chassis of Cisco's document 15215: an RSP and
+// two line cards, each pointing to its ENTITY-MIB entry, plus a CPU without
+// entity (cpmCPUTotalPhysicalIndex 0). The deprecated columns are there too.
+func ciscoMIB() *testagent.MIB {
+	vals := sysMIB("rtr")
+	set := func(oid string, typ gosnmp.Asn1BER, v any) { vals[oid] = testagent.Value{Type: typ, Value: v} }
+	for idx, name := range map[string]string{"1": "Chassis", "9": "RSP at Slot 2", "25": "Line Card 4", "28": "Line Card 6"} {
+		set("1.3.6.1.2.1.47.1.1.1.1.7."+idx, gosnmp.OctetString, name)
+	}
+	const cpm = "1.3.6.1.4.1.9.9.109.1.1.1.1."
+	for _, row := range []struct {
+		idx                    string
+		phys, sec5, min1, min5 int
+	}{
+		{"1", 9, 12, 11, 10},
+		{"8", 25, 3, 2, 1},
+		{"9", 28, 4, 3, 2},
+		{"10", 0, 50, 40, 30},
+	} {
+		set(cpm+"2."+row.idx, gosnmp.Integer, row.phys)
+		for col, v := range map[string]int{"3": 99, "4": 99, "5": 99, "6": row.sec5, "7": row.min1, "8": row.min5} {
+			set(cpm+col+"."+row.idx, gosnmp.Gauge32, uint(v))
+		}
+	}
+	return testagent.NewMIB(vals)
+}
+
+// TestShippedCiscoCPU polls the shipped cisco-cpu capability: one row per
+// CPU, named by the entPhysicalName its cpmCPUTotalPhysicalIndex points to,
+// "Rev" objects only.
+func TestShippedCiscoCPU(t *testing.T) {
+	for _, version := range []string{"1", "2c"} {
+		t.Run("v"+version, func(t *testing.T) {
+			agent := testagent.Start(t, nil, ciscoMIB(), nil)
+			out := &capture{}
+			d, store := shippedDevice(t, fmt.Sprintf(`
+devices: [{ id: rtr, address: 127.0.0.1, port: %d, snmp: { version: "%s", community: %s } }]
+`, agent.Port, version, testagent.Community), out)
+			res, err := d.poll(context.Background(), store, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.missing != 0 {
+				t.Errorf("missing oids = %d, want 0", res.missing)
+			}
+			disc := loadDiscovery(t, store, "rtr")
+			if got := fmt.Sprint(disc.Capabilities); got != "[cisco-cpu interfaces system]" {
+				t.Errorf("capabilities = %s", got)
+			}
+			if got := fmt.Sprint(disc.Columns["cpuName"]); got != "map[1:RSP at Slot 2 8:Line Card 4 9:Line Card 6]" {
+				t.Errorf("cpuName = %s", got)
+			}
+			var cpus []string
+			for _, s := range out.batches[0].Samples {
+				if s.Table != "cpu" {
+					continue
+				}
+				if s.Unit != "percent" || s.Capability != "cisco-cpu" {
+					t.Errorf("sample = %+v", s)
+				}
+				cpus = append(cpus, fmt.Sprintf("%s.%s=%v(%s,%s)", s.Metric, s.Index, s.Value,
+					s.Labels["cpuName"], s.Labels["cpmCPUTotalPhysicalIndex"]))
+			}
+			slices.Sort(cpus)
+			want := []string{
+				"cpmCPUTotal1minRev.1=11(RSP at Slot 2,9)",
+				"cpmCPUTotal1minRev.10=40(,0)",
+				"cpmCPUTotal1minRev.8=2(Line Card 4,25)",
+				"cpmCPUTotal1minRev.9=3(Line Card 6,28)",
+				"cpmCPUTotal5minRev.1=10(RSP at Slot 2,9)",
+				"cpmCPUTotal5minRev.10=30(,0)",
+				"cpmCPUTotal5minRev.8=1(Line Card 4,25)",
+				"cpmCPUTotal5minRev.9=2(Line Card 6,28)",
+				"cpmCPUTotal5secRev.1=12(RSP at Slot 2,9)",
+				"cpmCPUTotal5secRev.10=50(,0)",
+				"cpmCPUTotal5secRev.8=3(Line Card 4,25)",
+				"cpmCPUTotal5secRev.9=4(Line Card 6,28)",
+			}
+			slices.Sort(want)
+			if !slices.Equal(cpus, want) {
+				t.Errorf("cpu samples =\n%s\nwant\n%s", strings.Join(cpus, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
 // TestFormulas covers formulas on walked tables, missing inputs, emit:
 // false and unit suffixes on rates, with custom capabilities.
 func TestFormulas(t *testing.T) {

@@ -1,0 +1,44 @@
+# Capability "cisco-cpu": CPU utilization of Cisco IOS devices, from
+# CISCO-PROCESS-MIB cpmCPUTotalTable (1.3.6.1.4.1.9.9.109.1.1.1), as
+# recommended by Cisco in "Collect CPU Utilization on Cisco IOS Devices with
+# SNMP" (document 15215).
+#
+# Applies to devices that have cpmCPUTotal5minRev (detected at discovery):
+# IOS 12.2(3.5) and later, and the other Cisco platforms that implement the
+# same table (IOS XE, NX-OS, ...). The "Rev" objects replace the
+# deprecated cpmCPUTotal5sec/1min/5min (columns 3 to 5), which are not
+# polled.
+#
+# One row per CPU: a device with several CPUs (route processors, line cards,
+# modules) has one row each, indexed by cpmCPUTotalIndex. Each row points to
+# its ENTITY-MIB entPhysicalTable entry (cpmCPUTotalPhysicalIndex), whose
+# entPhysicalName (e.g. "RSP at Slot 2", "Line Card 4") labels the row when
+# the device has ENTITY-MIB. A row with cpmCPUTotalPhysicalIndex 0 has no
+# entity, and no entPhysicalName label.
+#
+# Cisco suggests cpmCPUTotal5minRev for monitoring (90% as a starting
+# rising threshold, to adjust to the platform's baseline), and the shorter
+# averages to see brief peaks. Polling every second or so can itself load
+# the CPU of some devices.
+description: Cisco CISCO-PROCESS-MIB CPU utilization, per CPU
+
+detect:
+  - 1.3.6.1.4.1.9.9.109.1.1.1.1.8      # cpmCPUTotal5minRev
+
+discovery:
+  columns:
+    cpmCPUTotalPhysicalIndex: 1.3.6.1.4.1.9.9.109.1.1.1.1.2   # entPhysicalIndex, 0 = none
+    cpuName:                                                  # entPhysicalName of that entity
+      oid: 1.3.6.1.2.1.47.1.1.1.1.7
+      index: cpmCPUTotalPhysicalIndex
+
+tables:
+  # Walked on every poll: its rows are the CPUs.
+  - name: cpu
+    labels: [cpuName, cpmCPUTotalPhysicalIndex]
+    columns:
+      # Share of the time the CPU was busy over the last 5 seconds, 1 minute
+      # and 5 minutes (0 to 100).
+      - { name: cpmCPUTotal5secRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.6, unit: percent }
+      - { name: cpmCPUTotal1minRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.7, unit: percent }
+      - { name: cpmCPUTotal5minRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8, unit: percent }

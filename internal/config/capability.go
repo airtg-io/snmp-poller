@@ -36,10 +36,46 @@ type CapabilityFile struct {
 
 // Discovery lists slow-changing data collected on discovery runs.
 // Scalars maps a name to a scalar OID (e.g. sysDescr -> 1.3.6.1.2.1.1.1.0).
-// Columns maps a name to a table column OID that is walked (e.g. ifDescr).
+// Columns maps a name to a table column that is walked (e.g. ifDescr).
 type Discovery struct {
-	Scalars map[string]string `yaml:"scalars"`
-	Columns map[string]string `yaml:"columns"`
+	Scalars map[string]string          `yaml:"scalars"`
+	Columns map[string]DiscoveryColumn `yaml:"columns"`
+}
+
+// DiscoveryColumn is a table column walked on discovery. Written as a bare
+// OID, its rows are the column's own. With Index, it belongs to another
+// table: row r takes the value of OID at the index found in column Index
+// at row r (e.g. CISCO-PROCESS-MIB cpmCPUTotalPhysicalIndex pointing into
+// ENTITY-MIB entPhysicalTable, for entPhysicalName).
+type DiscoveryColumn struct {
+	OID   string `yaml:"oid"`
+	Index string `yaml:"index"`
+}
+
+// String is the OID, followed by the index column if any.
+func (c DiscoveryColumn) String() string {
+	if c.Index == "" {
+		return c.OID
+	}
+	return c.OID + " at index " + c.Index
+}
+
+// UnmarshalYAML accepts a bare OID or a mapping { oid, index }.
+func (c *DiscoveryColumn) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		return n.Decode(&c.OID)
+	}
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: a discovery column is an oid or { oid, index }", n.Line)
+	}
+	// Node.Decode does not inherit the decoder's KnownFields: check here.
+	for i := 0; i < len(n.Content); i += 2 {
+		if k := n.Content[i].Value; k != "oid" && k != "index" {
+			return fmt.Errorf("line %d: field %s not found in discovery column", n.Content[i].Line, k)
+		}
+	}
+	type plain DiscoveryColumn
+	return n.Decode((*plain)(c))
 }
 
 // Mode selects how a value is emitted.
@@ -272,8 +308,18 @@ func checkCapability(f CapabilityFile) error {
 		}
 	}
 	for _, k := range sortedKeys(f.Discovery.Columns) {
-		if !oidPattern.MatchString(f.Discovery.Columns[k]) {
-			add("discovery column %q: invalid oid %q", k, f.Discovery.Columns[k])
+		col := f.Discovery.Columns[k]
+		if !oidPattern.MatchString(col.OID) {
+			add("discovery column %q: invalid oid %q", k, col.OID)
+		}
+		if col.Index == "" {
+			continue
+		}
+		switch ref, ok := f.Discovery.Columns[col.Index]; {
+		case !ok:
+			add("discovery column %q: index %q is not a discovery column of this capability", k, col.Index)
+		case ref.Index != "":
+			add("discovery column %q: index %q has an index itself (one level only)", k, col.Index)
 		}
 	}
 	scalars := map[string]bool{}
@@ -409,7 +455,7 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 	c := &Capability{
 		Name:        name,
 		Description: f.Description,
-		Discovery:   Discovery{Scalars: map[string]string{}, Columns: map[string]string{}},
+		Discovery:   Discovery{Scalars: map[string]string{}, Columns: map[string]DiscoveryColumn{}},
 	}
 	for _, oid := range f.Detect {
 		c.Detect = append(c.Detect, normOID(oid))
@@ -418,7 +464,8 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 		c.Discovery.Scalars[k] = normOID(v)
 	}
 	for k, v := range f.Discovery.Columns {
-		c.Discovery.Columns[k] = normOID(v)
+		v.OID = normOID(v.OID)
+		c.Discovery.Columns[k] = v
 	}
 	for _, sc := range f.Scalars {
 		if sc.OID != "" {
@@ -463,7 +510,8 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 }
 
 // checkUnique rejects names that would collide on a device to which several
-// capabilities apply. A discovery entry may be shared if its OID is the same.
+// capabilities apply. A discovery entry may be shared if its OID (and index
+// column) is the same.
 func checkUnique(caps []*Capability) error {
 	var errs []error
 	owner := map[string]string{}
@@ -491,7 +539,7 @@ func checkUnique(caps []*Capability) error {
 			shareDisc("scalar", k, c.Discovery.Scalars[k], c.Name)
 		}
 		for _, k := range sortedKeys(c.Discovery.Columns) {
-			shareDisc("column", k, c.Discovery.Columns[k], c.Name)
+			shareDisc("column", k, c.Discovery.Columns[k].String(), c.Name)
 		}
 		for _, s := range c.Scalars {
 			claim("scalar", s.Name, c.Name)

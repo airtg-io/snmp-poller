@@ -13,7 +13,7 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
 - **Hot reload**: edited files are validated and applied without restart (or on `SIGHUP`);
   devices keep their discovery cycle, an invalid change is logged and ignored.
 - **Capabilities**: what to poll lives in `etc/capabilities.d/`, one file per capability (system
-  group, interfaces, host resources, inventory, ...). Discovery finds which capabilities each device has, and every one
+  group, interfaces, host resources, inventory, Cisco CPUs, ...). Discovery finds which capabilities each device has, and every one
   found is polled unless the device excludes it.
 - **Discovery** on the first poll and then every hour (configurable) for slow-changing data:
   sysDescr, sysName, sysLocation, model, interface names, ... cached **on disk**.
@@ -454,6 +454,7 @@ ignored. Shipped in `etc/capabilities.d`:
 | `interfaces` | every device | IF-MIB counters, status and speed of every interface, with 64-bit ifXTable counters on interfaces faster than 100 Mbit/s when available (v2c and v3). |
 | `entity` | `entPhysicalModelName` | Discovery: ENTITY-MIB name, model and serial number of every physical entity. |
 | `host-resources` | HOST-RESOURCES-MIB (`1.3.6.1.2.1.25`) | Number of processes, memory size, size, used and free bytes and used and free percentages of every storage (RAM, swap, file systems), load of every processor. See [below](#the-host-resources-capability). |
+| `cisco-cpu` | `cpmCPUTotal5minRev` | CISCO-PROCESS-MIB busy percentage of every CPU over 5 seconds, 1 minute and 5 minutes, named after its ENTITY-MIB entry. See [below](#the-cisco-cpu-capability). |
 
 Every device gets every capability discovery finds, except those listed in its `exclude`.
 Scalar and table names must be unique across all capabilities, since several of them apply
@@ -470,7 +471,7 @@ A table can only use discovery columns of its own capability as labels.
 | `description` | Free text. |
 | `detect` | Optional list of OID subtrees that must **all** exist on the agent (checked with one GETNEXT each, at discovery). Without `detect`, the capability applies to every device. |
 | `discovery.scalars` | Map of name to scalar OID, fetched on discovery (e.g. `sysName: 1.3.6.1.2.1.1.5.0`). Cached on disk and attached to every batch. |
-| `discovery.columns` | Map of name to table column OID, walked on discovery (e.g. `ifDescr: 1.3.6.1.2.1.2.2.1.2`). Used as table labels. |
+| `discovery.columns` | Map of name to table column OID, walked on discovery (e.g. `ifDescr: 1.3.6.1.2.1.2.2.1.2`). Used as table labels. A column of another table can be read through a column holding its index: `{ oid, index }` gives, at each row of the `index` discovery column (of the same capability, itself a plain OID), the value of `oid` at the index that row holds (e.g. `cpuName: { oid: 1.3.6.1.2.1.47.1.1.1.1.7, index: cpmCPUTotalPhysicalIndex }`, the entPhysicalName each CPU points to). Rows whose index is not found in `oid` have no value. |
 | `scalars` | Metrics polled every cycle, see below. |
 | `tables` | Tables polled every cycle, see below. |
 
@@ -589,21 +590,65 @@ tables:
       - { name: storageFreePercent, formula: "storageFree * 100 / storageSize", unit: percent }
 ```
 
+### The `cisco-cpu` capability
+
+CPU utilization of Cisco devices, as recommended by Cisco in
+[Collect CPU Utilization on Cisco IOS Devices with SNMP](https://www.cisco.com/c/en/us/support/docs/ip/simple-network-management-protocol-snmp/15215-collect-cpu-util-snmp.html):
+CISCO-PROCESS-MIB `cpmCPUTotalTable`, one row per CPU (route processor, line card, module),
+indexed by `cpmCPUTotalIndex`. Detected on devices that have `cpmCPUTotal5minRev` (IOS
+12.2(3.5) and later, and the other Cisco platforms that implement the table). The deprecated
+`cpmCPUTotal5sec`, `cpmCPUTotal1min` and `cpmCPUTotal5min` are not polled.
+
+| Metric | Table | Unit | From |
+|--------|-------|------|------|
+| `cpmCPUTotal5secRev` | `cpu` | percent | Share of the last 5 seconds the CPU was busy |
+| `cpmCPUTotal1minRev` | `cpu` | percent | Same, over the last minute |
+| `cpmCPUTotal5minRev` | `cpu` | percent | Same, over the last 5 minutes: the value Cisco suggests monitoring |
+
+Each row carries `cpmCPUTotalPhysicalIndex`, the ENTITY-MIB `entPhysicalIndex` of the CPU,
+and `cpuName`, the `entPhysicalName` of that entity (e.g. `RSP at Slot 2`, `Line Card 4`),
+read at discovery through the index (see `discovery.columns`). A CPU without entity
+(`cpmCPUTotalPhysicalIndex` 0), or a device without ENTITY-MIB, has no `cpuName`. Cisco gives
+90% of `cpmCPUTotal5minRev` as a starting alert threshold, to adjust to the platform's
+baseline, and warns that polling every second or so can load the CPU of some devices.
+
+```yaml
+# capabilities.d/cisco-cpu.yaml (excerpt)
+detect:
+  - 1.3.6.1.4.1.9.9.109.1.1.1.1.8      # cpmCPUTotal5minRev
+discovery:
+  columns:
+    cpmCPUTotalPhysicalIndex: 1.3.6.1.4.1.9.9.109.1.1.1.1.2
+    cpuName: { oid: 1.3.6.1.2.1.47.1.1.1.1.7, index: cpmCPUTotalPhysicalIndex }
+tables:
+  - name: cpu
+    labels: [cpuName, cpmCPUTotalPhysicalIndex]
+    columns:
+      - { name: cpmCPUTotal5minRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8, unit: percent }
+```
+
 ### Capability examples
 
 Each example is one file of `capabilities_dir` (the test suite validates each of them).
 
-A vendor capability, polled only on devices that have the Cisco CPU MIB:
+A vendor capability, polled only on devices that have the Cisco memory pool MIB, with rows
+named by pool:
 
 ```yaml
-# capabilities.d/cisco-cpu.yaml
-description: Cisco CPU load
+# capabilities.d/cisco-memory.yaml
+description: Cisco memory pools (CISCO-MEMORY-POOL-MIB)
 detect:
-  - 1.3.6.1.4.1.9.9.109.1.1.1.1.8      # cpmCPUTotal5minRev
+  - 1.3.6.1.4.1.9.9.48.1.1.1.5         # ciscoMemoryPoolUsed
+discovery:
+  columns:
+    ciscoMemoryPoolName: 1.3.6.1.4.1.9.9.48.1.1.1.2   # e.g. "Processor", "I/O"
 tables:
-  - name: cisco_cpu
+  - name: memory_pool
+    label: ciscoMemoryPoolName
     columns:
-      - { name: cpmCPUTotal5minRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8 }
+      - { name: ciscoMemoryPoolUsed, oid: 1.3.6.1.4.1.9.9.48.1.1.1.5, unit: bytes }
+      - { name: ciscoMemoryPoolFree, oid: 1.3.6.1.4.1.9.9.48.1.1.1.6, unit: bytes }
+      - { name: ciscoMemoryPoolUsedPercent, formula: "ciscoMemoryPoolUsed * 100 / (ciscoMemoryPoolUsed + ciscoMemoryPoolFree)", unit: percent }
 ```
 
 Raw, rate and volume:
@@ -837,7 +882,7 @@ devices:
 ```
 
 Save it as `etc/conf.d/devices.yaml` and run `./snmp-poller`: the device gets every capability
-of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory). After the first start, the file
+of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory, Cisco CPUs). After the first start, the file
 reads `community: ~~6A0F...E1~~` (see [Credentials encryption](#credentials-encryption)).
 
 ### Device ids
@@ -1411,7 +1456,7 @@ server; the sinks against fake destinations, their requests decoded with indepen
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
 | `etc/snmp-poller.yaml` | Default main configuration (no device). |
 | `etc/conf.d/` | Local configuration files (git-ignored), `devices.yaml.example` and `sinks.yaml.example`. |
-| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`). |
+| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`, `cisco-cpu`). |
 
 ### Versions and releases
 

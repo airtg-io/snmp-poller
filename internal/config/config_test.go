@@ -551,6 +551,18 @@ tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: 
 			`table "x" is defined by both "a" and "b"`},
 		{map[string]string{"a.yaml": `discovery: { scalars: { x: 1.3 } }`, "b.yaml": `discovery: { scalars: { x: 1.4 } }`},
 			`discovery scalar "x" has different oids`},
+		// Discovery columns read through an index column.
+		{map[string]string{"a.yaml": `discovery: { columns: { n: { oid: 1.3, index: p } } }`},
+			`discovery column "n": index "p" is not a discovery column of this capability`},
+		{map[string]string{"a.yaml": `discovery: { columns: { p: 1.2, q: { oid: 1.3, index: p }, n: { oid: 1.4, index: q } } }`},
+			`discovery column "n": index "q" has an index itself`},
+		{map[string]string{"a.yaml": `discovery: { columns: { n: { oid: x } } }`}, `discovery column "n": invalid oid "x"`},
+		{map[string]string{"a.yaml": `discovery: { columns: { n: { oid: 1.3, idx: p } } }`}, "field idx not found in discovery column"},
+		{map[string]string{"a.yaml": `discovery: { columns: { n: [1.3] } }`}, "a discovery column is an oid or { oid, index }"},
+		{map[string]string{
+			"a.yaml": `discovery: { columns: { p: 1.2, n: { oid: 1.3, index: p } } }`,
+			"b.yaml": `discovery: { columns: { n: 1.3 } }`,
+		}, `discovery column "n" has different oids in "a" (.1.3 at index p) and "b" (.1.3)`},
 	} {
 		_, err := parseWith(t, `devices: []`, tc.caps)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -563,6 +575,16 @@ tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: 
 		"b.yaml": `discovery: { columns: { ifName: .1.3.1 } }`,
 	}); err != nil {
 		t.Errorf("shared discovery column: %v", err)
+	}
+	c, err := parseWith(t, `devices: []`, map[string]string{
+		"a.yaml": `discovery: { columns: { p: 1.2, n: { oid: 1.3.1, index: p } } }`,
+		"b.yaml": `discovery: { columns: { p: 1.2, n: { index: p, oid: .1.3.1 } } }`,
+	})
+	if err != nil {
+		t.Fatalf("shared indexed discovery column: %v", err)
+	}
+	if got := c.Capabilities()[0].Discovery.Columns["n"]; got != (DiscoveryColumn{OID: ".1.3.1", Index: "p"}) {
+		t.Errorf("indexed discovery column = %+v", got)
 	}
 }
 

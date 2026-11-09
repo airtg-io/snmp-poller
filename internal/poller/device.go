@@ -234,15 +234,19 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 	// Every OID is fetched once, whatever the number of names using it.
 	scalars := map[string][]string{} // oid -> names
 	columns := map[string][]string{}
+	indexed := map[string]config.DiscoveryColumn{} // name -> column read through an index column
 	for _, cp := range active {
 		for name, oid := range cp.Discovery.Scalars {
 			if !slices.Contains(scalars[oid], name) {
 				scalars[oid] = append(scalars[oid], name)
 			}
 		}
-		for name, oid := range cp.Discovery.Columns {
-			if !slices.Contains(columns[oid], name) {
-				columns[oid] = append(columns[oid], name)
+		for name, col := range cp.Discovery.Columns {
+			if col.Index != "" {
+				indexed[name] = col
+			}
+			if !slices.Contains(columns[col.OID], name) {
+				columns[col.OID] = append(columns[col.OID], name)
 			}
 		}
 	}
@@ -289,7 +293,9 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 	}
 
-	// 3. Columns, walked.
+	// 3. Columns, walked. A column read through an index column takes, at
+	// each row of the index column, the value at the index it holds.
+	walked := map[string]map[string]string{} // oid -> index -> value
 	for _, root := range slices.Sorted(maps.Keys(columns)) {
 		vals := map[string]string{}
 		err := c.Walk(root, func(p gosnmp.SnmpPDU) error {
@@ -305,9 +311,21 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		if err != nil {
 			return nil, err
 		}
+		walked[root] = vals
 		for _, name := range columns[root] {
-			disc.Columns[name] = vals
+			if _, ok := indexed[name]; !ok {
+				disc.Columns[name] = vals
+			}
 		}
+	}
+	for name, col := range indexed {
+		vals := map[string]string{}
+		for idx, ref := range disc.Columns[col.Index] {
+			if v, ok := walked[col.OID][ref]; ok {
+				vals[idx] = v
+			}
+		}
+		disc.Columns[name] = vals
 	}
 
 	// 4. Row selection of labelled tables, fixed until the next discovery.

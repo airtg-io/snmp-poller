@@ -39,7 +39,11 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   the agent has it, else sysUpTime (sysUpTime is the agent's uptime, not the system's), and
   sysUpTime), `interfaces` (always), `entity` (detected), `host-resources` (detected:
   hrSystemProcesses, memorySize, hrStorageTable size/used/free in bytes + used/free percent,
-  hrProcessorLoad).
+  hrProcessorLoad), `cisco-cpu` (detected: CISCO-PROCESS-MIB cpmCPUTotal5sec/1min/5minRev per
+  CPU, per Cisco doc 15215; deprecated non-Rev objects not polled; rows named `cpuName` =
+  entPhysicalName via cpmCPUTotalPhysicalIndex). A discovery column is an OID or
+  `{oid, index}`: read at the index held by another (plain) discovery column of the same
+  capability, for cross-table names.
 - **Formulas, units, fallbacks**: a scalar is exactly one of `oid`, `oids` (candidates in
   preference order, the first the agent has is chosen at discovery, cached as `sources` in
   discovery.json) or `formula`; a column is `oid`/`hc_oid` or `formula`. Formulas (`+ - * /`,
