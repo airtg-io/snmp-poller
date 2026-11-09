@@ -1,0 +1,38 @@
+# Capability "juniper-cpu": CPU utilization of Juniper Junos devices, from
+# JUNIPER-MIB jnxOperatingTable (1.3.6.1.4.1.2636.3.1.13.1), the table behind
+# "show chassis routing-engine" and "show chassis fpc".
+#
+# Applies to devices that have jnxOperatingCPU (detected at discovery): MX,
+# EX, QFX, PTX, SRX, ACX, vMX, vSRX, ...
+#
+# jnxOperatingTable has one row per component of the chassis (Routing
+# Engines, FPCs, PICs, fans, power supplies, ...), indexed by
+# jnxOperatingContentsIndex.L1.L2.L3, and reports 0 for what a component
+# does not have: only the rows that have a CPU are polled, selected at
+# discovery by their jnxOperatingDescr ("Routing Engine 0", "FPC: MPC7E 3D
+# 40XGE @ 0/*/*", "FPC: EX4300-48T @ 1/*/*" for a Virtual Chassis member,
+# ...). A device can poll other rows with its own include (e.g. SRX SPCs).
+#
+# jnxOperatingCPU is the current utilization, on every Junos release. The
+# 1, 5 and 15 minute averages are recent JUNIPER-MIB objects: an older
+# agent does not return them (counted as missing OIDs, logged at debug),
+# and jnxOperatingCPU is still polled.
+description: Juniper JUNIPER-MIB CPU utilization of every Routing Engine and FPC
+
+detect:
+  - 1.3.6.1.4.1.2636.3.1.13.1.8        # jnxOperatingCPU
+
+discovery:
+  columns:
+    jnxOperatingDescr: 1.3.6.1.4.1.2636.3.1.13.1.5   # e.g. "Routing Engine 0"
+
+tables:
+  - name: juniper_cpu
+    label: jnxOperatingDescr
+    include: ["^Routing Engine", "^FPC"]
+    columns:
+      # Share of the time the CPU was busy (0 to 100).
+      - { name: jnxOperatingCPU,         oid: 1.3.6.1.4.1.2636.3.1.13.1.8,  unit: percent }
+      - { name: jnxOperating1MinAvgCPU,  oid: 1.3.6.1.4.1.2636.3.1.13.1.23, unit: percent }
+      - { name: jnxOperating5MinAvgCPU,  oid: 1.3.6.1.4.1.2636.3.1.13.1.24, unit: percent }
+      - { name: jnxOperating15MinAvgCPU, oid: 1.3.6.1.4.1.2636.3.1.13.1.25, unit: percent }

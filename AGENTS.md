@@ -45,7 +45,10 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   entPhysicalName via cpmCPUTotalPhysicalIndex), `cisco-enhanced-mempool` (detected,
   per pool and entity, 64-bit HC columns via `high_capacity` probe without `speed` = all rows)
   and its fallback `cisco-memory-pool` (CISCO-MEMORY-POOL-MIB, `replaced_by` the enhanced one:
-  never both). A discovery column is an OID, `{oid, index}` (read at the index held by another
+  never both), `juniper-cpu` / `juniper-memory` (detected: JUNIPER-MIB jnxOperatingTable,
+  rows labelled jnxOperatingDescr, `include` Routing Engine/FPC only (other rows report 0);
+  jnxOperatingCPU + 1/5/15MinAvgCPU (recent MIB, missing on old Junos); memory MiB and
+  Buffer percent -> jnxMemorySize/jnxMemoryUsed bytes, Heap percent). A discovery column is an OID, `{oid, index}` (read at the index held by another
   discovery column of the same capability, itself without `index`) or `{oid, index_part: n}`
   (rows of oid, value = n-th sub-id of the row index), for cross-table names.
 - **Formulas, units, fallbacks**: a scalar is exactly one of `oid`, `oids` (candidates in

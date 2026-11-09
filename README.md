@@ -13,7 +13,7 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
 - **Hot reload**: edited files are validated and applied without restart (or on `SIGHUP`);
   devices keep their discovery cycle, an invalid change is logged and ignored.
 - **Capabilities**: what to poll lives in `etc/capabilities.d/`, one file per capability (system
-  group, interfaces, host resources, inventory, Cisco CPUs and memory, ...). Discovery finds which capabilities each device has, and every one
+  group, interfaces, host resources, inventory, Cisco and Juniper CPUs and memory, ...). Discovery finds which capabilities each device has, and every one
   found is polled unless the device excludes it or a preferred capability replaces it.
 - **Discovery** on the first poll and then every hour (configurable) for slow-changing data:
   sysDescr, sysName, sysLocation, model, interface names, ... cached **on disk**.
@@ -457,6 +457,8 @@ ignored. Shipped in `etc/capabilities.d`:
 | `cisco-cpu` | `cpmCPUTotal5minRev` | CISCO-PROCESS-MIB busy percentage of every CPU over 5 seconds, 1 minute and 5 minutes, named after its ENTITY-MIB entry. See [below](#the-cisco-cpu-capability). |
 | `cisco-enhanced-mempool` | `cempMemPoolUsed` | CISCO-ENHANCED-MEMPOOL-MIB used, free and largest free bytes and used percentage of every memory pool of every card, 64-bit when available. See [below](#the-cisco-memory-capabilities). |
 | `cisco-memory-pool` | `ciscoMemoryPoolUsed`, unless `cisco-enhanced-mempool` applies | CISCO-MEMORY-POOL-MIB used, free and largest free bytes and used percentage of every memory pool, for older Cisco devices. See [below](#the-cisco-memory-capabilities). |
+| `juniper-cpu` | `jnxOperatingCPU` | JUNIPER-MIB busy percentage of every Routing Engine and FPC, current and over 1, 5 and 15 minutes. See [below](#the-juniper-capabilities). |
+| `juniper-memory` | `jnxOperatingMemory` | JUNIPER-MIB memory size, used bytes and used percentage, and heap used percentage, of every Routing Engine and FPC. See [below](#the-juniper-capabilities). |
 
 Every device gets every capability discovery finds, except those listed in its `exclude` and
 those replaced by a capability that applies to it (`replaced_by`).
@@ -695,6 +697,53 @@ tables:
       - { name: cempMemPoolUsed, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: bytes }
 ```
 
+### The Juniper capabilities
+
+CPU and memory of Junos devices (MX, EX, QFX, PTX, SRX, ACX, vMX, vSRX, ...), from
+JUNIPER-MIB `jnxOperatingTable`, the table behind `show chassis routing-engine` and
+`show chassis fpc`. `juniper-cpu` is detected on devices that have `jnxOperatingCPU`,
+`juniper-memory` on devices that have `jnxOperatingMemory`.
+
+| Metric | Table | Unit | From |
+|--------|-------|------|------|
+| `jnxOperatingCPU` | `juniper_cpu` | percent | Current share of the time the CPU is busy |
+| `jnxOperating1MinAvgCPU` | `juniper_cpu` | percent | Same, averaged over the last minute |
+| `jnxOperating5MinAvgCPU` | `juniper_cpu` | percent | Same, over the last 5 minutes |
+| `jnxOperating15MinAvgCPU` | `juniper_cpu` | percent | Same, over the last 15 minutes |
+| `jnxOperatingBuffer` | `juniper_memory` | percent | Share of the memory in use (the CLI's "Memory utilization") |
+| `jnxOperatingHeap` | `juniper_memory` | percent | Share of the heap in use (FPCs; 0 on Routing Engines) |
+| `jnxMemorySize` | `juniper_memory` | bytes | `jnxOperatingMemory * 1048576`: the agent reports MiB |
+| `jnxMemoryUsed` | `juniper_memory` | bytes | `jnxMemorySize * jnxOperatingBuffer / 100`, to 1% of the size: the agent reports a whole percentage |
+
+`jnxOperatingTable` has one row per component of the chassis (Routing Engines, FPCs, PICs,
+fans, power supplies, ...), indexed by `<jnxOperatingContentsIndex>.<L1>.<L2>.<L3>` (e.g.
+`9.1.0.0` for Routing Engine 0), and reports 0 for what a component does not have. Both
+tables are labelled by `jnxOperatingDescr` and poll only the rows it names `Routing Engine ...`
+or `FPC...` (`FPC: MPC7E 3D 40XGE @ 0/*/*`, one FPC per member of a Virtual Chassis, ...),
+selected at discovery. A device can select other rows with its own
+[`include`](#capabilities-per-device-exclude-and-row-filter), e.g.
+`include: { juniper_cpu: ["^Routing Engine", "^FPC", "^SPC"] }`. The 1, 5 and 15 minute
+averages are recent JUNIPER-MIB objects: an older Junos agent does not return them (debug
+logs count and list them), and `jnxOperatingCPU` is still polled.
+
+```yaml
+# capabilities.d/juniper-memory.yaml (excerpt)
+detect:
+  - 1.3.6.1.4.1.2636.3.1.13.1.15       # jnxOperatingMemory
+discovery:
+  columns:
+    jnxOperatingDescr: 1.3.6.1.4.1.2636.3.1.13.1.5
+tables:
+  - name: juniper_memory
+    label: jnxOperatingDescr
+    include: ["^Routing Engine", "^FPC"]
+    columns:
+      - { name: jnxOperatingMemory, oid: 1.3.6.1.4.1.2636.3.1.13.1.15, unit: MiB, emit: false }
+      - { name: jnxOperatingBuffer, oid: 1.3.6.1.4.1.2636.3.1.13.1.11, unit: percent }
+      - { name: jnxMemorySize, formula: "jnxOperatingMemory * 1048576", unit: bytes }
+      - { name: jnxMemoryUsed, formula: "jnxMemorySize * jnxOperatingBuffer / 100", unit: bytes }
+```
+
 ### Capability examples
 
 Each example is one file of `capabilities_dir` (the test suite validates each of them).
@@ -930,7 +979,7 @@ devices:
 ```
 
 Save it as `etc/conf.d/devices.yaml` and run `./snmp-poller`: the device gets every capability
-of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory, Cisco CPUs and memory). After the first start, the file
+of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory, Cisco and Juniper CPUs and memory). After the first start, the file
 reads `community: ~~6A0F...E1~~` (see [Credentials encryption](#credentials-encryption)).
 
 ### Device ids
@@ -1505,7 +1554,7 @@ server; the sinks against fake destinations, their requests decoded with indepen
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
 | `etc/snmp-poller.yaml` | Default main configuration (no device). |
 | `etc/conf.d/` | Local configuration files (git-ignored), `devices.yaml.example` and `sinks.yaml.example`. |
-| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`, `cisco-cpu`, `cisco-enhanced-mempool`, `cisco-memory-pool`). |
+| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`, `cisco-cpu`, `cisco-enhanced-mempool`, `cisco-memory-pool`, `juniper-cpu`, `juniper-memory`). |
 
 ### Versions and releases
 

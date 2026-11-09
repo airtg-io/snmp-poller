@@ -904,6 +904,120 @@ devices: [{ id: rtr, address: 127.0.0.1, port: %d, exclude: [%s], snmp: { versio
 	}
 }
 
+// junosMIB is the jnxOperatingTable of an MX: two Routing Engines (the
+// second one standby), an FPC, a PIC, a fan and a power supply, which
+// report 0 for what they do not have. recent adds the 1, 5 and 15 minute
+// CPU averages of the recent JUNIPER-MIB.
+func junosMIB(recent bool) *testagent.MIB {
+	vals := sysMIB("mx")
+	set := func(oid string, typ gosnmp.Asn1BER, v any) { vals[oid] = testagent.Value{Type: typ, Value: v} }
+	const jnx = "1.3.6.1.4.1.2636.3.1.13.1."
+	for _, row := range []struct {
+		idx, descr             string
+		cpu, mem, buffer, heap int
+	}{
+		{"2.1.0.0", "PEM 0", 0, 0, 0, 0},
+		{"4.1.1.0", "Top Tray Fan 1", 0, 0, 0, 0},
+		{"7.1.0.0", "FPC: MPC7E 3D 40XGE @ 0/*/*", 30, 2048, 15, 40},
+		{"8.1.1.0", "PIC: 20XGE SFPP @ 0/0/*", 0, 0, 0, 0},
+		{"9.1.0.0", "Routing Engine 0", 12, 16384, 25, 0},
+		{"9.2.0.0", "Routing Engine 1", 2, 16384, 10, 0},
+	} {
+		set(jnx+"5."+row.idx, gosnmp.OctetString, row.descr)
+		set(jnx+"8."+row.idx, gosnmp.Gauge32, uint(row.cpu))
+		set(jnx+"11."+row.idx, gosnmp.Gauge32, uint(row.buffer))
+		set(jnx+"12."+row.idx, gosnmp.Gauge32, uint(row.heap))
+		set(jnx+"15."+row.idx, gosnmp.Integer, row.mem)
+		if recent {
+			for col, v := range map[string]int{"23": row.cpu + 1, "24": row.cpu + 2, "25": row.cpu + 3} {
+				set(jnx+col+"."+row.idx, gosnmp.Gauge32, uint(v))
+			}
+		}
+	}
+	return testagent.NewMIB(vals)
+}
+
+// TestShippedJuniper polls the shipped juniper-cpu and juniper-memory
+// capabilities: Routing Engine and FPC rows only, memory in bytes, and
+// jnxOperatingCPU alone on agents without the CPU averages.
+func TestShippedJuniper(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		recent  bool
+		missing int
+	}{
+		{"recent", true, 0},
+		{"without averages", false, 9}, // 3 averages x 3 rows
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := testagent.Start(t, nil, junosMIB(tc.recent), nil)
+			out := &capture{}
+			d, store := shippedDevice(t, fmt.Sprintf(`
+devices: [{ id: mx, address: 127.0.0.1, port: %d, snmp: { version: "2c", community: %s } }]
+`, agent.Port, testagent.Community), out)
+			res, err := d.poll(context.Background(), store, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.missing != tc.missing {
+				t.Errorf("missing oids = %d, want %d", res.missing, tc.missing)
+			}
+			if got := fmt.Sprint(loadDiscovery(t, store, "mx").Capabilities); got != "[interfaces juniper-cpu juniper-memory system]" {
+				t.Errorf("capabilities = %s", got)
+			}
+			var got []string
+			for _, s := range out.batches[0].Samples {
+				if s.Table != "juniper_cpu" && s.Table != "juniper_memory" {
+					continue
+				}
+				want := "percent"
+				if strings.HasPrefix(s.Metric, "jnxMemory") {
+					want = "bytes"
+				}
+				if s.Unit != want {
+					t.Errorf("%s unit = %q, want %q", s.Metric, s.Unit, want)
+				}
+				got = append(got, fmt.Sprintf("%s.%s=%v (%s)", s.Metric, s.Index, s.Value, s.Labels["jnxOperatingDescr"]))
+			}
+			slices.Sort(got)
+			want := []string{
+				"jnxMemorySize.7.1.0.0=2147483648 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxMemorySize.9.1.0.0=17179869184 (Routing Engine 0)",
+				"jnxMemorySize.9.2.0.0=17179869184 (Routing Engine 1)",
+				"jnxMemoryUsed.7.1.0.0=3.221225472e+08 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxMemoryUsed.9.1.0.0=4.294967296e+09 (Routing Engine 0)",
+				"jnxMemoryUsed.9.2.0.0=1.7179869184e+09 (Routing Engine 1)",
+				"jnxOperatingBuffer.7.1.0.0=15 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxOperatingBuffer.9.1.0.0=25 (Routing Engine 0)",
+				"jnxOperatingBuffer.9.2.0.0=10 (Routing Engine 1)",
+				"jnxOperatingCPU.7.1.0.0=30 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxOperatingCPU.9.1.0.0=12 (Routing Engine 0)",
+				"jnxOperatingCPU.9.2.0.0=2 (Routing Engine 1)",
+				"jnxOperatingHeap.7.1.0.0=40 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxOperatingHeap.9.1.0.0=0 (Routing Engine 0)",
+				"jnxOperatingHeap.9.2.0.0=0 (Routing Engine 1)",
+			}
+			if tc.recent {
+				want = append(want,
+					"jnxOperating15MinAvgCPU.7.1.0.0=33 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+					"jnxOperating15MinAvgCPU.9.1.0.0=15 (Routing Engine 0)",
+					"jnxOperating15MinAvgCPU.9.2.0.0=5 (Routing Engine 1)",
+					"jnxOperating1MinAvgCPU.7.1.0.0=31 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+					"jnxOperating1MinAvgCPU.9.1.0.0=13 (Routing Engine 0)",
+					"jnxOperating1MinAvgCPU.9.2.0.0=3 (Routing Engine 1)",
+					"jnxOperating5MinAvgCPU.7.1.0.0=32 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+					"jnxOperating5MinAvgCPU.9.1.0.0=14 (Routing Engine 0)",
+					"jnxOperating5MinAvgCPU.9.2.0.0=4 (Routing Engine 1)",
+				)
+			}
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Errorf("juniper samples =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
 // TestFormulas covers formulas on walked tables, missing inputs, emit:
 // false and unit suffixes on rates, with custom capabilities.
 func TestFormulas(t *testing.T) {
