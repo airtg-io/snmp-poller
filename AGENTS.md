@@ -172,8 +172,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   skipped (another program's file), else a main file.
 - Sink tests decode requests with independent parsers (`protowire`, InfluxData's
   `line-protocol/v2`), test-only dependencies; poller tests inject fake sinks with
-  `WithSinkFactory`. Running downloaded Prometheus/InfluxDB/Grafana binaries needs the
-  user's permission (auto mode blocks it).
+  `WithSinkFactory`.
+- Real-backend E2E (user approved, auto mode blocks it otherwise): the dev box is **arm64**
+  and /tmp is a small tmpfs, so put the linux-arm64 releases of Prometheus (with
+  `--web.enable-remote-write-receiver`), InfluxDB 3 Core (`influxdb3 create token --admin`)
+  and Grafana under `~/.cache/snmp-poller-e2e`. Kill servers with `pgrep -f "[p]attern"`,
+  never a bare pattern (it matches the calling shell).
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
 
