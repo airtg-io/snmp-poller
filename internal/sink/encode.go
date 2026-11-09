@@ -17,13 +17,21 @@ import (
 // concatenated (both formats allow it), then finish makes the request
 // payload.
 type encoder interface {
-	// encode appends the samples of b the sink sends to buf and returns
-	// how many it encoded.
-	encode(buf []byte, b *Batch) ([]byte, int)
+	// encode appends the samples of b the sink sends to buf, and to units
+	// where each unit ends: a request body may be cut after any of them.
+	// It returns how many samples it encoded.
+	encode(buf []byte, b *Batch, units []unit) ([]byte, []unit, int)
 	// finish compresses a body made of encoded batches.
 	finish(body []byte) []byte
 	// kind identifies the format in the disk buffer.
 	kind() byte
+}
+
+// unit is the smallest piece of a body: a Prometheus TimeSeries (one
+// sample) or an InfluxDB line (the samples of a row).
+type unit struct {
+	end     int // offset in the buffer after the unit
+	samples int
 }
 
 // Record kinds of the disk buffer.
@@ -41,7 +49,7 @@ func (*promEncoder) kind() byte { return kindPrometheus }
 
 func (*promEncoder) finish(body []byte) []byte { return snappy.Encode(nil, body) }
 
-func (e *promEncoder) encode(buf []byte, b *Batch) ([]byte, int) {
+func (e *promEncoder) encode(buf []byte, b *Batch, units []unit) ([]byte, []unit, int) {
 	n := 0
 	var tv []tagValue
 	var ts []byte
@@ -74,9 +82,10 @@ func (e *promEncoder) encode(buf []byte, b *Batch) ([]byte, int) {
 		buf = append(buf, 0x0a)
 		buf = binary.AppendUvarint(buf, uint64(len(ts)))
 		buf = append(buf, ts...)
+		units = append(units, unit{end: len(buf), samples: 1})
 		n++
 	}
-	return buf, n
+	return buf, units, n
 }
 
 // appendLabel appends a TimeSeries.labels entry (field 1): a Label with
@@ -126,7 +135,7 @@ type influxLine struct {
 	time   int64
 }
 
-func (e *influxEncoder) encode(buf []byte, b *Batch) ([]byte, int) {
+func (e *influxEncoder) encode(buf []byte, b *Batch, units []unit) ([]byte, []unit, int) {
 	var lines []*influxLine
 	byKey := map[string]*influxLine{}
 	var tv []tagValue
@@ -183,8 +192,9 @@ func (e *influxEncoder) encode(buf []byte, b *Batch) ([]byte, int) {
 		buf = append(buf, ' ')
 		buf = strconv.AppendInt(buf, l.time, 10)
 		buf = append(buf, '\n')
+		units = append(units, unit{end: len(buf), samples: len(l.keys)})
 	}
-	return buf, n
+	return buf, units, n
 }
 
 func contains(list []string, s string) bool {

@@ -95,6 +95,12 @@ var (
 	retryMax = 30 * time.Second
 )
 
+// pendingUnit is a unit of the pending buffer, with when it was written.
+type pendingUnit struct {
+	unit
+	written time.Time
+}
+
 // Sink is one configured destination.
 type Sink struct {
 	cfg     config.Sink
@@ -105,9 +111,9 @@ type Sink struct {
 	fifo    *fifo
 
 	mu        sync.Mutex
-	pending   []byte // encoded samples not yet in a request
+	pending   []byte        // encoded samples not yet in a request
+	units     []pendingUnit // the units of pending, in order
 	nPending  int
-	first     time.Time // when the oldest pending sample was written
 	closed    bool
 	started   bool
 	inherited bool // the disk buffer comes from the sink this one replaces
@@ -194,10 +200,11 @@ func (s *Sink) ID() string { return s.cfg.ID }
 // Write encodes the samples of b this sink sends and queues them. It never
 // blocks on the destination.
 func (s *Sink) Write(b *Batch) {
-	buf, n := s.enc.encode(nil, b)
+	buf, units, n := s.enc.encode(nil, b, nil)
 	if n == 0 {
 		return
 	}
+	now := time.Now()
 	s.mu.Lock()
 	switch {
 	case s.closed:
@@ -210,10 +217,12 @@ func (s *Sink) Write(b *Batch) {
 		return
 	}
 	first := s.nPending == 0
-	if first {
-		s.first = time.Now()
-	}
+	base := len(s.pending)
 	s.pending = append(s.pending, buf...)
+	for _, u := range units {
+		u.end += base
+		s.units = append(s.units, pendingUnit{unit: u, written: now})
+	}
 	s.nPending += n
 	full := s.nPending >= s.cfg.BatchSize
 	s.mu.Unlock()
@@ -234,8 +243,10 @@ func (s *Sink) drop(n int, why string) {
 	}
 }
 
-// intake groups pending samples into requests: when batch_size samples are
-// pending, or flush_interval after the oldest one.
+// intake groups pending samples into requests of at most batch_size
+// samples (an InfluxDB line is never split: a line of more samples is a
+// request of its own): a request is cut when it is full, or flush_interval
+// after its oldest sample was written.
 func (s *Sink) intake() {
 	t := time.NewTimer(s.cfg.FlushInterval)
 	defer t.Stop()
@@ -248,20 +259,14 @@ func (s *Sink) intake() {
 			stopping = true
 		}
 		s.mu.Lock()
-		cut := s.nPending > 0 && (stopping || s.nPending >= s.cfg.BatchSize || time.Since(s.first) >= s.cfg.FlushInterval)
-		var body []byte
-		var n int
-		if cut {
-			body, n = s.pending, s.nPending
-			s.pending, s.nPending = nil, 0
-		}
+		reqs := s.cut(stopping)
 		wait := s.cfg.FlushInterval
-		if s.nPending > 0 {
-			wait = max(s.cfg.FlushInterval-time.Since(s.first), time.Millisecond)
+		if len(s.units) > 0 {
+			wait = max(s.cfg.FlushInterval-time.Since(s.units[0].written), time.Millisecond)
 		}
 		s.mu.Unlock()
-		if cut {
-			if dropped := s.fifo.push(record{kind: s.enc.kind(), samples: n, data: s.enc.finish(body)}); dropped > 0 {
+		for _, r := range reqs {
+			if dropped := s.fifo.push(record{kind: s.enc.kind(), samples: r.samples, data: s.enc.finish(r.body)}); dropped > 0 {
 				s.drop(dropped, "buffer full")
 			}
 		}
@@ -276,6 +281,51 @@ func (s *Sink) intake() {
 		}
 		t.Reset(wait)
 	}
+}
+
+type request struct {
+	body    []byte
+	samples int
+}
+
+// cut takes the requests to send off the pending buffer: every full one,
+// and the rest when all is true or its oldest sample is flush_interval old.
+// Called with s.mu held.
+func (s *Sink) cut(all bool) []request {
+	var reqs []request
+	i, start := 0, 0 // first unit and byte not taken
+	for i < len(s.units) {
+		j, n := i, 0
+		for j < len(s.units) && (j == i || n+s.units[j].samples <= s.cfg.BatchSize) {
+			n += s.units[j].samples
+			j++
+		}
+		full := j < len(s.units) || n >= s.cfg.BatchSize
+		if !full && !all && time.Since(s.units[i].written) < s.cfg.FlushInterval {
+			break
+		}
+		end := s.units[j-1].end
+		reqs = append(reqs, request{body: s.pending[start:end], samples: n})
+		s.nPending -= n
+		i, start = j, end
+	}
+	if i == 0 {
+		return nil
+	}
+	// The requests keep the old array: what is left moves to a new one, so
+	// that Write never appends over a request.
+	if i == len(s.units) {
+		s.pending, s.units = nil, nil
+		return reqs
+	}
+	s.pending = append([]byte(nil), s.pending[start:]...)
+	units := make([]pendingUnit, len(s.units)-i)
+	for k := range units {
+		units[k] = s.units[i+k]
+		units[k].end -= start
+	}
+	s.units = units
+	return reqs
 }
 
 // sender posts the head of the FIFO until the sink is closed.

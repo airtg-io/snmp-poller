@@ -115,8 +115,10 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   capability's tables, `Batch.Columns`); default `[device, index, labels]`. Validation:
   Prometheus label names, a Prometheus name emitted by two tables, an InfluxDB tag equal to a
   field of its measurement, `time` tag, credentials in URL. Delivery: `Write` encodes in the
-  poll worker and never blocks; per sink an intake goroutine cuts requests (`batch_size`,
-  `flush_interval`) and a sender posts them in order. FIFO = memory (32MB) + disk buffer
+  poll worker and never blocks; per sink an intake goroutine cuts requests of at most
+  `batch_size` samples (split between TimeSeries / InfluxDB lines only, encoders report unit
+  ends; a longer line goes alone), when full or `flush_interval` after their oldest sample,
+  and a sender posts them in order. FIFO = memory (32MB) + disk buffer
   `<data_dir>/sinks/<id>/` (`disk_buffer`, default 1GB, `0`/`null` = none): disk records are
   always older than memory ones; down or memory full = spill to disk; full = oldest segment
   dropped. Retry (1s doubling to 30s) on network/5xx/429/401/403/404/408, drop on other 4xx.

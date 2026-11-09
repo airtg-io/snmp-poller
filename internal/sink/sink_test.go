@@ -202,8 +202,8 @@ func fields(t testing.TB, b []byte, fn func(protowire.Number, protowire.Type, []
 func TestPrometheusEncoding(t *testing.T) {
 	cfg := sinkConfig(t, `id: p, type: prometheus, url: "http://p/w", tags: [device, { host: sysName }, ifType, labels, index]`)
 	enc := &promEncoder{sink: &cfg}
-	body, n := enc.encode(nil, testBatch(t0))
-	body, n2 := enc.encode(body, testBatch(t0.Add(time.Minute))) // batches concatenate
+	body, _, n := enc.encode(nil, testBatch(t0), nil)
+	body, _, n2 := enc.encode(body, testBatch(t0.Add(time.Minute)), nil) // batches concatenate
 	got := decodeProm(t, enc.finish(body))
 	if n != 6 || n2 != 6 || len(got) != 12 {
 		t.Fatalf("encoded %d+%d samples, decoded %d: %v", n, n2, len(got), got)
@@ -229,7 +229,7 @@ func TestPrometheusEncoding(t *testing.T) {
 	// Keys and prefix.
 	cfg = sinkConfig(t, `id: p, type: prometheus, url: "http://p/w", prefix: "", tags: [device], keys: { include: [ifInOctets], exclude: [_volume] }`)
 	enc = &promEncoder{sink: &cfg}
-	body, n = enc.encode(nil, testBatch(t0))
+	body, _, n = enc.encode(nil, testBatch(t0), nil)
 	got = decodeProm(t, enc.finish(body))
 	if n != 1 || got[0].String() != fmt.Sprintf("{__name__=ifInOctets_rate device=r1} 1250.5 @%d", ms) {
 		t.Errorf("filtered: %v", got)
@@ -298,7 +298,7 @@ func gunzip(t testing.TB, b []byte) []byte {
 func TestInfluxEncoding(t *testing.T) {
 	cfg := sinkConfig(t, `id: i, type: influxdb, url: "http://i", database: d, tags: [device, sysLocation, labels, index, { kind: ifType }]`)
 	enc := &influxEncoder{sink: &cfg}
-	body, n := enc.encode(nil, testBatch(t0))
+	body, _, n := enc.encode(nil, testBatch(t0), nil)
 	if n != 7 {
 		t.Errorf("encoded %d samples, want 7 (NaN left out)", n)
 	}
@@ -342,7 +342,7 @@ func TestInfluxEncoding(t *testing.T) {
 
 	cfg = sinkConfig(t, `id: i, type: influxdb, url: "http://i", database: d, prefix: "snmp_", tags: [], keys: { exclude: [Octets] }`)
 	enc = &influxEncoder{sink: &cfg}
-	body, _ = enc.encode(nil, testBatch(t0))
+	body, _, _ = enc.encode(nil, testBatch(t0), nil)
 	if s := string(body); !strings.HasPrefix(s, `snmp_system uptime=4200i,sysDescr=`) || strings.Contains(s, "Octets") || strings.Count(s, "\n") != 3 {
 		// Without tags, both interfaces rows share a series: one line.
 		t.Errorf("body:\n%s", s)
@@ -453,8 +453,16 @@ func TestSendInfluxDB(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, r.Header.Get(k), v)
 		}
 	}
-	if st := s.Stats(); st.Sent != 7 || st.Requests != 1 || st.Dropped != 0 || st.BacklogSamples != 0 {
-		t.Errorf("stats = %+v", st)
+	// The server counts samples before it answers: wait for the sender.
+	var total Stats // Stats returns counters since the previous call
+	waitFor(t, "the sender", func() bool {
+		st := s.Stats()
+		total.Sent, total.Requests, total.Dropped = total.Sent+st.Sent, total.Requests+st.Requests, total.Dropped+st.Dropped
+		total.BacklogSamples = st.BacklogSamples
+		return total.Sent == 7
+	})
+	if total.Requests != 1 || total.Dropped != 0 || total.BacklogSamples != 0 {
+		t.Errorf("stats = %+v", total)
 	}
 }
 
@@ -587,6 +595,72 @@ func TestDiskLimit(t *testing.T) {
 	if !found {
 		t.Error("the newest batch was dropped")
 	}
+}
+
+// TestBatchSize: a request holds at most batch_size samples, however many
+// are pending when it is cut, in order. An InfluxDB line is never split.
+func TestBatchSize(t *testing.T) {
+	t.Run("prometheus", func(t *testing.T) {
+		srv := newServer(t, promCount(t))
+		cfg := sinkConfig(t, `id: p, type: prometheus, url: "`+srv.URL+`", batch_size: 4, flush_interval: 1h`)
+		s := start(t, cfg, t.TempDir(), discard())
+		for i := range 11 { // 6 samples each
+			s.Write(testBatch(t0.Add(time.Duration(i) * time.Minute)))
+		}
+		// 16 full requests; the last 2 samples wait for flush_interval, here Close.
+		waitFor(t, "the full requests", func() bool { return srv.samples.Load() == 64 })
+		s.Close()
+		if got := srv.samples.Load(); got != 66 {
+			t.Errorf("%d samples sent, want 66", got)
+		}
+		var last int64
+		for i, b := range srv.bodies {
+			series := decodeProm(t, b)
+			if want := 4; i == len(srv.bodies)-1 {
+				if len(series) != 2 {
+					t.Errorf("last request: %d samples, want 2", len(series))
+				}
+			} else if len(series) != want {
+				t.Errorf("request %d: %d samples, want %d", i, len(series), want)
+			}
+			for _, sr := range series {
+				batch := sr.ts / time.Minute.Milliseconds() // samples of a batch are ms apart
+				if batch < last {
+					t.Errorf("request %d: sample of batch minute %d after %d: out of order", i, batch, last)
+				}
+				last = batch
+			}
+		}
+	})
+	t.Run("influxdb", func(t *testing.T) {
+		srv := newServer(t, influxCount(t))
+		cfg := sinkConfig(t, `id: i, type: influxdb, url: "`+srv.URL+`", database: d, batch_size: 2, flush_interval: 1h`)
+		s := start(t, cfg, t.TempDir(), discard())
+		for i := range 5 { // 7 samples each, in lines of 1 to 4 samples
+			s.Write(testBatch(t0.Add(time.Duration(i) * time.Minute)))
+		}
+		s.Close()
+		if got := srv.samples.Load(); got != 35 {
+			t.Errorf("%d samples sent, want 35", got)
+		}
+		long := 0
+		for i, b := range srv.bodies {
+			lines := decodeInflux(t, gunzip(t, b))
+			n := 0
+			for _, l := range lines {
+				n += len(l.fields)
+			}
+			switch {
+			case n > 2 && len(lines) == 1:
+				long++ // a line of more samples than batch_size: alone
+			case n > 2:
+				t.Errorf("request %d: %d samples in %d lines, want at most 2", i, n, len(lines))
+			}
+		}
+		if long == 0 {
+			t.Error("no line longer than batch_size: the test does not cover them")
+		}
+	})
 }
 
 // TestNoDiskBuffer: with disk_buffer 0, nothing is written to disk: data

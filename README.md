@@ -300,7 +300,7 @@ sinks:
 | `prefix` | `snmp_` (prometheus), none (influxdb) | Start of every metric name (prometheus) or measurement name (influxdb). |
 | `keys` | all | `include` and `exclude` lists of regular expressions on the [keys](#keys-and-tags): a key is sent when it matches an `include` pattern (or there is none) and no `exclude` pattern. |
 | `tags` | `[device, index, labels]` | Tags (labels) attached to every value, see [Keys and tags](#keys-and-tags). |
-| `batch_size` | `5000` | Values per request. |
+| `batch_size` | `5000` | Maximum values per request. An InfluxDB line (the values of one row) is never split: a line of more values is a request of its own. |
 | `flush_interval` | `1s` | The longest a value waits for its request to fill up. |
 | `disk_buffer` | `1GB` | Size limit of the [disk buffer](#delivery-and-disk-buffer) `<data_dir>/sinks/<id>/`, used while the destination is unreachable. `0` or `null`: no disk buffer. Units: `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000), `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024). |
 
@@ -888,7 +888,7 @@ ORDER BY time
 ### Delivery and disk buffer
 
 - **Parallel and non-blocking**: a poll hands its batch to each of its sinks and moves on. Each
-  sink groups values into requests (`batch_size` values, or what came in `flush_interval`) and
+  sink groups values into requests (at most `batch_size` values, sent when full or `flush_interval` after the oldest) and
   sends them from its own goroutine, one request at a time, in order. A slow or unreachable
   destination never delays polling or the other sinks.
 - **Unreachable destination** (connection error, timeout, HTTP 5xx, 429, 401, 403, 404): the
