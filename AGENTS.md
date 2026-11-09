@@ -1,6 +1,6 @@
-# AIrtg SNMP Poller - agent memory
+# AIrtg snmp-poller - agent memory
 
-Free and open source (GPLv3, see `LICENSE`) SNMP poller for AIrtg, written in Go.
+AIrtg snmp-poller: free and open source (GPLv3, see `LICENSE`) SNMP poller for AIrtg, written in Go.
 This file is the project's agent memory: every feature and hard requirement lives here.
 Keep it current when features are added or changed. User-facing docs live in `README.md`.
 

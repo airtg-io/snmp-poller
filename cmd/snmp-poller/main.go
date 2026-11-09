@@ -1,4 +1,4 @@
-// Command snmp-poller is the AIrtg SNMP poller.
+// Command snmp-poller is AIrtg snmp-poller, the SNMP poller of AIrtg.
 package main
 
 import (
@@ -37,7 +37,7 @@ func run() int {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("snmp-poller %s (commit %s)\n", version, commit)
+		fmt.Printf("AIrtg snmp-poller %s (commit %s)\n", version, commit)
 		return 0
 	}
 

@@ -1,4 +1,4 @@
-# AIrtg SNMP Poller - builds.
+# AIrtg snmp-poller - builds.
 #
 #   make              vet, format check and tests, then cross-build every
 #                     platform into dist/ (same as `make all`)

@@ -1,6 +1,6 @@
-# AIrtg SNMP Poller
+# AIrtg snmp-poller
 
-A fast, free and open source SNMP poller for AIrtg, written in Go.
+AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written in Go.
 
 - SNMP **v1**, **v2c** and **v3** (noAuthNoPriv, authNoPriv, authPriv; MD5, SHA, SHA-224, SHA-256,
   SHA-384, SHA-512; DES, AES-128, AES-192, AES-256 in both Blumenthal and Reeder/Cisco variants),
@@ -998,12 +998,12 @@ credentials and the scheduler. The Vault client is tested against a fake Vault H
 
 The version is in the `VERSION` file (`MAJOR.MINOR` or `MAJOR.MINOR.PATCH`, currently `0.1`).
 `snmp-poller -version` prints it with the git commit it was built from:
-`snmp-poller 0.1 (commit 10d59ad)`.
+`AIrtg snmp-poller 0.1 (commit 10d59ad)`.
 
 GitHub Actions (`.github/workflows/go.yml`) runs on every push to `main` and every pull
 request: `make check`, then `make package`, with the archives kept as a build artifact. On a
 push to `main`, if no tag `v<VERSION>` exists yet, it also creates that tag on the pushed commit
-and a GitHub release named `snmp-poller v<VERSION>`, with release notes generated from the
+and a GitHub release named `AIrtg snmp-poller v<VERSION>`, with release notes generated from the
 commits and pull requests since the previous release, and these files:
 
 | File | Content |

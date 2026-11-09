@@ -96,5 +96,5 @@ jobs:
         gh release create "$TAG" dist/* \
           --repo "$GITHUB_REPOSITORY" \
           --target "$GITHUB_SHA" \
-          --title "snmp-poller $TAG" \
+          --title "AIrtg snmp-poller $TAG" \
           --generate-notes

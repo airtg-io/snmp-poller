@@ -32,7 +32,7 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# snmp-poller runtime files
+# AIrtg snmp-poller runtime files
 /snmp-poller
 /snmp-poller.exe
 /dist/
