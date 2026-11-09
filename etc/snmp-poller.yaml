@@ -4,10 +4,12 @@
 #
 # The configuration can be split: every *.yaml and *.yml file of
 # global.include_dir (etc/conf.d) is read after this file, in name order,
-# with the same format. Devices and outputs of all files are combined;
+# with the same format. Devices and sinks of all files are combined;
 # logging and vault may be defined in one file only; global only here.
-# No device is configured by default: add yours in a file of etc/conf.d
-# (see etc/conf.d/devices.yaml.example).
+# No device and no sink are configured by default: add yours in files of
+# etc/conf.d (see etc/conf.d/devices.yaml.example and
+# etc/conf.d/sinks.yaml.example). Without a sink, polled data is sent
+# nowhere.
 
 global:
   threads: 250                 # concurrent polls (worker pool size)
@@ -20,7 +22,7 @@ global:
   port: 161
   transport: udp               # default for devices: udp or tcp
   walk: bulk                   # default for devices: bulk (GETBULK) or getnext; SNMPv1 always uses getnext
-  data_dir: data               # on-disk state for rate/volume; wiped on startup
+  data_dir: data               # device state (wiped on startup), credentials key, sink disk buffers
   include_dir: conf.d          # more configuration files (relative to this file)
   capabilities_dir: capabilities.d  # SNMP capabilities, one file each (relative to this file)
   stats_interval: 1m           # periodic summary log line
@@ -39,7 +41,3 @@ logging:
     max_backups: 10            # rotated files to keep (0 = all)
     max_age_days: 30           # delete rotated files older than this (0 = never)
     compress: true             # gzip rotated files
-
-outputs:
-  - name: blackhole
-    type: "null"               # discards everything (the only output type for now)

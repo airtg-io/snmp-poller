@@ -15,7 +15,7 @@ import (
 	"github.com/gosnmp/gosnmp"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
-	"github.com/airtg-io/snmp-poller/internal/output"
+	"github.com/airtg-io/snmp-poller/internal/sink"
 	"github.com/airtg-io/snmp-poller/internal/snmp"
 	"github.com/airtg-io/snmp-poller/internal/state"
 )
@@ -50,10 +50,10 @@ type TableDiscovery struct {
 // touched by the worker currently polling it (the scheduler guarantees at
 // most one poll per device at a time). Discovery data lives on disk.
 type device struct {
-	spec    config.DeviceSpec
-	log     *slog.Logger
-	outputs []output.Output
-	vault   secretReader // set when spec.VaultPath is
+	spec  config.DeviceSpec
+	log   *slog.Logger
+	sinks []Sink
+	vault secretReader // set when spec.VaultPath is
 
 	discoveredAt time.Time // zero until the first successful discovery
 	failing      bool
@@ -70,13 +70,13 @@ type device struct {
 	removed bool          // no longer in the configuration
 	latest  *deviceConf   // last configuration applied or pending
 	pending *deviceConf   // configuration to apply when the poll ends
-	waiters []*retirement // retired outputs waiting for this poll to end
+	waiters []*retirement // retired sinks waiting for this poll to end
 }
 
 // applyConf sets the device's configuration. Only called while the device
 // is not being polled.
 func (d *device) applyConf(dc *deviceConf) {
-	d.spec, d.log, d.outputs, d.vault = dc.spec, dc.log, dc.outputs, dc.vault
+	d.spec, d.log, d.sinks, d.vault = dc.spec, dc.log, dc.sinks, dc.vault
 	if dc.rediscover {
 		d.discoveredAt = time.Time{}
 	}
@@ -96,7 +96,6 @@ type pollResult struct {
 	discoveryErr bool
 	samples      int
 	missing      int
-	outputErrs   int
 }
 
 // poll runs one cycle on the device: discovery when due, then the metrics.
@@ -126,11 +125,8 @@ func (d *device) poll(ctx context.Context, store *state.Store, now func() time.T
 	}
 	res.missing = missing
 	res.samples = len(batch.Samples)
-	for i, o := range d.outputs {
-		if err := o.Write(ctx, batch); err != nil {
-			res.outputErrs++
-			d.log.Warn("output write failed", "output", d.spec.Outputs[i], "err", err)
-		}
+	for _, s := range d.sinks {
+		s.Write(batch)
 	}
 	return res, nil
 }
@@ -393,16 +389,17 @@ func (d *device) active(disc *Discovery) []*config.Capability {
 // collect polls every metric of the device's capabilities. missing counts
 // requested OIDs the agent did not return (wrong OID, row gone, unsupported
 // MIB).
-func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, now func() time.Time) (batch *output.Batch, missing int, err error) {
+func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, now func() time.Time) (batch *sink.Batch, missing int, err error) {
 	st, err := store.Load(d.spec.ID)
 	if err != nil {
 		d.log.Warn("state reset", "err", err)
 	}
-	batch = &output.Batch{
+	batch = &sink.Batch{
 		DeviceID:     d.spec.ID,
 		Address:      d.spec.Address,
 		Capabilities: disc.Capabilities,
 		Discovery:    disc.Scalars,
+		Columns:      disc.Columns,
 	}
 	em := emitter{batch: batch, state: st, log: d.log, deltas: map[string]delta{}}
 	caps := d.active(disc)
@@ -456,7 +453,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 					if base == "" {
 						continue // formula, or hc_oid only on a row that is not high-capacity
 					}
-					add(base+"."+idx, target{table: t, column: col, index: idx})
+					add(base+"."+idx, target{cap: cp, table: t, column: col, index: idx})
 				}
 			}
 		}
@@ -490,13 +487,13 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 			if tg.scalar != nil {
 				fv.scalar(tg.cap, tg.scalar.Name, v)
 				if tg.scalar.Emitted() {
-					em.emit(p.Name, tg.scalar.Name, "", "", nil, tg.scalar.Modes, tg.scalar.Unit, v, ts)
+					em.emit(p.Name, tg.cap.Name, tg.scalar.Name, "", "", nil, tg.scalar.Modes, tg.scalar.Unit, v, ts)
 				}
 				continue
 			}
 			fv.column(tg.table, tg.index, tg.column.Name, v, ts)
 			if tg.column.Emitted() {
-				em.emit(p.Name, tg.column.Name, tg.table.Name, tg.index, labels(tg.table, tg.index, disc),
+				em.emit(p.Name, tg.cap.Name, tg.column.Name, tg.table.Name, tg.index, labels(tg.table, tg.index, disc),
 					tg.column.Modes, tg.column.Unit, v, ts)
 			}
 		}
@@ -505,6 +502,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 	// Unlabelled tables: walk each column once, filter on the index of each
 	// table using it.
 	type walked struct {
+		cap    *config.Capability
 		table  *config.TableSpec
 		column *config.Column
 	}
@@ -518,7 +516,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 			for j := range t.Columns {
 				col := &t.Columns[j]
 				if col.OID != "" { // not a formula
-					walks[col.OID] = append(walks[col.OID], walked{table: t, column: col})
+					walks[col.OID] = append(walks[col.OID], walked{cap: cp, table: t, column: col})
 				}
 			}
 		}
@@ -540,7 +538,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 				}
 				fv.column(w.table, idx, w.column.Name, v, ts)
 				if w.column.Emitted() {
-					em.emit(p.Name, w.column.Name, w.table.Name, idx, labels(w.table, idx, disc),
+					em.emit(p.Name, w.cap.Name, w.column.Name, w.table.Name, idx, labels(w.table, idx, disc),
 						w.column.Modes, w.column.Unit, v, ts)
 				}
 			}
@@ -556,7 +554,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 		if env := fv.scalars[cp]; env != nil {
 			for i := range cp.Scalars {
 				if sc := &cp.Scalars[i]; sc.Expr != nil {
-					em.compute(env, sc.Expr, sc.Name, "", "", nil, sc.Unit, sc.Emitted(), ts)
+					em.compute(env, sc.Expr, cp.Name, sc.Name, "", "", nil, sc.Unit, sc.Emitted(), ts)
 				}
 			}
 		}
@@ -567,7 +565,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 				r := rows[idx]
 				for j := range t.Columns {
 					if col := &t.Columns[j]; col.Expr != nil {
-						em.compute(r.vals, col.Expr, col.Name, t.Name, idx, labels(t, idx, disc), col.Unit, col.Emitted(), r.time)
+						em.compute(r.vals, col.Expr, cp.Name, col.Name, t.Name, idx, labels(t, idx, disc), col.Unit, col.Emitted(), r.time)
 					}
 				}
 			}
@@ -671,7 +669,7 @@ func labels(t *config.TableSpec, idx string, disc *Discovery) map[string]string 
 }
 
 type emitter struct {
-	batch *output.Batch
+	batch *sink.Batch
 	state *state.Device
 	log   *slog.Logger
 	// deltas caches this poll's delta of every OID: previous values are
@@ -686,10 +684,10 @@ type delta struct {
 
 // emit adds the samples of one value read from oid: one per mode. Rate and
 // volume come from the same delta.
-func (e *emitter) emit(oid, metric, table, idx string, labels map[string]string,
+func (e *emitter) emit(oid, capability, metric, table, idx string, labels map[string]string,
 	modes []config.Mode, unit string, v snmp.Value, ts time.Time,
 ) {
-	sample := output.Sample{Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Unit: unit, Time: ts}
+	sample := sink.Sample{Capability: capability, Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Unit: unit, Time: ts}
 	needDelta := false
 	for _, m := range modes {
 		if m == config.ModeRaw {
@@ -737,7 +735,7 @@ func (e *emitter) emit(oid, metric, table, idx string, labels map[string]string,
 // compute evaluates a formula over env, the values of its scalars or row,
 // and stores the result in env for the formulas below it. A formula whose
 // inputs are missing, or that divides by zero, gives no sample.
-func (e *emitter) compute(env map[string]*big.Rat, f *config.Formula, metric, table, idx string,
+func (e *emitter) compute(env map[string]*big.Rat, f *config.Formula, capability, metric, table, idx string,
 	labels map[string]string, unit string, emitted bool, ts time.Time,
 ) {
 	r, err := f.Eval(func(name string) (*big.Rat, bool) { v, ok := env[name]; return v, ok })
@@ -749,9 +747,9 @@ func (e *emitter) compute(env map[string]*big.Rat, f *config.Formula, metric, ta
 	if !emitted {
 		return
 	}
-	e.batch.Samples = append(e.batch.Samples, output.Sample{
-		Metric: metric, Table: table, Index: idx, Labels: labels, Mode: config.ModeRaw,
-		Type: output.TypeFormula, Unit: unit, Value: f.Value(r), Time: ts,
+	e.batch.Samples = append(e.batch.Samples, sink.Sample{
+		Capability: capability, Metric: metric, Table: table, Index: idx, Labels: labels, Mode: config.ModeRaw,
+		Type: sink.TypeFormula, Unit: unit, Value: f.Value(r), Time: ts,
 	})
 }
 

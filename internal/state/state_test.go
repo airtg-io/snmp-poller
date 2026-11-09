@@ -84,12 +84,19 @@ func TestSaveDropsUnseenKeysAndResets(t *testing.T) {
 
 	store.SaveDiscovery("other", map[string]string{"x": "y"})
 	os.WriteFile(filepath.Join(dir, "key.dat"), []byte("k"), 0o600)
+	buffer := filepath.Join(dir, "sinks", "influx", "00000000000000000001.seg")
+	os.MkdirAll(filepath.Dir(buffer), 0o755)
+	os.WriteFile(buffer, []byte("data"), 0o644)
 	if err := store.Clean(); err != nil {
 		t.Fatal(err)
 	}
-	// Device directories go, files (the credentials key) stay.
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 || entries[0].Name() != "key.dat" {
-		t.Errorf("Clean left %v, want key.dat only", entries)
+	// Device directories go, files (the credentials key) and the disk
+	// buffers of the sinks stay.
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 || entries[0].Name() != "key.dat" || entries[1].Name() != "sinks" {
+		t.Errorf("Clean left %v, want key.dat and sinks", entries)
+	}
+	if _, err := os.Stat(buffer); err != nil {
+		t.Errorf("disk buffer removed: %v", err)
 	}
 }
 

@@ -24,7 +24,7 @@ const DefaultPath = "etc/snmp-poller.yaml"
 type Config struct {
 	Global  Global   `yaml:"global"`
 	Logging Logging  `yaml:"logging"`
-	Outputs []Output `yaml:"outputs"`
+	Sinks   []Sink   `yaml:"sinks"`
 	Vault   *Vault   `yaml:"vault"`
 	Devices []Device `yaml:"devices"`
 
@@ -98,17 +98,6 @@ type FileLog struct {
 	Compress   *bool  `yaml:"compress"`
 }
 
-// Output declares one destination for polled samples.
-// Type-specific settings are kept in Options.
-type Output struct {
-	Name    string         `yaml:"name"`
-	Type    string         `yaml:"type"`
-	Options map[string]any `yaml:",inline"`
-
-	file  string
-	index int
-}
-
 // SNMP is a device's `snmp:` block: version and credentials. v1/v2c use a
 // community, v3 a username, a security level and the auth/priv protocols
 // and passwords. Credentials may instead (or also) come from Vault.
@@ -148,7 +137,7 @@ type Device struct {
 	Retries           *int                `yaml:"retries"`
 	MaxOIDsPerRequest int                 `yaml:"max_oids_per_request"`
 	MaxRepetitions    uint32              `yaml:"max_repetitions"`
-	Outputs           []string            `yaml:"outputs"`
+	Sinks             []string            `yaml:"sinks"`
 	Trace             bool                `yaml:"trace"`
 
 	file  string // file defining the device ("" = main document)
@@ -243,11 +232,12 @@ func decodeFile(data []byte, path string, main bool) (*configFile, error) {
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, inFile(path, err)
 	}
-	top := map[string]*yaml.Node{} // top-level key -> its key node
+	top := map[string]*yaml.Node{}  // top-level key -> its key node
+	vals := map[string]*yaml.Node{} // top-level key -> its value node
 	if len(root.Content) == 1 && root.Content[0].Kind == yaml.MappingNode {
 		m := root.Content[0].Content
 		for i := 0; i+1 < len(m); i += 2 {
-			top[m[i].Value] = m[i]
+			top[m[i].Value], vals[m[i].Value] = m[i], m[i+1]
 			if m[i].Value == "global" && main {
 				g := m[i+1].Content
 				for j := 0; j+1 < len(g); j += 2 {
@@ -255,6 +245,18 @@ func decodeFile(data []byte, path string, main bool) (*configFile, error) {
 						return nil, inFile(path, fmt.Errorf("line %d: global.conf_dir was renamed global.capabilities_dir "+
 							"(conf.d now holds configuration files, capabilities moved to capabilities.d)", g[j].Line))
 					}
+				}
+			}
+		}
+	}
+	if k := top["outputs"]; k != nil {
+		return nil, inFile(path, fmt.Errorf("line %d: outputs were replaced by sinks (prometheus, influxdb), see README.md", k.Line))
+	}
+	if d := vals["devices"]; d != nil && d.Kind == yaml.SequenceNode {
+		for _, dev := range d.Content {
+			for j := 0; dev.Kind == yaml.MappingNode && j+1 < len(dev.Content); j += 2 {
+				if k := dev.Content[j]; k.Value == "outputs" {
+					return nil, inFile(path, fmt.Errorf("line %d: a device's outputs were replaced by sinks (sink ids)", k.Line))
 				}
 			}
 		}
@@ -276,10 +278,26 @@ func decodeFile(data []byte, path string, main bool) (*configFile, error) {
 	for i := range doc.Devices {
 		doc.Devices[i].file, doc.Devices[i].index = path, i
 	}
-	for i := range doc.Outputs {
-		doc.Outputs[i].file, doc.Outputs[i].index = path, i
+	for i := range doc.Sinks {
+		doc.Sinks[i].file, doc.Sinks[i].index = path, i
 	}
+	markNullBuffers(vals["sinks"], doc.Sinks)
 	return &configFile{path: path, source: data, doc: doc}, nil
+}
+
+// markNullBuffers records `disk_buffer: null` (no disk buffer), which yaml
+// does not tell apart from an absent key (the default size).
+func markNullBuffers(n *yaml.Node, sinks []Sink) {
+	if n == nil || n.Kind != yaml.SequenceNode || len(n.Content) != len(sinks) {
+		return
+	}
+	for i, e := range n.Content {
+		for j := 0; e.Kind == yaml.MappingNode && j+1 < len(e.Content); j += 2 {
+			if e.Content[j].Value == "disk_buffer" && e.Content[j+1].ShortTag() == "!!null" {
+				sinks[i].DiskBuffer = ByteSize{Set: true}
+			}
+		}
+	}
 }
 
 // readIncludeDir decodes every *.yaml and *.yml file of dir, in name order.
@@ -322,7 +340,7 @@ func isYAMLFile(e fs.DirEntry) bool {
 	return !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && (ext == ".yaml" || ext == ".yml")
 }
 
-// merge combines the configuration files: outputs and devices are
+// merge combines the configuration files: sinks and devices are
 // concatenated in file order; logging and vault may each be defined by
 // one file only.
 func merge(files []*configFile) (*Config, error) {
@@ -345,7 +363,7 @@ func merge(files []*configFile) (*Config, error) {
 				cfg.Vault, cfg.vaultFile = d.Vault, f.path
 			}
 		}
-		cfg.Outputs = append(cfg.Outputs, d.Outputs...)
+		cfg.Sinks = append(cfg.Sinks, d.Sinks...)
 		cfg.Devices = append(cfg.Devices, d.Devices...)
 	}
 	return cfg, errors.Join(errs...)
@@ -451,7 +469,7 @@ func (c *Config) applyDefaults() {
 		c.Vault.applyDefaults()
 	}
 
-	if len(c.Outputs) == 0 {
-		c.Outputs = []Output{{Name: "null", Type: "null"}}
+	for i := range c.Sinks {
+		c.Sinks[i].applyDefaults()
 	}
 }

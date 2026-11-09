@@ -21,7 +21,11 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
   than 100 Mbit/s, and ifTable counters otherwise.
 - **Raw values, rates and volumes.** Previous values are kept **on disk**, not in memory.
 - **Row-based table polling** with inclusive regex filters on a discovered label (e.g. `ifDescr`).
-- **Pluggable outputs** with multiple destinations. Only `null` exists for now.
+- **Sinks**: **Prometheus remote write** (Prometheus, Mimir, VictoriaMetrics, Thanos, ...) and
+  **InfluxDB 3**, any number of each, ready for Grafana. Each sink chooses the keys it sends
+  and the tags attached to them from the discovery cache (sysName, ifName, ifAlias, ...).
+  Sinks send in parallel and never delay polling; an unreachable destination's data waits in a
+  **disk buffer** (1GB by default) and is sent in order once it is back. No sink, no data sent.
 - **Bounded worker pool** (250 threads by default) with overrun protection.
 - **Useful logs**: one stats line per minute, failures logged once per device, per-device tracing,
   console + auto-rotated file. **Credentials are never logged.**
@@ -34,6 +38,7 @@ Licensed under the GNU GPL v3 (see [LICENSE](LICENSE)).
 - [How it works](#how-it-works)
 - [Configuration reference](#configuration-reference)
 - [Capabilities](#capabilities)
+- [Sinks](#sinks)
 - [Examples](#examples)
 - [Logs](#logs)
 - [Data directory](#data-directory)
@@ -46,6 +51,7 @@ Requires Go 1.27 or later.
 ```sh
 make build                               # or: go build -o snmp-poller ./cmd/snmp-poller
 cp etc/conf.d/devices.yaml.example etc/conf.d/devices.yaml   # then edit: your devices
+cp etc/conf.d/sinks.yaml.example etc/conf.d/sinks.yaml       # then edit: where data goes
 ./snmp-poller -check                     # validate the configuration and the capabilities, and exit
 ./snmp-poller                            # run with etc/snmp-poller.yaml and etc/conf.d/*.yaml
 ./snmp-poller -config /path/to/file.yaml # run with another file
@@ -62,8 +68,10 @@ static binaries with no dependency: copy one with the `etc/` directory and run i
 Stop with `Ctrl-C` or `SIGTERM`: in-flight polls get `global.shutdown_timeout` to finish.
 Configuration changes apply without restart: see [Reloading](#reloading-the-configuration).
 
-The shipped configuration polls nothing: add devices in a file of `etc/conf.d` (see
-[Configuration files](#configuration-files)). Without any, the poller runs idle and logs a warning.
+The shipped configuration polls nothing and sends nothing: add devices and [sinks](#sinks) in
+files of `etc/conf.d` (see [Configuration files](#configuration-files)). Without devices, the
+poller runs idle; without sinks, it polls but sends the data nowhere. It logs a warning for
+each.
 
 Relative paths (`data_dir`, log file) are relative to the working directory, except
 `include_dir` and `capabilities_dir`, which are relative to the directory of the main
@@ -119,8 +127,9 @@ Each poll:
    value, so it emits only `raw`. Counter32 wraps are handled. A Counter64 that goes
    backwards is treated as a reset (no sample). Gauges and integers may give negative deltas.
    Rate/volume on non-numeric values (strings) are ignored.
-4. **Output**: the batch (device id, address, capabilities, discovery scalars, samples) is
-   handed to every output of the device.
+4. **Sinks**: the batch (device id, address, discovery scalars and columns, samples) is handed
+   to every [sink](#sinks) of the device. Each sink picks its keys and tags, encodes the batch
+   and returns at once: sending happens in the background, sink by sink.
 
 ## Configuration reference
 
@@ -129,7 +138,7 @@ The configuration is YAML, in three places:
 | Path | Holds |
 |------|-------|
 | `etc/snmp-poller.yaml` | The main file: `global`, and anything else below. Shipped with the defaults, no device. |
-| `etc/conf.d/*.yaml` | More configuration files, read automatically: devices (with their credentials), outputs, `vault`, `logging`. See [Configuration files](#configuration-files). |
+| `etc/conf.d/*.yaml` | More configuration files, read automatically: devices (with their credentials), sinks, `vault`, `logging`. See [Configuration files](#configuration-files). |
 | `etc/capabilities.d/*.yaml` | What to poll, one [capability](#capabilities) per file. |
 
 Unknown keys are rejected, so typos are caught by `-check`. Durations use Go syntax: `500ms`,
@@ -139,10 +148,11 @@ Unknown keys are rejected, so typos are caught by `-check`. Durations use Go syn
 
 Every `*.yaml` and `*.yml` file of `global.include_dir` (`etc/conf.d` by default) is read after
 the main file, in name order, and has the same format as the main file. Other files (such as
-the shipped `devices.yaml.example`), hidden files and subdirectories are ignored.
+the shipped `devices.yaml.example` and `sinks.yaml.example`), hidden files and subdirectories
+are ignored.
 
-- `devices` and `outputs` of every file are combined (main file first, then the files in name
-  order). Device ids, device addresses and output names are unique across all files.
+- `devices` and `sinks` of every file are combined (main file first, then the files in name
+  order). Device ids, device addresses and sink ids are unique across all files.
 - `logging` and `vault` may each be defined in one file only, any of them.
 - `global` is only allowed in the main file.
 - Clear-text credentials are [encrypted](#credentials-encryption) in the file they are written in.
@@ -200,11 +210,11 @@ level=ERROR msg="configuration reload failed, the previous configuration stays i
 | Device added | Polled from now on, first polls spread over one poll interval; discovered on its first poll. |
 | Device removed | No longer polled (a poll in progress ends normally); its data directory is deleted. |
 | Address, port, transport, SNMP version, credentials, context, Vault path, capabilities (excluded, edited, include patterns) of a device | The device is discovered again on its next poll. |
-| Anything else on a device (intervals, timeouts, retries, walk, outputs, trace, ...) | Applied on its next poll. Its discovery cycle is kept: `discovery_interval` counts from its last discovery. A shorter `poll_interval` applies at once, a longer one after the next poll. |
+| Anything else on a device (intervals, timeouts, retries, walk, sinks, trace, ...) | Applied on its next poll. Its discovery cycle is kept: `discovery_interval` counts from its last discovery. A shorter `poll_interval` applies at once, a longer one after the next poll. |
 | Unchanged devices | Nothing: same poll phase, same discovery cycle, rate/volume state kept. |
-| `outputs` | New or changed outputs are built; replaced ones are closed once the polls using them are done. Unchanged outputs are kept as they are. |
+| `sinks` | New or changed sinks start at once; a replaced sink stops once the polls using it are done, hands its disk buffer to its successor and gets its `timeout` to send what it holds in memory. Unchanged sinks keep running untouched. |
 | `vault` | A new client logs in on its next use; an unchanged section keeps its token. |
-| `logging` | Applied at once (level, sinks, file). |
+| `logging` | Applied at once (level, console, file). |
 | `global.threads`, `stats_interval`, `shutdown_timeout`, `hot_reload`, defaults inherited by devices | Applied at once. |
 | `global.data_dir` | Refused (error, previous configuration kept): restart to change it. |
 
@@ -224,7 +234,7 @@ A device being polled during a reload gets its new configuration when that poll 
 | `port` | `161` | Default agent port. |
 | `transport` | `udp` | Default transport: `udp` or `tcp`. |
 | `walk` | `bulk` | Default walk method: `bulk` (GETBULK) or `getnext` (GETNEXT, one OID per request, for agents with a broken GETBULK). SNMPv1 has no GETBULK: v1 devices always use `getnext`. |
-| `data_dir` | `data` | On-disk state directory. Device directories are wiped on startup; the credentials key `key.dat` is kept. |
+| `data_dir` | `data` | On-disk state directory. Device directories are wiped on startup; the credentials key `key.dat` and the sinks' disk buffers (`sinks/`) are kept. See [Data directory](#data-directory). |
 | `include_dir` | `conf.d` | [Configuration files](#configuration-files) read after the main file. Relative to the directory of the main file (`etc/conf.d` by default). Main file only. |
 | `capabilities_dir` | `capabilities.d` | [Capabilities](#capabilities) directory. Relative to the directory of the main file (`etc/capabilities.d` by default). Formerly `conf_dir`, which is now rejected with a message saying so. |
 | `stats_interval` | `1m` | Interval of the stats log line. |
@@ -258,16 +268,44 @@ logs/snmp-poller-2026-11-08T10-00-00.000.log.gz     # rotated, compressed
 logs/snmp-poller-2026-11-07T22-41-17.512.log.gz
 ```
 
-### `outputs`
+### `sinks`
 
-A list of destinations. With no `outputs` section, a single `null` output named `null` is used.
+Where polled data goes. See [Sinks](#sinks) for what is sent and how. Without any sink,
+polled data is sent nowhere.
 
-| Key | Description |
-|-----|-------------|
-| `name` | Unique name, referenced by devices. |
-| `type` | Output type. Available: `null` (discards everything). |
+```yaml
+# conf.d/sinks.yaml
+sinks:
+  - id: prometheus
+    type: prometheus
+    url: http://prometheus:9090/api/v1/write
+  - id: influxdb
+    type: influxdb
+    url: http://influxdb:8181
+    database: snmp
+    token: apiv3_xxxxxxxx               # encrypted in this file on startup
+```
 
-Devices send to every output by default, or to the subset listed in their `outputs`.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `id` | | Unique id (letters, digits, `.`, `_`, `-`), referenced by devices, used in logs and as the disk buffer directory name. Required. |
+| `type` | | `prometheus` ([remote write](#prometheus)) or `influxdb` ([InfluxDB 3](#influxdb-3)). Required. |
+| `url` | | `prometheus`: the remote write endpoint, e.g. `http://prometheus:9090/api/v1/write`. `influxdb`: the server, e.g. `http://influxdb:8181` (`/api/v2/write` is appended). Required. |
+| `database` | | `influxdb` only: the database (bucket). Required. |
+| `token` | | `influxdb`: sent as `Authorization: Token <token>`. `prometheus`: sent as `Authorization: Bearer <token>`. [Encrypted](#credentials-encryption) on startup like device credentials. |
+| `username`, `password` | | HTTP basic authentication, instead of `token`. The password is encrypted on startup. |
+| `headers` | | More HTTP headers, e.g. `{ X-Scope-OrgID: tenant-1 }` for Mimir. Not `Authorization`: use `token` or `username`/`password`, which are encrypted. |
+| `ca_cert`, `client_cert`, `client_key`, `tls_skip_verify` | | TLS: CA file (PEM) to verify the server, client certificate and key (mutual TLS), or no verification (tests only). |
+| `timeout` | `10s` | Per request. Also how long a stopping sink gets to send what it holds in memory. |
+| `prefix` | `snmp_` (prometheus), none (influxdb) | Start of every metric name (prometheus) or measurement name (influxdb). |
+| `keys` | all | `include` and `exclude` lists of regular expressions on the [keys](#keys-and-tags): a key is sent when it matches an `include` pattern (or there is none) and no `exclude` pattern. |
+| `tags` | `[device, index, labels]` | Tags (labels) attached to every value, see [Keys and tags](#keys-and-tags). |
+| `batch_size` | `5000` | Values per request. |
+| `flush_interval` | `1s` | The longest a value waits for its request to fill up. |
+| `disk_buffer` | `1GB` | Size limit of the [disk buffer](#delivery-and-disk-buffer) `<data_dir>/sinks/<id>/`, used while the destination is unreachable. `0` or `null`: no disk buffer. Units: `B`, `KB`, `MB`, `GB`, `TB` (powers of 1000), `KiB`, `MiB`, `GiB`, `TiB` (powers of 1024). |
+
+Devices send to every sink by default, to the sinks listed in their `sinks`, or to none with
+`sinks: []`.
 
 ### `devices`
 
@@ -286,7 +324,7 @@ Devices send to every output by default, or to the subset listed in their `outpu
 | `discovery_interval` | `global.discovery_interval` | |
 | `timeout`, `retries` | global | |
 | `max_oids_per_request`, `max_repetitions` | global | |
-| `outputs` | all outputs | Output names to send to. |
+| `sinks` | all sinks | Ids of the [sinks](#sinks) to send to; `[]` for none. |
 | `trace` | `false` | Log debug details for this device only, whatever the global level. |
 
 ### `devices[].snmp`
@@ -622,6 +660,164 @@ tables:
     columns:
       - { name: upsInputVoltage, oid: 1.3.6.1.2.1.33.1.3.3.1.3 }
 ```
+
+## Sinks
+
+A sink sends the values of every poll of its devices to a time series database. Two types
+exist, both read by Grafana out of the box:
+
+- [`prometheus`](#prometheus): the Prometheus remote write protocol (1.0), accepted by
+  Prometheus, Grafana Mimir, VictoriaMetrics, Thanos Receive, Cortex, Grafana Cloud, ...
+- [`influxdb`](#influxdb-3): InfluxDB line protocol to InfluxDB 3 Core, Enterprise and Cloud
+  (the `/api/v2/write` endpoint, also served by InfluxDB 2).
+
+### Keys and tags
+
+Every value has a **key**: the metric name (a scalar or a table column of a capability), with
+`_rate` or `_volume` appended for those [modes](#capability-scalars): `uptime`, `ifOperStatus`,
+`ifInOctets_rate`, `ifInOctets_volume`, `storageUsedPercent`. `keys.include` and
+`keys.exclude` select which keys a sink sends:
+
+```yaml
+sinks:
+  - id: traffic-only
+    type: prometheus
+    url: http://prometheus:9090/api/v1/write
+    keys:
+      include: ['^if(In|Out)Octets_rate$', '^ifOperStatus$']
+  - id: no-volumes
+    type: influxdb
+    url: http://influxdb:8181
+    database: snmp
+    keys:
+      exclude: ['_volume$']
+```
+
+**Tags** identify what a value is about. Their values come from the device and from its
+discovery cache (`data/<device_id>/discovery.json`), so they cost no extra SNMP request.
+`tags` is a list of sources; an entry `{ name: source }` renames one:
+
+| Source | Value |
+|--------|-------|
+| `device` | The device id. |
+| `address` | The device address. |
+| `index` | The table row index (`1`, `10101`, ...). Table values only. |
+| `table`, `capability` | The table name, the capability name. |
+| `labels` | The table's `label` and `labels` columns (e.g. `ifDescr`, `ifName`, `ifAlias`), each a tag named after its column. Cannot be renamed. Table values only. |
+| a discovery scalar | `sysName`, `sysLocation`, `sysDescr`, `sysContact`, `sysObjectID`, ... (any `discovery.scalars` of a capability), on every value of the device. |
+| a discovery column | `ifSpeed`, `ifType`, `entPhysicalModelName`, ... (any `discovery.columns` of a capability), the row's value, on values of the tables of that capability. |
+
+```yaml
+sinks:
+  - id: influxdb
+    type: influxdb
+    url: http://influxdb:8181
+    database: snmp
+    tags: [device, { host: sysName }, sysLocation, labels, index, { speed: ifSpeed }]
+```
+
+Empty values are left out. Unknown sources are configuration errors. Keep `index` or a label
+that is unique per row (such as `ifDescr`): without one, the rows of a table become the same
+series.
+
+### Prometheus
+
+Each value is a sample of the series `<prefix><key>` (`snmp_ifInOctets_rate`), with the tags as
+labels and the time the value was received (ms). Strings (e.g. `sysDescr` polled as a
+scalar) cannot be stored by Prometheus and are not sent. Names are made valid Prometheus names
+(invalid characters become `_`); a name emitted by two tables is a configuration error (exclude
+one with `keys`).
+
+Prometheus accepts remote write when started with `--web.enable-remote-write-receiver`:
+
+```sh
+prometheus --config.file=prometheus.yml --web.enable-remote-write-receiver
+```
+
+Prometheus rejects samples older than its newest data for a series (out of order), unless
+`out_of_order_time_window` allows them. The poller never sends a series out of order: the disk
+buffer is sent first, in order. But after an outage longer than about an hour, Prometheus also
+rejects samples older than its head block: allow them with
+
+```yaml
+# prometheus.yml
+storage:
+  tsdb:
+    out_of_order_time_window: 1d   # longer than the outages to recover from
+```
+
+VictoriaMetrics and Mimir accept old samples by default.
+
+In Grafana, add a Prometheus data source pointing to Prometheus, then query:
+
+```promql
+snmp_ifInOctets_rate{device="core-1"} * 8                    # bit/s per interface, legend: {{ifDescr}}
+snmp_storageUsedPercent{hrStorageType=~".*25\\.2\\.1\\.4"}  # fixed disks (hrStorageFixedDisk)
+max by (device) (snmp_hrProcessorLoad)                        # busiest processor per host
+```
+
+### InfluxDB 3
+
+Values are written as InfluxDB line protocol, gzip compressed, with millisecond timestamps:
+
+- the **measurement** is the table name (`interfaces`, `storage`, `processors`), or for
+  scalars the capability name (`system`, `host-resources`), after the `prefix`;
+- the **tags** are the sink's tags;
+- the **fields** are the keys: all the values of one row (or of one capability's scalars) of a
+  poll make one line, at the time the first of them was received.
+
+```text
+interfaces,device=core-1,ifAlias=uplink,ifDescr=TenGigE0/1,ifName=Te0/1,index=1 ifInOctets_rate=1.2e+08,ifInOctets_volume=7.2e+09,ifOperStatus=1i,ifSpeed=4294967295i 1794132000123
+system,device=core-1 uptime=864000i,sysUpTime=864000i 1794132000045
+```
+
+Integers are always integer fields (`i`), whatever their SNMP type, so a field never changes
+type between devices; rates and volumes are floats; strings are string fields. A tag with the
+same name as a field of the same measurement (e.g. a tag `ifSpeed` on `interfaces`, which has an
+`ifSpeed` field) is a configuration error: rename it (`{ speed: ifSpeed }`). InfluxDB 3 creates
+the database on the first write.
+
+```sh
+influxdb3 serve --node-id node0 --object-store file --data-dir ~/.influxdb3
+influxdb3 create token --admin            # the token of the sink
+```
+
+In Grafana, add an **InfluxDB** data source with the query language **SQL**, the URL of the
+server, the database and the token, then query:
+
+```sql
+SELECT time, "ifDescr", "ifInOctets_rate" * 8 AS bps
+FROM interfaces
+WHERE device = 'core-1' AND $__timeFilter(time)
+ORDER BY time
+```
+
+### Delivery and disk buffer
+
+- **Parallel and non-blocking**: a poll hands its batch to each of its sinks and moves on. Each
+  sink groups values into requests (`batch_size` values, or what came in `flush_interval`) and
+  sends them from its own goroutine, one request at a time, in order. A slow or unreachable
+  destination never delays polling or the other sinks.
+- **Unreachable destination** (connection error, timeout, HTTP 5xx, 429, 401, 403, 404): the
+  sink logs one `warn` line, keeps its data in the **disk buffer** `<data_dir>/sinks/<id>/` and
+  retries (after 1s, doubling up to 30s). New data goes to the end of the buffer. Once the
+  destination is back, an `info` line reports the outage duration and the buffer is sent, oldest
+  first, then the sink goes back to sending from memory. Fix a wrong token or URL with a
+  [reload](#reloading-the-configuration): the buffer is kept and sent with the new settings.
+- **Full disk buffer**: beyond `disk_buffer`, the oldest data is dropped (logged, and counted
+  in the [stats](#logs)), so the most recent data is kept.
+- **Without disk buffer** (`disk_buffer: 0`): data waits in memory (up to 32MB of compressed
+  requests, oldest dropped beyond) and is lost on stop.
+- **Rejected data** (other HTTP 4xx, e.g. 400 invalid data): that request is dropped with a
+  `warn` line, so it cannot block the ones after it.
+- **Restarts**: on stop, each sink gets its `timeout` to send what it holds in memory; the
+  rest goes to its disk buffer, which the next run sends first. A crash loses at most the data
+  of the last `flush_interval`; after one, data sent but not yet recorded as sent may be sent
+  twice, which both databases ignore (same series, same time).
+- **Reload**: a sink whose settings change is replaced; the new one takes over the disk
+  buffer. A buffer written by a sink of another type is dropped (logged), not sent.
+- The disk buffer of a sink removed from the configuration stays on disk: it is sent if the
+  sink comes back, or delete `<data_dir>/sinks/<id>/` by hand.
 
 ## Examples
 
@@ -990,20 +1186,41 @@ devices:
     discovery_interval: 10m     # this one changes often
 ```
 
-### Multiple outputs
+### Multiple sinks
 
 ```yaml
-outputs:
-  - { name: primary, type: "null" }
-  - { name: archive, type: "null" }
+sinks:
+  - id: prometheus
+    type: prometheus
+    url: https://mimir.example.net/api/v1/push
+    headers: { X-Scope-OrgID: network }
+    username: snmp-poller
+    password: change-me                 # encrypted in this file on startup
+    ca_cert: /etc/ssl/certs/internal-ca.pem
+  - id: influxdb
+    type: influxdb
+    url: http://influxdb:8181
+    database: snmp
+    token: "${INFLUXDB_TOKEN}"
+    tags: [device, { host: sysName }, sysLocation, labels, index]
+    disk_buffer: 10GB                   # long outages
+  - id: lab
+    type: influxdb
+    url: http://lab-influxdb:8181
+    database: lab
+    disk_buffer: 0                      # no disk buffer: data is dropped while down
 
 devices:
-  - id: everywhere          # no outputs list: sent to every output
+  - id: everywhere          # no sinks list: sent to every sink
     address: 192.0.2.110
     snmp: { version: 2c, community: "${SNMP_COMMUNITY}" }
-  - id: archive-only
+  - id: lab-only
     address: 192.0.2.111
-    outputs: [archive]
+    sinks: [lab]
+    snmp: { version: 2c, community: "${SNMP_COMMUNITY}" }
+  - id: polled-not-sent
+    address: 192.0.2.112
+    sinks: []
     snmp: { version: 2c, community: "${SNMP_COMMUNITY}" }
 ```
 
@@ -1078,7 +1295,7 @@ Logs are meant to be read: there is no line per poll at `info` level.
   ```text
   level=INFO msg="poller stats" window=1m0s devices=1200 in_progress=37 queued=4 failing_devices=3
     polls_ok=1180 polls_failed=17 skipped=0 discoveries=21 discovery_failed=2 samples=184022
-    output_errors=0 avg_duration=412ms max_duration=9.8s total_polls_ok=88231 total_polls_failed=902
+    avg_duration=412ms max_duration=9.8s total_polls_ok=88231 total_polls_failed=902
   ```
 
   | Field | Meaning |
@@ -1089,11 +1306,28 @@ Logs are meant to be read: there is no line per poll at `info` level.
   | `polls_ok`, `polls_failed` | Polls finished during the window. |
   | `skipped` | Poll slots skipped because the previous poll of that device was still running. |
   | `discoveries`, `discovery_failed` | Discovery runs during the window. |
-  | `samples` | Samples sent to outputs during the window. |
-  | `output_errors` | Failed output writes. |
+  | `samples` | Values produced during the window (before each sink's `keys`). |
   | `avg_duration`, `max_duration` | Poll durations during the window. |
   | `total_*` | Since startup. |
 
+- A **sink stats line** per sink, after the stats line:
+
+  ```text
+  level=INFO msg="sink stats" sink=influxdb state=up samples_sent=183950 requests=61
+    failed_requests=0 samples_dropped=0 backlog_samples=72 backlog_bytes=0
+  ```
+
+  | Field | Meaning |
+  |-------|---------|
+  | `state` | `up`, or `down` while the destination is unreachable. |
+  | `samples_sent`, `requests` | Values accepted by the destination, and requests sent, during the window. |
+  | `failed_requests` | Requests that failed (retried, or dropped when rejected). |
+  | `samples_dropped` | Values lost during the window: rejected by the destination, or dropped from a full buffer. |
+  | `backlog_samples`, `backlog_bytes` | Values waiting to be sent now, and the size of the disk buffer. |
+
+- **Sinks log on change**: a `warn` when a destination becomes unreachable (with the error), an
+  `info` when it is back (with the outage duration and backlog), a `warn` at most once a minute
+  while data is dropped.
 - **Failures are logged on change**: the first failure of a device is a `warn` with its
   `device` id and the error, and its recovery is an `info`. Repeated failures only show up in
   the stats line, so a dead device does not flood the logs.
@@ -1119,6 +1353,10 @@ data/
   <device_id>/
     discovery.json   # discovery cache: capabilities, scalars, columns, selected rows, scalar sources
     state.json       # previous value and timestamp of every rate/volume OID
+  sinks/
+    <sink_id>/       # disk buffer of a sink, only while it holds data
+      00000000000000000001.seg   # requests not sent yet, oldest first (segments up to 64MB)
+      cursor                     # read position in the first segment
 ```
 
 For example, for a switch with ifXTable:
@@ -1134,7 +1372,7 @@ For example, for a switch with ifXTable:
 }
 ```
 
-Device directories are wiped on startup (files such as `key.dat` are kept), and a device's
+Device directories are wiped on startup (`key.dat` and `sinks/` are kept), and a device's
 directory is wiped on each of its rediscoveries and when a reload removes the device. Files are replaced atomically. The discovery and state of a device are only
 loaded in memory while that device is being polled, so memory does not grow with the number
 of devices, rows or polled OIDs.
@@ -1156,7 +1394,9 @@ go test -race ./...         # with the race detector (needs a C compiler)
 Integration tests run an in-process SNMP agent (`internal/testagent`) and exercise every SNMP
 version, every v3 auth/priv combination, contexts, GETBULK and GETNEXT walks, capability
 detection, the shipped capabilities (with and without ifXTable), tables, rates, Vault
-credentials and the scheduler. The Vault client is tested against a fake Vault HTTP server.
+credentials, the scheduler and the sinks. The Vault client is tested against a fake Vault HTTP
+server; the sinks against fake destinations, their requests decoded with independent parsers
+(protobuf wire format, InfluxData's line protocol parser).
 
 | Path | Purpose |
 |------|---------|
@@ -1166,11 +1406,11 @@ credentials and the scheduler. The Vault client is tested against a fake Vault H
 | `internal/snmp` | SNMP client (gosnmp) and value conversion. |
 | `internal/state` | On-disk previous values and rate/volume math. |
 | `internal/vault` | HashiCorp Vault client (KV v1/v2; token, AppRole, userpass, Kubernetes auth). |
-| `internal/output` | Output interface, registry and the `null` output. |
+| `internal/sink` | Sinks: Prometheus remote write and InfluxDB encoders, HTTP sender, disk buffer. |
 | `internal/poller` | Scheduler, workers, discovery, collection, configuration reload, stats. |
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
 | `etc/snmp-poller.yaml` | Default main configuration (no device). |
-| `etc/conf.d/` | Local configuration files (git-ignored), and `devices.yaml.example`. |
+| `etc/conf.d/` | Local configuration files (git-ignored), `devices.yaml.example` and `sinks.yaml.example`. |
 | `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`). |
 
 ### Versions and releases
@@ -1198,5 +1438,3 @@ Each archive holds a `snmp-poller-<version>-<os>-<arch>/` directory with the bin
 To release: change `VERSION` (e.g. `0.2`) and push to `main`. Pushing without changing
 `VERSION` only builds and tests. A failing check releases nothing; once fixed, the next push
 releases that version. An invalid `VERSION` fails the build.
-
-New output types implement `output.Output` and call `output.Register` from an `init` function.

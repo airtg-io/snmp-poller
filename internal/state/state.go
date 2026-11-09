@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/airtg-io/snmp-poller/internal/config"
 	"github.com/airtg-io/snmp-poller/internal/snmp"
 )
 
@@ -43,7 +44,8 @@ func (s *Store) Dir() string { return s.dir }
 func (s *Store) DeviceDir(id string) string { return filepath.Join(s.dir, id) }
 
 // Clean removes every device directory. Called on startup. Files, such as
-// the credentials key (config.KeyFile), are kept.
+// the credentials key (config.KeyFile), and the disk buffers of the sinks
+// (config.SinksDir) are kept.
 func (s *Store) Clean() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -51,7 +53,7 @@ func (s *Store) Clean() error {
 	}
 	var errs []error
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && e.Name() != config.SinksDir {
 			errs = append(errs, os.RemoveAll(filepath.Join(s.dir, e.Name())))
 		}
 	}

@@ -76,8 +76,8 @@ func TestDefaults(t *testing.T) {
 		*l.LocalTime || !*l.File.Compress {
 		t.Errorf("unexpected logging defaults: %+v", l)
 	}
-	if len(c.Outputs) != 1 || c.Outputs[0].Type != "null" {
-		t.Errorf("default outputs = %+v, want one null output", c.Outputs)
+	if len(c.Sinks) != 0 {
+		t.Errorf("default sinks = %+v, want none", c.Sinks)
 	}
 	specs := c.DeviceSpecs()
 	if len(specs) != 1 {
@@ -100,8 +100,8 @@ func TestDefaults(t *testing.T) {
 	if filepath.Base(g.IncludeDir) != "conf.d" || !filepath.IsAbs(g.IncludeDir) {
 		t.Errorf("include_dir = %q, want <base dir>/conf.d", g.IncludeDir)
 	}
-	if len(s.Outputs) != 1 || s.Outputs[0] != "null" {
-		t.Errorf("device outputs = %v", s.Outputs)
+	if len(s.Sinks) != 0 {
+		t.Errorf("device sinks = %v", s.Sinks)
 	}
 }
 
@@ -278,6 +278,9 @@ func TestReadmeExamplesAreValid(t *testing.T) {
 		doc, _, _ := strings.Cut(b, "```")
 		first, _, _ := strings.Cut(doc, "\n")
 		t.Run(fmt.Sprintf("example-%d", i+1), func(t *testing.T) {
+			if strings.HasPrefix(first, "# prometheus.yml") {
+				return // configuration of another program
+			}
 			if file, ok := strings.CutPrefix(first, "# capabilities.d/"); ok {
 				file, _, _ = strings.Cut(file, " ")
 				caps++
@@ -309,9 +312,9 @@ func TestReadmeExamplesAreValid(t *testing.T) {
 func TestInheritanceAndOverrides(t *testing.T) {
 	c, err := parseWith(t, `
 global: { poll_interval: 30s, discovery_interval: 2h, timeout: 2s, retries: 3, port: 1161 }
-outputs:
-  - { name: a, type: "null" }
-  - { name: b, type: "null" }
+sinks:
+  - { id: a, type: prometheus, url: "http://prom:9090/api/v1/write" }
+  - { id: b, type: prometheus, url: "http://prom:9090/api/v1/write" }
 devices:
   - id: r1
     address: 10.0.0.1
@@ -326,7 +329,7 @@ devices:
     poll_interval: 10s
     discovery_interval: 5m
     retries: 0
-    outputs: [b]
+    sinks: [b]
     exclude: [vendor]
     include: { if: ["^ge-"] }
   - id: r2
@@ -372,8 +375,8 @@ scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 }]
 	if r2.SNMP.Username != "poller" || r2.SNMP.AuthPassword.Reveal() != "authpass1" || r2.SNMP.SecurityLevel != AuthPriv {
 		t.Errorf("r2 must reuse r1's snmp block through the alias: %+v", r2.SNMP)
 	}
-	if fmt.Sprint(r1.Outputs) != "[b]" || fmt.Sprint(r2.Outputs) != "[a b]" {
-		t.Errorf("outputs: r1=%v r2=%v", r1.Outputs, r2.Outputs)
+	if fmt.Sprint(r1.Sinks) != "[b]" || fmt.Sprint(r2.Sinks) != "[a b]" {
+		t.Errorf("sinks: r1=%v r2=%v", r1.Sinks, r2.Sinks)
 	}
 
 	names := func(caps []*Capability) string {
@@ -484,14 +487,16 @@ func TestValidationErrors(t *testing.T) {
 		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_password: short } }]`, "at least 8"},
 		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, security_level: authPriv, auth_protocol: MD5, auth_password: 12345678 } }]`, "requires priv_protocol"},
 		{`devices: [{ id: d, address: x, snmp: { version: 3, username: u, context_engine_id: zz } }]`, "hex"},
-		{dev(`, outputs: [nope]`), "unknown output"},
+		{dev(`, sinks: [nope]`), "unknown sink"},
+		{dev(`, outputs: [x]`), "a device's outputs were replaced by sinks"},
 		{dev(`, profiles: [x]`), "field profiles not found"},
 		{dev(`, scalars: []`), "field scalars not found"},
 		{dev(`, exclude: [nope]`), `unknown capability "nope"`},
 		{dev(`, exclude: [uptime]`), "every capability is excluded"},
 		{dev(`, include: { nope: [x] }`), `unknown table "nope"`},
 		{dev(`, include: { nope: ["("] }`), "missing closing )"},
-		{dev(``) + "\n" + `outputs: [{ name: a, type: "null" }, { name: a, type: "null" }]`, "duplicate name"},
+		{dev(``) + "\n" + `outputs: [{ name: a, type: "null" }]`, "outputs were replaced by sinks"},
+		{dev(``) + "\n" + `sinks: [{ id: a, type: prometheus, url: "http://prom:9090/api/v1/write" }, { id: a, type: prometheus, url: "http://prom:9090/api/v1/write" }]`, "duplicate id"},
 	} {
 		_, err := parse(t, tc.doc)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -692,7 +697,7 @@ func TestIncludeDir(t *testing.T) {
 	t.Setenv("SNMP_COMMUNITY", "from-env")
 	path := writeConfig(t, `
 global: { poll_interval: 30s }
-outputs: [{ name: main, type: "null" }]
+sinks: [{ id: main, type: prometheus, url: "http://prom:9090/api/v1/write" }]
 devices:
   - { id: from-main, address: 192.0.2.1, snmp: { version: 2c, community: c } }
 `, map[string]string{
@@ -704,7 +709,7 @@ devices:
     address: 192.0.2.11
     port: 1161
     transport: tcp
-    outputs: [extra]
+    sinks: [extra]
     snmp: { version: 1, community: "${SNMP_COMMUNITY}" }
   - id: core-1
     address: 192.0.2.12
@@ -726,7 +731,7 @@ devices:
   - { id: edge-1, address: 192.0.2.13, snmp: { vault: true } }
   - { id: edge-2, address: 192.0.2.14, snmp: { vault: network/edge-v3 } }
 `,
-		"30-outputs.yaml":   `outputs: [{ name: extra, type: "null" }]`,
+		"30-sinks.yaml":     `sinks: [{ id: extra, type: influxdb, url: "http://influx:8181", database: snmp }]`,
 		"40-logging.yaml":   `logging: { level: debug }`,
 		"50-empty.yaml":     "# nothing yet\n",
 		"devices.yaml.bak":  "not: yaml: [",                       // not *.yaml: ignored
@@ -742,7 +747,7 @@ devices:
 	}
 	dir := filepath.Dir(path)
 	wantFiles := []string{path, filepath.Join(dir, "conf.d", "10-vault.yml"), filepath.Join(dir, "conf.d", "20-devices.yaml"),
-		filepath.Join(dir, "conf.d", "30-outputs.yaml"), filepath.Join(dir, "conf.d", "40-logging.yaml"),
+		filepath.Join(dir, "conf.d", "30-sinks.yaml"), filepath.Join(dir, "conf.d", "40-logging.yaml"),
 		filepath.Join(dir, "conf.d", "50-empty.yaml")}
 	if !slices.Equal(c.Files(), wantFiles) {
 		t.Errorf("files = %q\nwant %q", c.Files(), wantFiles)
@@ -751,7 +756,7 @@ devices:
 	var got []string
 	for _, s := range c.DeviceSpecs() {
 		got = append(got, fmt.Sprintf("%s %s %s %s %v %s %v", s.ID, s.SNMP.Version, s.Transport, s.Walk,
-			s.PollInterval, s.VaultPath, s.Outputs))
+			s.PollInterval, s.VaultPath, s.Sinks))
 	}
 	want := []string{
 		"from-main 2c udp bulk 30s  [main extra]",
@@ -808,8 +813,8 @@ func TestIncludeDirErrors(t *testing.T) {
 			[]string{`conf.d/b.yaml: device "r2": address 192.0.2.1 port 161 is already used by device "r1"`}},
 		{"device error names its file", "", map[string]string{"a.yaml": "devices: [{ id: d }]"},
 			[]string{"conf.d/a.yaml: devices[0]: address is required"}},
-		{"duplicate output across files", "outputs: [{ name: o, type: \"null\" }]", map[string]string{"a.yaml": "outputs: [{ name: o, type: \"null\" }]"},
-			[]string{`conf.d/a.yaml: outputs[0]: duplicate name "o" (also in `, "snmp-poller.yaml)"}},
+		{"duplicate sink across files", `sinks: [{ id: o, type: prometheus, url: "http://prom:9090/api/v1/write" }]`, map[string]string{"a.yaml": `sinks: [{ id: o, type: prometheus, url: "http://prom:9090/api/v1/write" }]`},
+			[]string{`conf.d/a.yaml: sinks[0]: duplicate id "o" (also in `, "snmp-poller.yaml)"}},
 		{"unknown key names its file and line", "", map[string]string{"a.yaml": "devices: []\ndevice: []"},
 			[]string{"conf.d/a.yaml: yaml: unmarshal errors:", "line 2: field device not found"}},
 		{"capability in conf.d", "", map[string]string{"system.yaml": uptime},

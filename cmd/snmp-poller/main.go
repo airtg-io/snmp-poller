@@ -13,8 +13,8 @@ import (
 
 	"github.com/airtg-io/snmp-poller/internal/config"
 	"github.com/airtg-io/snmp-poller/internal/logging"
-	"github.com/airtg-io/snmp-poller/internal/output"
 	"github.com/airtg-io/snmp-poller/internal/poller"
+	"github.com/airtg-io/snmp-poller/internal/sink"
 )
 
 // version (the VERSION file) and commit are set at build time by the
@@ -56,19 +56,21 @@ func run() int {
 	}
 
 	if *check {
-		// Building outputs validates their type-specific options too.
-		outs, err := output.Build(cfg.Outputs, discardLogger())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "invalid configuration: %v\n", err)
-			return 2
+		// Building sinks checks their TLS files too (nothing is written).
+		for _, k := range cfg.Sinks {
+			s, err := sink.New(k, cfg.Global.DataDir, discardLogger())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid configuration: sink %q: %v\n", k.ID, err)
+				return 2
+			}
+			s.Close()
 		}
-		output.CloseAll(outs)
 		names := make([]string, 0, len(cfg.Capabilities()))
 		for _, c := range cfg.Capabilities() {
 			names = append(names, c.Name)
 		}
-		fmt.Printf("configuration OK: %d file(s) (%s), %d enabled device(s), %d output(s), %d capabilities from %s (%s)\n",
-			len(cfg.Files()), strings.Join(cfg.Files(), ", "), len(cfg.DeviceSpecs()), len(cfg.Outputs),
+		fmt.Printf("configuration OK: %d file(s) (%s), %d enabled device(s), %d sink(s), %d capabilities from %s (%s)\n",
+			len(cfg.Files()), strings.Join(cfg.Files(), ", "), len(cfg.DeviceSpecs()), len(cfg.Sinks),
 			len(names), cfg.Global.CapabilitiesDir, strings.Join(names, ", "))
 		return 0
 	}
@@ -80,23 +82,21 @@ func run() int {
 	}
 	defer log.Close()
 	log.Info("starting AIrtg snmp-poller", "version", version, "commit", commit, "config", *path,
-		"files", len(cfg.Files()), "devices", len(cfg.DeviceSpecs()))
+		"files", len(cfg.Files()), "devices", len(cfg.DeviceSpecs()), "sinks", len(cfg.Sinks))
 	if len(cfg.DeviceSpecs()) == 0 {
 		log.Warn("no enabled device: add devices to a file of the include directory",
 			"include_dir", cfg.Global.IncludeDir)
+	}
+	if len(cfg.Sinks) == 0 {
+		log.Warn("no sink configured: polled data is sent nowhere", "include_dir", cfg.Global.IncludeDir)
 	}
 
 	// Encrypt the clear-text credentials of the (valid) configuration files.
 	poller.Seal(cfg, log.Logger)
 
-	outs, err := output.Build(cfg.Outputs, log.Logger)
+	sink.UserAgent = "airtg-snmp-poller/" + version
+	p, err := poller.New(cfg, log.Logger)
 	if err != nil {
-		log.Error("outputs", "err", err)
-		return 1
-	}
-	p, err := poller.New(cfg, log.Logger, outs) // owns outs from now on
-	if err != nil {
-		output.CloseAll(outs)
 		log.Error("poller", "err", err)
 		return 1
 	}

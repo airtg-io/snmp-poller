@@ -1,0 +1,38 @@
+# Example sinks: where polled data is sent. This file is not read (only
+# *.yaml and *.yml files of etc/conf.d are): copy it to a name ending in
+# .yaml, e.g. sinks.yaml, keep the sinks you use and edit them. Every option
+# is documented in README.md.
+#
+# Without any sink, polled data is sent nowhere. Every device sends to
+# every sink, unless it lists the ids of its sinks (`sinks: [prometheus]`).
+# Each sink sends on its own: a slow or unreachable one never delays the
+# others. While a destination is unreachable, its data waits in
+# <data_dir>/sinks/<id> (up to disk_buffer, oldest dropped first) and is
+# sent, in order, once it is back.
+#
+# Clear-text tokens and passwords are encrypted in place on startup, like
+# device credentials.
+
+sinks:
+  # Prometheus remote write: Prometheus (started with
+  # --web.enable-remote-write-receiver), Grafana Mimir, VictoriaMetrics,
+  # Thanos Receive, Cortex, ...
+  - id: prometheus
+    type: prometheus
+    url: http://localhost:9090/api/v1/write
+    # token: ${PROMETHEUS_TOKEN}     # Authorization: Bearer; or username/password
+    # prefix: snmp_                  # metric names: snmp_ifInOctets_rate, ...
+    # disk_buffer: 1GB               # 0 or null: no disk buffer
+
+  # InfluxDB 3 (Core, Enterprise, Cloud), /api/v2/write.
+  - id: influxdb
+    type: influxdb
+    url: http://localhost:8181
+    database: snmp
+    token: ${INFLUXDB_TOKEN}         # or the token itself, encrypted on startup
+    # Tags of every line: device id, system name and location from the
+    # discovery cache, and for table rows their index and labels (ifDescr,
+    # ifName, ifAlias, ...).
+    tags: [device, sysName, sysLocation, index, labels]
+    # keys:                          # fields sent (default: all)
+    #   exclude: ['_volume$']

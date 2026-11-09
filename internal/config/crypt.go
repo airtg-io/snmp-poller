@@ -134,6 +134,11 @@ func (c *Config) secrets() []namedSecret {
 			add(p+"priv_password", &s.PrivPassword)
 		}
 	}
+	for i := range c.Sinks {
+		p := fmt.Sprintf("sinks[%d].", i)
+		add(p+"token", &c.Sinks[i].Token)
+		add(p+"password", &c.Sinks[i].Password)
+	}
 	if v := c.Vault; v != nil {
 		add("vault.auth.token", &v.Auth.Token)
 		add("vault.auth.secret_id", &v.Auth.SecretID)
@@ -170,6 +175,14 @@ func (c *Config) resolveSecrets() error {
 				errs = append(errs, inFile(f.path, fmt.Errorf("%s: %w", s.name, err)))
 			}
 		}
+	}
+	// Sinks are merged by value: take their resolved secrets.
+	var resolved []Sink
+	for _, f := range c.files {
+		resolved = append(resolved, f.doc.Sinks...)
+	}
+	for i := range c.Sinks {
+		c.Sinks[i].Token, c.Sinks[i].Password = resolved[i].Token, resolved[i].Password
 	}
 	return errors.Join(errs...)
 }

@@ -62,7 +62,7 @@ type DeviceSpec struct {
 	Retries           int
 	MaxOIDsPerRequest int
 	MaxRepetitions    uint32
-	Outputs           []string
+	Sinks             []string
 	Trace             bool
 	// Capabilities are the candidates for this device (every capability not
 	// excluded), with the device's include overrides applied. Discovery
@@ -126,18 +126,25 @@ func (c *Config) validate() error {
 		add("logging.file.max_size_mb must be >= 1")
 	}
 
-	outputs := map[string]string{} // name -> file defining it
-	for _, o := range c.Outputs {
-		add = in(o.file)
-		switch prev, dup := outputs[o.Name]; {
-		case o.Name == "":
-			add("outputs[%d]: name is required", o.index)
+	sinks := map[string]string{} // id -> file defining it
+	for i := range c.Sinks {
+		k := &c.Sinks[i]
+		add = in(k.file)
+		switch prev, dup := sinks[k.ID]; {
+		case k.ID == "":
+			add("sinks[%d]: id is required", k.index)
+			continue
+		case !idPattern.MatchString(k.ID):
+			add("sink %q: id may only contain letters, digits, '.', '_' and '-'", k.ID)
+			continue
 		case dup:
-			add("outputs[%d]: duplicate name %q (also in %s)", o.index, o.Name, nameOf(prev))
-		case o.Type == "":
-			add("output %q: type is required", o.Name)
+			add("sinks[%d]: duplicate id %q (also in %s)", k.index, k.ID, nameOf(prev))
+			continue
 		}
-		outputs[o.Name] = o.file
+		sinks[k.ID] = k.file
+		if err := k.validate(c.capabilities); err != nil {
+			add("sink %q: %w", k.ID, err)
+		}
 	}
 
 	// Credentials are validated where they are used (see resolve and
@@ -172,8 +179,8 @@ func (c *Config) validate() error {
 		case !idPattern.MatchString(d.ID):
 			add("%s: id may only contain letters, digits, '.', '_' and '-'", label)
 			continue
-		case d.ID == KeyFile:
-			add("%s: id %q is reserved (the key file of the data directory)", label, KeyFile)
+		case d.ID == KeyFile || d.ID == SinksDir:
+			add("%s: id %q is reserved (a file of the data directory)", label, d.ID)
 			continue
 		case ids[d.ID] != "":
 			add("%s: duplicate id (also %s)", label, ids[d.ID])
@@ -197,7 +204,7 @@ func (c *Config) validate() error {
 		if d.Enabled != nil && !*d.Enabled {
 			continue
 		}
-		spec, err := c.resolve(d, outputs)
+		spec, err := c.resolve(d, sinks)
 		if err != nil {
 			add("%s: %w", label, err)
 			continue
@@ -229,7 +236,7 @@ func endpoint(address string, port uint16) string {
 	return net.JoinHostPort(a, strconv.Itoa(int(port)))
 }
 
-func (c *Config) resolve(d Device, outputs map[string]string) (DeviceSpec, error) {
+func (c *Config) resolve(d Device, sinks map[string]string) (DeviceSpec, error) {
 	g := c.Global
 	s := DeviceSpec{
 		ID:                d.ID,
@@ -282,17 +289,20 @@ func (c *Config) resolve(d Device, outputs map[string]string) (DeviceSpec, error
 		return s, err
 	}
 
-	// Outputs: default to every configured output.
-	if len(d.Outputs) == 0 {
-		for _, o := range c.Outputs {
-			s.Outputs = append(s.Outputs, o.Name)
+	// Sinks: default to every configured sink.
+	if d.Sinks == nil {
+		for _, k := range c.Sinks {
+			s.Sinks = append(s.Sinks, k.ID)
 		}
 	}
-	for _, o := range d.Outputs {
-		if _, ok := outputs[o]; !ok {
-			return s, fmt.Errorf("unknown output %q", o)
+	for _, id := range d.Sinks {
+		if _, ok := sinks[id]; !ok {
+			return s, fmt.Errorf("unknown sink %q", id)
 		}
-		s.Outputs = append(s.Outputs, o)
+		if slices.Contains(s.Sinks, id) {
+			return s, fmt.Errorf("sinks: %q is listed twice", id)
+		}
+		s.Sinks = append(s.Sinks, id)
 	}
 
 	caps, err := c.deviceCapabilities(d)

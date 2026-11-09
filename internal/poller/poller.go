@@ -8,12 +8,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
-	"github.com/airtg-io/snmp-poller/internal/output"
 	"github.com/airtg-io/snmp-poller/internal/state"
 )
 
@@ -23,6 +24,8 @@ type Poller struct {
 	store *state.Store
 	now   func() time.Time
 	stats stats
+
+	newSink func(cfg config.Sink, dataDir string, log *slog.Logger) (Sink, error)
 
 	// Configuration reload, see EnableReload and reload.go.
 	load        func(path string) (*config.Config, error)
@@ -40,19 +43,28 @@ type Poller struct {
 	conf     *config.Config
 	devices  map[string]*device // by id
 	count    atomic.Int64       // len(devices), for stats
-	outputs  map[string]*outputEntry
+	sinks    map[string]*sinkEntry
 	vault    *vaultEntry
 	inflight map[string]*device // id -> device being polled (queued or running)
 	queue    *jobQueue
 	workers  int
 	wg       sync.WaitGroup
+	closing  sync.WaitGroup // retired sinks being closed
 	stopped  atomic.Bool
 }
 
-// New prepares a poller. outputs must contain every output of the
-// configuration, built by output.Build; the poller owns them from then on
-// (Run closes them, a reload closes those it replaces).
-func New(cfg *config.Config, log *slog.Logger, outputs map[string]output.Output) (*Poller, error) {
+// Option configures a poller.
+type Option func(*Poller)
+
+// WithSinkFactory replaces how sinks are built (tests).
+func WithSinkFactory(f func(cfg config.Sink, dataDir string, log *slog.Logger) (Sink, error)) Option {
+	return func(p *Poller) { p.newSink = f }
+}
+
+// New prepares a poller and starts its sinks: they send what a previous
+// run left in their disk buffer right away. Run, or Close if Run is never
+// called, closes them.
+func New(cfg *config.Config, log *slog.Logger, opts ...Option) (*Poller, error) {
 	store, err := state.New(cfg.Global.DataDir)
 	if err != nil {
 		return nil, err
@@ -61,21 +73,18 @@ func New(cfg *config.Config, log *slog.Logger, outputs map[string]output.Output)
 		log:         log,
 		store:       store,
 		now:         time.Now,
+		newSink:     openSink,
 		reloadReq:   make(chan struct{}, 1),
 		watchEvery:  2 * time.Second,
 		applies:     make(chan *generation),
 		firstConfig: cfg,
 		devices:     map[string]*device{},
-		outputs:     map[string]*outputEntry{},
+		sinks:       map[string]*sinkEntry{},
 		inflight:    map[string]*device{},
 		queue:       newJobQueue(),
 	}
-	for _, o := range cfg.Outputs {
-		out, ok := outputs[o.Name]
-		if !ok {
-			return nil, fmt.Errorf("output %q not built", o.Name)
-		}
-		p.outputs[o.Name] = &outputEntry{cfg: o, out: out}
+	for _, o := range opts {
+		o(p)
 	}
 	gen, err := p.prepare(cfg)
 	if err != nil {
@@ -85,14 +94,36 @@ func New(cfg *config.Config, log *slog.Logger, outputs map[string]output.Output)
 	return p, nil
 }
 
+// Close closes the sinks of a poller that will not Run.
+func (p *Poller) Close() {
+	p.mu.Lock()
+	sinks := p.sinkList()
+	p.sinks = map[string]*sinkEntry{}
+	p.mu.Unlock()
+	p.closeSinks(sinks)
+}
+
+// sinkList returns the running sinks, sorted by id. Called with p.mu held.
+func (p *Poller) sinkList() []*sinkEntry {
+	list := make([]*sinkEntry, 0, len(p.sinks))
+	for _, e := range p.sinks {
+		list = append(list, e)
+	}
+	slices.SortFunc(list, func(a, b *sinkEntry) int { return strings.Compare(a.cfg.ID, b.cfg.ID) })
+	return list
+}
+
 // Run polls until ctx is cancelled, then waits up to shutdown_timeout for
-// in-flight polls before aborting them. Outputs are closed on return.
+// in-flight polls before aborting them. Sinks are closed on return: each
+// gets up to its timeout to send what it holds, the rest goes to its disk
+// buffer.
 func (p *Poller) Run(ctx context.Context) error {
 	if err := p.store.Clean(); err != nil {
+		p.Close()
 		return fmt.Errorf("clean data dir: %w", err)
 	}
 	p.mu.Lock()
-	p.log.Info("poller started", "devices", len(p.devices), "threads", p.cfg.Threads,
+	p.log.Info("poller started", "devices", len(p.devices), "sinks", len(p.sinks), "threads", p.cfg.Threads,
 		"workers", p.targetWorkers(), "data_dir", p.store.Dir())
 	pollCtx, abort := context.WithCancel(context.WithoutCancel(ctx))
 	defer abort()
@@ -132,13 +163,8 @@ func (p *Poller) Run(ctx context.Context) error {
 		<-done
 	}
 	bg.Wait()
-	p.mu.Lock()
-	for name, e := range p.outputs {
-		if err := e.out.Close(); err != nil {
-			p.log.Error("closing output", "output", name, "err", err)
-		}
-	}
-	p.mu.Unlock()
+	p.Close()
+	p.closing.Wait()
 	p.log.Info("poller stopped")
 	return nil
 }
@@ -260,7 +286,7 @@ func (p *Poller) work(ctx context.Context) {
 	}
 }
 
-// done ends the poll of d: pending configuration is applied, outputs
+// done ends the poll of d: pending configuration is applied, sinks
 // retired meanwhile are closed when no poll uses them any more, and the
 // data of a removed device is deleted.
 func (p *Poller) done(d *device) {
@@ -271,10 +297,10 @@ func (p *Poller) done(d *device) {
 		d.applyConf(d.pending)
 		d.pending = nil
 	}
-	var closing []*outputEntry
+	var closing []*sinkEntry
 	for _, r := range d.waiters {
 		if r.waiting--; r.waiting == 0 {
-			closing = append(closing, r.outputs...)
+			closing = append(closing, r.sinks...)
 		}
 	}
 	d.waiters = nil
@@ -288,7 +314,7 @@ func (p *Poller) done(d *device) {
 			p.log.Warn("removing the data of a removed device", "device", d.spec.ID, "err", err)
 		}
 	}
-	p.closeOutputs(closing)
+	p.retire(closing)
 }
 
 // track logs transitions only: the first failure of a device at warn level

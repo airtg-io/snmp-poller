@@ -2,13 +2,17 @@ package poller
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,10 +22,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/gosnmp/gosnmp"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
-	"github.com/airtg-io/snmp-poller/internal/output"
+	"github.com/airtg-io/snmp-poller/internal/sink"
 	"github.com/airtg-io/snmp-poller/internal/state"
 	"github.com/airtg-io/snmp-poller/internal/testagent"
 	"github.com/airtg-io/snmp-poller/internal/testconf"
@@ -36,19 +41,34 @@ func loadDiscovery(t *testing.T, store *state.Store, id string) *Discovery {
 	return disc
 }
 
-// capture is an output that records batches, for tests.
+// capture is a sink that records batches, for tests.
 type capture struct {
 	mu      sync.Mutex
-	batches []*output.Batch
+	batches []*sink.Batch
 }
 
-func (c *capture) Write(_ context.Context, b *output.Batch) error {
+func (c *capture) Write(b *sink.Batch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.batches = append(c.batches, b)
-	return nil
 }
-func (c *capture) Close() error { return nil }
+func (c *capture) Start()            {}
+func (c *capture) Stats() sink.Stats { return sink.Stats{} }
+func (c *capture) Close() error      { return nil }
+
+// testSink is the sink of test configurations: the poller gets the fakes
+// of testSinks instead.
+const testSink = `sinks: [{ id: cap, type: prometheus, url: "http://sink.invalid/api/v1/write" }]`
+
+// testSinks makes the poller use fake sinks, by id.
+func testSinks(fakes map[string]Sink) Option {
+	return WithSinkFactory(func(cfg config.Sink, _ string, _ *slog.Logger) (Sink, error) {
+		if s, ok := fakes[cfg.ID]; ok {
+			return s, nil
+		}
+		return newCounting(cfg.Headers["tag"]), nil
+	})
+}
 
 func (c *capture) count(dev string) int {
 	c.mu.Lock()
@@ -153,13 +173,13 @@ discovery:
 // basicCaps are the capabilities used by most tests.
 var basicCaps = map[string]string{"system": systemCap, "uptime": testconf.Uptime}
 
-func newDevice(t *testing.T, doc string, caps map[string]string, out output.Output) (*device, *state.Store) {
+func newDevice(t *testing.T, doc string, caps map[string]string, out Sink) (*device, *state.Store) {
 	t.Helper()
 	return deviceFrom(t, testconf.Parse(t, doc, caps), out)
 }
 
 // shippedDevice uses the capabilities shipped in etc/capabilities.d.
-func shippedDevice(t *testing.T, doc string, out output.Output) (*device, *state.Store) {
+func shippedDevice(t *testing.T, doc string, out Sink) (*device, *state.Store) {
 	t.Helper()
 	_, file, _, _ := runtime.Caller(0)
 	cfg, err := config.Parse(strings.NewReader(doc), filepath.Join(filepath.Dir(file), "..", "..", "etc"))
@@ -169,26 +189,26 @@ func shippedDevice(t *testing.T, doc string, out output.Output) (*device, *state
 	return deviceFrom(t, cfg, out)
 }
 
-func deviceFrom(t *testing.T, cfg *config.Config, out output.Output) (*device, *state.Store) {
+func deviceFrom(t *testing.T, cfg *config.Config, out Sink) (*device, *state.Store) {
 	t.Helper()
 	store, err := state.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &device{
-		spec:    cfg.DeviceSpecs()[0],
-		log:     slog.New(slog.DiscardHandler),
-		outputs: []output.Output{out},
+		spec:  cfg.DeviceSpecs()[0],
+		log:   slog.New(slog.DiscardHandler),
+		sinks: []Sink{out},
 	}, store
 }
 
-func find(b *output.Batch, metric, idx string, mode config.Mode) (output.Sample, bool) {
+func find(b *sink.Batch, metric, idx string, mode config.Mode) (sink.Sample, bool) {
 	for _, s := range b.Samples {
 		if s.Metric == metric && s.Index == idx && s.Mode == mode {
 			return s, true
 		}
 	}
-	return output.Sample{}, false
+	return sink.Sample{}, false
 }
 
 var (
@@ -606,7 +626,7 @@ devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", commu
 					{"storageFreePercent", "40", nil},
 				} {
 					s, ok := find(b, w.metric, w.idx, config.ModeRaw)
-					if ok != (w.value != nil) || (ok && (s.Value != w.value || s.Type != output.TypeFormula)) {
+					if ok != (w.value != nil) || (ok && (s.Value != w.value || s.Type != sink.TypeFormula)) {
 						t.Errorf("%s.%s = %+v (found %v), want %v", w.metric, w.idx, s, ok, w.value)
 					}
 				}
@@ -897,12 +917,12 @@ func TestRun(t *testing.T) {
 
 	cfg := testconf.Parse(t, fmt.Sprintf(`
 global: { poll_interval: 1s, stats_interval: 1s, data_dir: %s }
-outputs: [{ name: cap, type: "null" }]
+%[6]s
 devices:
   - { id: ok1, address: 127.0.0.1, port: %[2]d, snmp: { version: 2c, community: %[5]s } }
   - { id: ok2, address: 127.0.0.1, port: %[3]d, snmp: { version: 2c, community: %[5]s } }
   - { id: bad, address: 127.0.0.1, port: %[4]d, timeout: 200ms, retries: 0, snmp: { version: 2c, community: very-secret-value } }
-`, filepath.Join(dir, "data"), ports[0], ports[1], ports[2], testagent.Community), basicCaps)
+`, filepath.Join(dir, "data"), ports[0], ports[1], ports[2], testagent.Community, testSink), basicCaps)
 	var logs bytes.Buffer
 	var logMu sync.Mutex
 	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
@@ -911,7 +931,7 @@ devices:
 		return logs.Write(p)
 	}), nil))
 	out := &capture{}
-	p, err := New(cfg, log, map[string]output.Output{"cap": out})
+	p, err := New(cfg, log, testSinks(map[string]Sink{"cap": out}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -954,11 +974,7 @@ func TestRunNoDevices(t *testing.T) {
 		defer logMu.Unlock()
 		return logs.Write(p)
 	}), nil))
-	outs, err := output.Build(cfg.Outputs, log)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := New(cfg, log, outs)
+	p, err := New(cfg, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,5 +1101,104 @@ devices:
 	if _, err := d2.poll(context.Background(), store2, time.Now); err == nil ||
 		err.Error() != "vault secret snmp-poller/dev: snmp v3 requires a username" {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// TestSinks runs the poller with the shipped capabilities and both sink
+// types against fake destinations: what they receive carries the polled
+// metrics and the tags chosen from the discovery cache.
+func TestSinks(t *testing.T) {
+	type received struct {
+		mu     sync.Mutex
+		bodies []string
+	}
+	serve := func(decode func([]byte) ([]byte, error)) (*httptest.Server, *received) {
+		rec := &received{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			plain, err := decode(b)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			rec.mu.Lock()
+			rec.bodies = append(rec.bodies, string(plain))
+			rec.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(srv.Close)
+		return srv, rec
+	}
+	prom, promRec := serve(func(b []byte) ([]byte, error) { return snappy.Decode(nil, b) })
+	influx, influxRec := serve(func(b []byte) ([]byte, error) {
+		r, err := gzip.NewReader(bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		return io.ReadAll(r)
+	})
+	agent := testagent.Start(t, nil, interfacesMIB(true, true), nil)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	_, file, _, _ := runtime.Caller(0)
+	cfg, err := config.Parse(strings.NewReader(fmt.Sprintf(`
+global: { data_dir: %s, stats_interval: 1s }
+sinks:
+  - { id: prom, type: prometheus, url: "%s/api/v1/write", flush_interval: 10ms }
+  - { id: influx, type: influxdb, url: "%s", database: snmp, flush_interval: 10ms,
+      tags: [device, { host: sysName }, labels, index] }
+devices:
+  - { id: sw, address: 127.0.0.1, port: %d, poll_interval: 1s, snmp: { version: 2c, community: %s } }
+`, dataDir, prom.URL, influx.URL, agent.Port, testagent.Community)), filepath.Join(filepath.Dir(file), "..", "..", "etc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	var logMu sync.Mutex
+	log := slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logs.Write(p)
+	}), nil))
+	p, err := New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if err := p.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	all := func(rec *received) string {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return strings.Join(rec.bodies, "\n")
+	}
+	lp := all(influxRec)
+	for _, want := range []string{
+		"system,device=sw,host=sw uptime=1000i,sysUpTime=1000i ",
+		"interfaces,device=sw,host=sw,ifAlias=",
+		",ifDescr=TenGigE0/1,ifName=",
+		",index=1 ifInOctets_rate=", // second poll: rates
+		"ifOperStatus=1i",
+	} {
+		if !strings.Contains(lp, want) {
+			t.Errorf("influxdb: %q not found in:\n%s", want, lp)
+		}
+	}
+	pb := all(promRec)
+	for _, want := range []string{"snmp_uptime", "snmp_ifInOctets_rate", "ifDescr", "TenGigE0/1", "device", "index"} {
+		if !strings.Contains(pb, want) {
+			t.Errorf("prometheus: %q not found", want)
+		}
+	}
+	logMu.Lock()
+	text := logs.String()
+	logMu.Unlock()
+	if !strings.Contains(text, `msg="sink stats" sink=influx state=up`) || !strings.Contains(text, `msg="sink stats" sink=prom state=up`) {
+		t.Errorf("sink stats missing:\n%s", text)
+	}
+	if strings.Contains(text, "level=WARN") {
+		t.Errorf("warnings:\n%s", text)
 	}
 }

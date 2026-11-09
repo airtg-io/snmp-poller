@@ -17,15 +17,17 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Configuration**: YAML. Main file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
   Every `*.yaml`/`*.yml` of `global.include_dir` (default `conf.d`, i.e. `etc/conf.d`; hidden
   files, subdirs and other extensions ignored; missing = fine unless set explicitly) is read
-  after it in name order, same schema: `devices`/`outputs` concatenated (ids, endpoints,
-  output names unique across files), `logging`/`vault` in one file only, `global` main file
+  after it in name order, same schema: `devices`/`sinks` concatenated (ids, endpoints,
+  sink ids unique across files), `logging`/`vault` in one file only, `global` main file
   only. Errors name their file. Config files hold process settings, outputs, `vault` and
-  devices only: **no SNMP metric definitions** (no profiles, no inline sets, no named
+  sinks only: **no SNMP metric definitions** (no profiles, no inline sets, no named
   credentials: reuse = YAML anchors, within one file). What to poll lives in
   `global.capabilities_dir` (default `capabilities.d`; both dirs relative to the main file).
-  Old `conf_dir` and capability files found in conf.d are rejected with an explanatory error.
-- **Shipped config**: valid, polls nothing: main file with defaults only (no devices, no
-  vault), `etc/conf.d/devices.yaml.example` (not loaded; validated by a test once renamed).
+  Old `conf_dir`, `outputs` (top level and per device) and capability files found in conf.d
+  are rejected with an explanatory error.
+- **Shipped config**: valid, polls and sends nothing: main file with defaults only (no devices,
+  no sinks, no vault), `etc/conf.d/devices.yaml.example` and `sinks.yaml.example` (not
+  loaded; validated by a test once renamed).
   Test devices live in tests only. Local `etc/conf.d/*.yaml` are git-ignored.
 - **Capabilities**: one `*.yaml`/`*.yml` file per capability in capabilities_dir, named after the file.
   No `detect` = applies to every device; `detect: [oid...]` = applies when every OID subtree
@@ -56,7 +58,7 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   settings-only changes keep their poll phase and discovery cycle; rediscovery only when
   `DeviceSpec.DiscoveryKey` changes (agent, credentials, context, Vault path, capability
   fingerprints incl. include patterns). A device being polled gets its config when the poll
-  ends; replaced outputs close after the polls that may use them; removed devices' data dirs
+  ends; replaced sinks close (in the background, Run waits) after the polls that may use them; removed devices' data dirs
   are deleted; worker pool resized. The logger (`logging.Logger.Reconfigure`) is live:
   derived loggers follow. The key is always created on startup/reload (`Seal`).
 - **Shared OIDs**: an OID used by several metrics (same or different capabilities, discovery or
@@ -81,7 +83,7 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   `~~`, else it is clear text), AES-256-GCM, key `<data_dir>/key.dat` generated if missing
   (0600, kept by the data dir cleanup). Only the value bytes change (comments/layout kept,
   atomic write, verified by re-decoding); read-only file = warn and continue. `${ENV}` refs
-  are never rewritten. Vault auth secrets are encrypted the same way. `snmp-poller -encrypt`
+  are never rewritten. Vault auth secrets and sink `token`/`password` are encrypted the same way. `snmp-poller -encrypt`
   (key from `-config`'s data_dir or `-key`) encrypts a value by hand: the single argument,
   else the first line of piped stdin, else typed twice at the terminal without echo.
 - **Vault**: top-level `vault:` (address, namespace, KV mount/version, prefix, auth
@@ -91,8 +93,29 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   kept in memory only; on failure the previous credentials are kept. One login shared by all
   devices, renewed at 3/4 TTL or on 403. Hand-written HTTP client (`internal/vault`).
 - **Global config**: worker thread count (default **250**), default poll interval, default discovery interval, timeouts, retries, data dir, stats interval.
-- **Outputs**: configurable, multiple destinations, each device can target a subset (default: all).
-  Only the `null` output exists for now (discards everything). Do not write SNMP data anywhere else yet.
+- **Sinks** (`internal/sink`, config `sinks:`, device `sinks: [ids]`, default all, `[]` none):
+  optional (none = data sent nowhere, warned at startup); `null` output removed. Types:
+  `prometheus` = remote write 1.0 (hand-encoded protobuf + snappy, one TimeSeries per value,
+  name `<prefix><key>`, default prefix `snmp_`, strings skipped, labels sorted) and `influxdb`
+  = line protocol, gzip, `/api/v2/write?bucket=<database>&precision=ms` (InfluxDB 3 Core/
+  Enterprise/Cloud, also 2.x), `Authorization: Token`; measurement = table or capability (for
+  scalars), one line per row per batch (first timestamp), integers always `i`, backslashes
+  not escaped (InfluxDB's own encoder rule), trailing ones dropped. Key = metric or
+  `metric_rate`/`metric_volume`; `keys: {include, exclude}` regexes. `tags` = list of sources
+  or `{name: source}`: device, address, index, table, capability, labels (table label+labels,
+  not renamable), any discovery scalar (all values) or discovery column (rows of its
+  capability's tables, `Batch.Columns`); default `[device, index, labels]`. Validation:
+  Prometheus label names, a Prometheus name emitted by two tables, an InfluxDB tag equal to a
+  field of its measurement, `time` tag, credentials in URL. Delivery: `Write` encodes in the
+  poll worker and never blocks; per sink an intake goroutine cuts requests (`batch_size`,
+  `flush_interval`) and a sender posts them in order. FIFO = memory (32MB) + disk buffer
+  `<data_dir>/sinks/<id>/` (`disk_buffer`, default 1GB, `0`/`null` = none): disk records are
+  always older than memory ones; down or memory full = spill to disk; full = oldest segment
+  dropped. Retry (1s doubling to 30s) on network/5xx/429/401/403/404/408, drop on other 4xx.
+  Segments `<seq>.seg` (header with CRC-32C, seq, samples, kind) + `cursor` file; torn tails
+  truncated on open, corrupt records skipped. Close: `timeout` to send memory, rest to disk.
+  Queues are shared by dir (registry): a reload's new sink takes over reading. `sinks/` is
+  kept by the data dir cleanup; device id `sinks` is reserved. Per-sink stats line.
 - **SNMP**: v1, v2c, v3. v3 supports context name / context engine ID, all security levels
   (noAuthNoPriv, authNoPriv, authPriv), all auth protocols (MD5, SHA, SHA224, SHA256, SHA384, SHA512)
   and all priv protocols (DES, AES, AES192, AES256, AES192C, AES256C). UDP and TCP transports,
@@ -106,11 +129,11 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Value modes**: `raw` (value as-is), `rate` ((v2-v1)/(t2-t1), per second) and `volume` (v2-v1).
   Previous values for rate/volume are **stored on disk, not in memory**, in `data/<device_id>/state.json`, keyed by OID.
   Counter32 wraps are handled; Counter64 going backwards is treated as a reset.
-  Device dirs of the data dir are cleaned on startup (files like key.dat kept), and a device's
+  Device dirs of the data dir are cleaned on startup (files like key.dat and the `sinks` dir kept), and a device's
   state is wiped on each rediscovery.
 - **Row based polling**: tables with an inclusive regex pattern list (`include`) matched against the
   row label (a discovery column, e.g. ifName) or the row index when no label is configured.
-- **Logging**: configurable level and sinks. Default to console + file `logs/snmp-poller.log` with
+- **Logging**: configurable level, console and file. Default to console + file `logs/snmp-poller.log` with
   automatic rotation (size, backups, age, gzip) to `logs/snmp-poller-<time>.log.gz`.
   Format is always text (logfmt), not configurable (JSON was removed on purpose).
   Every timestamp is RFC 3339 with ms and an explicit zone; UTC by default, `logging.local_time: true`
@@ -145,7 +168,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   run the package (`go run ./cmd/snmp-poller` or a built binary), not `main.go` alone.
 - Config tests never read local `etc/conf.d` files: they copy the shipped files to a temp dir
   (`shippedDir`). README ```yaml blocks: `# capabilities.d/<n>.yaml` = capability,
-  `# conf.d/<n>.yaml` = include file (checked with the shipped main), else a main file.
+  `# conf.d/<n>.yaml` = include file (checked with the shipped main), `# prometheus.yml` =
+  skipped (another program's file), else a main file.
+- Sink tests decode requests with independent parsers (`protowire`, InfluxData's
+  `line-protocol/v2`), test-only dependencies; poller tests inject fake sinks with
+  `WithSinkFactory`. Running downloaded Prometheus/InfluxDB/Grafana binaries needs the
+  user's permission (auto mode blocks it).
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
 
@@ -156,10 +184,10 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - `internal/logging` - slog setup (console + rotating file), per-device level override.
 - `internal/snmp` - gosnmp wrapper (version/auth/priv mapping, chunked GET, walks, v1 error handling).
 - `internal/state` - on-disk previous-value store and delta/rate math.
-- `internal/output` - `Output` interface, registry, `null` output.
+- `internal/sink` - sinks: encoders (`encode.go`), HTTP client, FIFO and disk buffer (`queue.go`).
 - `internal/vault` - Vault KV client (login, token reuse/renewal).
 - `internal/poller` - scheduler, worker pool, discovery, polling, configuration reload, stats.
 - `internal/testagent` - in-process SNMP agent used by integration tests (v1/v2c/v3).
 - `internal/testconf` - test helper writing a config plus its capabilities.d to a temp dir.
-- `etc/snmp-poller.yaml` - main configuration; `etc/conf.d/` - config files (example only);
+- `etc/snmp-poller.yaml` - main configuration; `etc/conf.d/` - config files (examples only);
   `etc/capabilities.d/` - shipped capabilities.

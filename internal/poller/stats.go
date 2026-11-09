@@ -22,7 +22,7 @@ type stats struct {
 type counters struct {
 	ok, failed               int64
 	discoveries, discoFailed int64
-	samples, outputErrs      int64
+	samples                  int64
 	durSum, durMax           time.Duration
 }
 
@@ -42,7 +42,6 @@ func (s *stats) record(res pollResult, err error, d time.Duration) {
 			c.discoFailed++
 		}
 		c.samples += int64(res.samples)
-		c.outputErrs += int64(res.outputErrs)
 		c.durSum += d
 		c.durMax = max(c.durMax, d)
 	}
@@ -99,10 +98,25 @@ func (p *Poller) logStats(window time.Duration) {
 		"discoveries", iv.discoveries,
 		"discovery_failed", iv.discoFailed,
 		"samples", iv.samples,
-		"output_errors", iv.outputErrs,
 		"avg_duration", roundDur(avg),
 		"max_duration", roundDur(iv.durMax),
 		"total_polls_ok", tot.ok,
 		"total_polls_failed", tot.failed,
 	)
+	p.mu.Lock()
+	sinks := p.sinkList()
+	p.mu.Unlock()
+	for _, e := range sinks {
+		st := e.sink.Stats()
+		p.log.Info("sink stats",
+			"sink", e.cfg.ID,
+			"state", map[bool]string{false: "up", true: "down"}[st.Down],
+			"samples_sent", st.Sent,
+			"requests", st.Requests,
+			"failed_requests", st.Failures,
+			"samples_dropped", st.Dropped,
+			"backlog_samples", st.BacklogSamples,
+			"backlog_bytes", st.BacklogBytes,
+		)
+	}
 }

@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
-	"github.com/airtg-io/snmp-poller/internal/output"
+	"github.com/airtg-io/snmp-poller/internal/sink"
 	"github.com/airtg-io/snmp-poller/internal/testagent"
 	"github.com/airtg-io/snmp-poller/internal/testconf"
 )
@@ -62,8 +62,8 @@ func (r *reloadRig) device(id string, extra string) string {
 // write writes the main file: global settings plus the given devices.
 func (r *reloadRig) write(global string, devices ...string) {
 	r.t.Helper()
-	doc := fmt.Sprintf("global: { data_dir: %s, stats_interval: 1h%s }\noutputs: [{ name: cap, type: \"null\" }]\ndevices:\n%s",
-		r.dataDir, global, strings.Join(devices, ""))
+	doc := fmt.Sprintf("global: { data_dir: %s, stats_interval: 1h%s }\n%s\ndevices:\n%s",
+		r.dataDir, global, testSink, strings.Join(devices, ""))
 	r.writeFile("snmp-poller.yaml", doc)
 }
 
@@ -83,7 +83,7 @@ func (r *reloadRig) start() {
 		r.t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(lockedWriter{r}, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	r.p, err = New(cfg, log, map[string]output.Output{"cap": r.out})
+	r.p, err = New(cfg, log, testSinks(map[string]Sink{"cap": r.out}))
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -264,30 +264,19 @@ type counting struct {
 	closed bool
 }
 
-var (
-	countingMu   sync.Mutex
-	countingOuts []*counting
-)
+func newCounting(name string) *counting { return &counting{name: name} }
 
-func init() {
-	output.Register("counting", func(cfg config.Output, _ *slog.Logger) (output.Output, error) {
-		c := &counting{name: fmt.Sprint(cfg.Options["tag"])}
-		countingMu.Lock()
-		countingOuts = append(countingOuts, c)
-		countingMu.Unlock()
-		return c, nil
-	})
-}
-
-func (c *counting) Write(context.Context, *output.Batch) error {
+func (c *counting) Write(*sink.Batch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return fmt.Errorf("output %s written after Close", c.name)
+		panic("sink " + c.name + " written after Close")
 	}
 	c.writes++
-	return nil
 }
+
+func (c *counting) Start()            {}
+func (c *counting) Stats() sink.Stats { return sink.Stats{} }
 
 func (c *counting) Close() error {
 	c.mu.Lock()
@@ -303,30 +292,28 @@ func (c *counting) state() (int, bool) {
 }
 
 // A device being polled during a reload gets its new configuration when
-// the poll ends; outputs replaced meanwhile are closed only then.
+// the poll ends; sinks replaced meanwhile are closed only then.
 func TestReloadWhilePolling(t *testing.T) {
 	r := newReloadRig(t, "a", "b")
 	mainDoc := func(tag, interval string) string {
 		return fmt.Sprintf(`global: { data_dir: %s }
-outputs: [{ name: cap, type: "null" }, { name: x, type: counting, tag: %s }]
+sinks:
+  - { id: cap, type: prometheus, url: "http://sink.invalid/w" }
+  - { id: x, type: prometheus, url: "http://sink.invalid/w", headers: { tag: %s } }
 devices:
   - { id: a, address: 127.0.0.1, port: %d, poll_interval: %s, snmp: { version: 2c, community: c } }
   - { id: b, address: 127.0.0.1, port: %d, snmp: { version: 2c, community: c } }
 `, r.dataDir, tag, r.ports["a"], interval, r.ports["b"])
 	}
 	cfg := testconf.Parse(t, mainDoc("one", "1h"), basicCaps)
-	outs, err := output.Build(cfg.Outputs, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := New(cfg, slog.New(slog.DiscardHandler), outs)
+	p, err := New(cfg, slog.New(slog.DiscardHandler), testSinks(map[string]Sink{"cap": &capture{}}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	a, b := p.devices["a"], p.devices["b"]
 	a.next = time.Now().Add(time.Hour)
 	a.discoveredAt = time.Now()
-	oldX := outs["x"].(*counting)
+	oldX := p.sinks["x"].sink.(*counting)
 	p.dispatch(a) // a is being polled
 	if d, _ := p.queue.pop(); d != a {
 		t.Fatal("a not queued")
@@ -338,34 +325,35 @@ devices:
 	}
 	_, sum := p.apply(gen)
 	if sum.changed != 2 || sum.rediscover != 0 {
-		t.Errorf("summary = %+v, want 2 changed (new output x), none rediscovered", sum)
+		t.Errorf("summary = %+v, want 2 changed (new sink x), none rediscovered", sum)
 	}
-	newX := gen.outputs["x"].out.(*counting)
-	if a.pending == nil || a.spec.PollInterval != time.Hour || a.outputs[1] != oldX {
+	newX := gen.sinks["x"].sink.(*counting)
+	if a.pending == nil || a.spec.PollInterval != time.Hour || a.sinks[1] != oldX {
 		t.Error("a changed during its poll")
 	}
-	if b.outputs[1] != newX {
+	if b.sinks[1] != newX {
 		t.Error("idle device b not updated at once")
 	}
 	if _, closed := oldX.state(); closed {
-		t.Fatal("output closed while a poll may still use it")
+		t.Fatal("sink closed while a poll may still use it")
 	}
 	if !a.next.Before(time.Now().Add(2 * time.Second)) {
 		t.Errorf("shorter interval not applied now: next poll at %v", a.next)
 	}
 
 	p.done(a)
-	if a.pending != nil || a.spec.PollInterval != time.Second || a.outputs[1] != newX {
+	p.closing.Wait() // retired sinks close in the background
+	if a.pending != nil || a.spec.PollInterval != time.Second || a.sinks[1] != newX {
 		t.Error("pending configuration not applied when the poll ended")
 	}
 	if a.discoveredAt.IsZero() {
 		t.Error("a forgot its discovery: nothing it depends on changed")
 	}
 	if _, closed := oldX.state(); !closed {
-		t.Error("replaced output not closed after the last poll using it")
+		t.Error("replaced sink not closed after the last poll using it")
 	}
 	if _, closed := newX.state(); closed {
-		t.Error("new output closed")
+		t.Error("new sink closed")
 	}
 
 	// Removing a device being polled: its data goes when the poll ends.

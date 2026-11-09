@@ -77,7 +77,7 @@ func fingerprint(files []fileData) string {
 // agent (address, port, transport), the SNMP version, credentials and
 // context, the Vault path and the capabilities. A device whose key changes
 // must be discovered again; any other change (intervals, timeouts,
-// outputs, trace, ...) applies without discovery.
+// sinks, trace, ...) applies without discovery.
 func (s *DeviceSpec) DiscoveryKey() string {
 	h := sha256.New()
 	n := s.SNMP

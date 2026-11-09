@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/airtg-io/snmp-poller/internal/config"
 	"github.com/airtg-io/snmp-poller/internal/logging"
-	"github.com/airtg-io/snmp-poller/internal/output"
+	"github.com/airtg-io/snmp-poller/internal/sink"
 	"github.com/airtg-io/snmp-poller/internal/vault"
 )
 
@@ -20,7 +20,7 @@ import (
 // (SIGHUP). load reads and validates the configuration (config.Load).
 // logConfig applies the logging section to the process logger; nil
 // ignores it. A configuration that fails anywhere (validation, outputs,
-// Vault, logging) is not applied: the previous one stays in force.
+// Vault, sinks, logging) is not applied: the previous one stays in force.
 func (p *Poller) EnableReload(load func(path string) (*config.Config, error), logConfig func(config.Logging) error) {
 	p.load, p.logConfig = load, logConfig
 }
@@ -52,10 +52,32 @@ func Seal(cfg *config.Config, log *slog.Logger) {
 	}
 }
 
-// outputEntry is a built output and the configuration it was built from.
-type outputEntry struct {
-	cfg config.Output
-	out output.Output
+// Sink is a destination of the batches of devices: a *sink.Sink, or a
+// fake in tests.
+type Sink interface {
+	Write(b *sink.Batch)
+	Start()
+	Stats() sink.Stats
+	Close() error
+}
+
+// sinkEntry is a built sink and the configuration it was built from.
+type sinkEntry struct {
+	cfg  config.Sink
+	sink Sink
+}
+
+// openSink builds a sink and opens its disk buffer.
+func openSink(cfg config.Sink, dataDir string, log *slog.Logger) (Sink, error) {
+	s, err := sink.New(cfg, dataDir, log)
+	if err != nil {
+		return nil, fmt.Errorf("sink %q: %w", cfg.ID, err)
+	}
+	if err := s.Open(); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 // vaultEntry is the Vault client and the configuration it was built from.
@@ -64,30 +86,30 @@ type vaultEntry struct {
 	client secretReader
 }
 
-// generation is a configuration ready to be applied: its outputs and
-// Vault client are built.
+// generation is a configuration ready to be applied: its sinks and Vault
+// client are built.
 type generation struct {
-	cfg     *config.Config
-	outputs map[string]*outputEntry
-	built   []*outputEntry // built for this generation, not reused
-	vault   *vaultEntry
-	done    chan reloadSummary
+	cfg   *config.Config
+	sinks map[string]*sinkEntry
+	built []*sinkEntry // built for this generation, not reused
+	vault *vaultEntry
+	done  chan reloadSummary
 }
 
-// retirement is a set of outputs replaced by a reload, closed once every
+// retirement is a set of sinks replaced by a reload, closed once every
 // poll running at the time of the reload is done.
 type retirement struct {
-	outputs []*outputEntry
+	sinks   []*sinkEntry
 	waiting int
 }
 
 // deviceConf is what the configuration says about one device.
 type deviceConf struct {
-	spec    config.DeviceSpec
-	key     string // spec.DiscoveryKey()
-	log     *slog.Logger
-	outputs []output.Output
-	vault   secretReader
+	spec  config.DeviceSpec
+	key   string // spec.DiscoveryKey()
+	log   *slog.Logger
+	sinks []Sink
+	vault secretReader
 	// rediscover forgets the last discovery: the next poll discovers.
 	rediscover bool
 	// resetVault forgets the credentials read from Vault.
@@ -99,25 +121,25 @@ type reloadSummary struct {
 }
 
 // prepare builds what cfg needs that the running configuration does not
-// have: outputs whose configuration is new or changed, and the Vault
-// client when the vault section changed.
+// have: sinks whose configuration is new or changed, and the Vault client
+// when the vault section changed.
 func (p *Poller) prepare(cfg *config.Config) (*generation, error) {
 	p.mu.Lock()
-	current, curVault := p.outputs, p.vault
+	current, curVault := p.sinks, p.vault
 	p.mu.Unlock()
-	gen := &generation{cfg: cfg, outputs: map[string]*outputEntry{}, done: make(chan reloadSummary, 1)}
-	for _, o := range cfg.Outputs {
-		if e := current[o.Name]; e != nil && e.cfg.Type == o.Type && reflect.DeepEqual(e.cfg.Options, o.Options) {
-			gen.outputs[o.Name] = e
+	gen := &generation{cfg: cfg, sinks: map[string]*sinkEntry{}, done: make(chan reloadSummary, 1)}
+	for _, k := range cfg.Sinks {
+		if e := current[k.ID]; e != nil && e.cfg.Equal(&k) {
+			gen.sinks[k.ID] = e
 			continue
 		}
-		outs, err := output.Build([]config.Output{o}, p.log)
+		s, err := p.newSink(k, cfg.Global.DataDir, p.log)
 		if err != nil {
-			p.closeOutputs(gen.built)
+			p.closeSinks(gen.built)
 			return nil, err
 		}
-		e := &outputEntry{cfg: o, out: outs[o.Name]}
-		gen.outputs[o.Name], gen.built = e, append(gen.built, e)
+		e := &sinkEntry{cfg: k, sink: s}
+		gen.sinks[k.ID], gen.built = e, append(gen.built, e)
 	}
 	usesVault := false
 	for _, s := range cfg.DeviceSpecs() {
@@ -130,7 +152,7 @@ func (p *Poller) prepare(cfg *config.Config) (*generation, error) {
 	default:
 		c, err := vault.New(cfg.Vault)
 		if err != nil {
-			p.closeOutputs(gen.built)
+			p.closeSinks(gen.built)
 			return nil, err
 		}
 		gen.vault = &vaultEntry{cfg: cfg.Vault, client: c}
@@ -148,13 +170,16 @@ func (p *Poller) apply(gen *generation) ([]*device, reloadSummary) {
 	var sum reloadSummary
 	p.cfg, p.conf = gen.cfg.Global, gen.cfg
 
-	var retired []*outputEntry
-	for name, e := range p.outputs {
-		if gen.outputs[name] != e {
+	var retired []*sinkEntry
+	for id, e := range p.sinks {
+		if gen.sinks[id] != e {
 			retired = append(retired, e)
 		}
 	}
-	p.outputs, p.vault = gen.outputs, gen.vault
+	p.sinks, p.vault = gen.sinks, gen.vault
+	for _, e := range gen.built {
+		e.sink.Start() // takes over the disk buffer of the sink it replaces
+	}
 
 	var added []*device
 	seen := map[string]bool{}
@@ -215,13 +240,13 @@ func (p *Poller) apply(gen *generation) ([]*device, reloadSummary) {
 	p.count.Store(int64(len(p.devices)))
 
 	if len(retired) > 0 {
-		r := &retirement{outputs: retired}
+		r := &retirement{sinks: retired}
 		for _, d := range p.inflight {
 			r.waiting++
 			d.waiters = append(d.waiters, r)
 		}
 		if r.waiting == 0 {
-			defer p.closeOutputs(retired) // after unlocking
+			p.retire(retired)
 		}
 	}
 	for _, id := range gone {
@@ -255,16 +280,16 @@ func (p *Poller) applyRunning(gen *generation, pollCtx context.Context) {
 }
 
 // deviceConf builds the configuration of one device from spec, with the
-// outputs and Vault client of the generation being applied. Called with
-// p.mu held, after p.outputs and p.vault are set.
+// sinks and Vault client of the generation being applied. Called with
+// p.mu held, after p.sinks and p.vault are set.
 func (p *Poller) deviceConf(spec config.DeviceSpec) *deviceConf {
 	log := p.log.With("device", spec.ID)
 	if spec.Trace {
 		log = logging.WithMinLevel(log, slog.LevelDebug)
 	}
 	dc := &deviceConf{spec: spec, key: spec.DiscoveryKey(), log: log}
-	for _, name := range spec.Outputs {
-		dc.outputs = append(dc.outputs, p.outputs[name].out)
+	for _, id := range spec.Sinks {
+		dc.sinks = append(dc.sinks, p.sinks[id].sink)
 	}
 	if spec.VaultPath != "" && p.vault != nil {
 		dc.vault = p.vault.client
@@ -277,21 +302,35 @@ func (p *Poller) deviceConf(spec config.DeviceSpec) *deviceConf {
 func settings(dc *deviceConf) string {
 	s := dc.spec
 	str := fmt.Sprint(s.Walk, s.PollInterval, s.DiscoveryInterval, s.Timeout, s.Retries,
-		s.MaxOIDsPerRequest, s.MaxRepetitions, s.Outputs, s.Trace)
-	// Instances, not contents: a rebuilt output or Vault client is a change.
-	for _, o := range dc.outputs {
-		str += fmt.Sprintf(" %p", o)
+		s.MaxOIDsPerRequest, s.MaxRepetitions, s.Sinks, s.Trace)
+	// Instances, not contents: a rebuilt sink or Vault client is a change.
+	for _, k := range dc.sinks {
+		str += fmt.Sprintf(" %p", k)
 	}
 	return str + fmt.Sprintf(" %p", dc.vault)
 }
 
-// closeOutputs closes outputs no poll uses any more.
-func (p *Poller) closeOutputs(outs []*outputEntry) {
-	for _, e := range outs {
-		if err := e.out.Close(); err != nil {
-			p.log.Error("closing output", "output", e.cfg.Name, "err", err)
-		}
+// retire closes sinks no poll uses any more, in the background: Run waits
+// for them before returning.
+func (p *Poller) retire(sinks []*sinkEntry) {
+	if len(sinks) == 0 {
+		return
 	}
+	p.closing.Go(func() { p.closeSinks(sinks) })
+}
+
+// closeSinks closes sinks, in parallel: each may
+// take up to its timeout to send what it holds.
+func (p *Poller) closeSinks(sinks []*sinkEntry) {
+	var wg sync.WaitGroup
+	for _, e := range sinks {
+		wg.Go(func() {
+			if err := e.sink.Close(); err != nil {
+				p.log.Error("closing sink", "sink", e.cfg.ID, "err", err)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 // reloadLoop reloads the configuration on Reload, and when its files
@@ -362,14 +401,14 @@ func (p *Poller) reload(ctx context.Context, cur *config.Config, last, reason st
 	}
 	if p.logConfig != nil {
 		if err := p.logConfig(cfg.Logging); err != nil {
-			p.closeOutputs(gen.built)
+			p.closeSinks(gen.built)
 			return fail(cfg.Fingerprint(), fmt.Errorf("logging: %w", err))
 		}
 	}
 	select {
 	case p.applies <- gen:
 	case <-ctx.Done():
-		p.closeOutputs(gen.built)
+		p.closeSinks(gen.built)
 		return cur, last
 	}
 	sum := <-gen.done

@@ -68,13 +68,13 @@ type Scalar struct {
 	Unit    string   `yaml:"unit"`
 	Modes   []Mode   `yaml:"modes"`
 	// Emit false makes the scalar an input of formulas only: it is polled
-	// but not sent to outputs.
+	// but not sent to sinks.
 	Emit *bool `yaml:"emit"`
 
 	Expr *Formula `yaml:"-"` // compiled Formula
 }
 
-// Emitted reports whether the scalar's samples are sent to outputs.
+// Emitted reports whether the scalar's samples are sent to sinks.
 func (s *Scalar) Emitted() bool { return s.Emit == nil || *s.Emit }
 
 // Table is a set of columns polled for every selected row.
@@ -110,13 +110,13 @@ type Column struct {
 	Unit    string `yaml:"unit"`
 	Modes   []Mode `yaml:"modes"`
 	// Emit false makes the column an input of formulas only: it is polled
-	// but not sent to outputs.
+	// but not sent to sinks.
 	Emit *bool `yaml:"emit"`
 
 	Expr *Formula `yaml:"-"` // compiled Formula
 }
 
-// Emitted reports whether the column's samples are sent to outputs.
+// Emitted reports whether the column's samples are sent to sinks.
 func (c *Column) Emitted() bool { return c.Emit == nil || *c.Emit }
 
 // Capability is a validated, normalized capability file.
