@@ -516,6 +516,198 @@ devices:
 	}
 }
 
+// hostMIB is a host with HOST-RESOURCES-MIB: up 50 s while its agent is up
+// 10 s, 2 MiB of memory (in KiB), three storages with different allocation
+// units (one of size 0) and two processors.
+func hostMIB() *testagent.MIB {
+	vals := sysMIB("host")
+	set := func(oid string, typ gosnmp.Asn1BER, v any) { vals[oid] = testagent.Value{Type: typ, Value: v} }
+	set("1.3.6.1.2.1.25.1.1.0", gosnmp.TimeTicks, uint32(5000))
+	set("1.3.6.1.2.1.25.1.6.0", gosnmp.Gauge32, uint(42))
+	set("1.3.6.1.2.1.25.2.2.0", gosnmp.Integer, 2048)
+	for _, row := range []struct {
+		idx, descr       string
+		units, size, use int
+	}{
+		{"1", "Physical memory", 1024, 2048, 512},
+		{"31", "/", 4096, math.MaxInt32, 1000}, // 8 TiB: exact product needed
+		{"40", "/empty", 4096, 0, 0},
+	} {
+		set("1.3.6.1.2.1.25.2.3.1.2."+row.idx, gosnmp.ObjectIdentifier, "1.3.6.1.2.1.25.2.1.4")
+		set("1.3.6.1.2.1.25.2.3.1.3."+row.idx, gosnmp.OctetString, row.descr)
+		set("1.3.6.1.2.1.25.2.3.1.4."+row.idx, gosnmp.Integer, row.units)
+		set("1.3.6.1.2.1.25.2.3.1.5."+row.idx, gosnmp.Integer, row.size)
+		set("1.3.6.1.2.1.25.2.3.1.6."+row.idx, gosnmp.Integer, row.use)
+	}
+	// hrDeviceTable has more rows than hrProcessorTable.
+	set("1.3.6.1.2.1.25.3.2.1.3.196608", gosnmp.OctetString, "CPU0")
+	set("1.3.6.1.2.1.25.3.2.1.3.196609", gosnmp.OctetString, "CPU1")
+	set("1.3.6.1.2.1.25.3.2.1.3.262145", gosnmp.OctetString, "network interface lo")
+	set("1.3.6.1.2.1.25.3.3.1.2.196608", gosnmp.Integer, 10)
+	set("1.3.6.1.2.1.25.3.3.1.2.196609", gosnmp.Integer, 20)
+	return testagent.NewMIB(vals)
+}
+
+// TestShippedHostResources polls hosts with and without HOST-RESOURCES-MIB
+// using the shipped capabilities: uptime source, formulas, inputs only.
+func TestShippedHostResources(t *testing.T) {
+	for _, version := range []string{"1", "2c"} {
+		t.Run("v"+version, func(t *testing.T) {
+			t.Run("host", func(t *testing.T) {
+				agent := testagent.Start(t, nil, hostMIB(), nil)
+				out := &capture{}
+				d, store := shippedDevice(t, fmt.Sprintf(`
+devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", community: %s } }]
+`, agent.Port, version, testagent.Community), out)
+				res, err := d.poll(context.Background(), store, time.Now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.missing != 0 {
+					t.Errorf("missing oids = %d, want 0", res.missing)
+				}
+				disc := loadDiscovery(t, store, "host")
+				if got := fmt.Sprint(disc.Capabilities); got != "[host-resources interfaces system]" {
+					t.Errorf("capabilities = %s", got)
+				}
+				if got := disc.Sources["uptime"]; got != ".1.3.6.1.2.1.25.1.1.0" {
+					t.Errorf("uptime source = %q, want hrSystemUptime", got)
+				}
+				b := out.batches[0]
+				type want struct {
+					idx   string
+					value any
+					unit  string
+				}
+				for metric, w := range map[string]want{
+					"uptime":            {"", uint64(5000), "centiseconds"}, // hrSystemUptime
+					"sysUpTime":         {"", uint64(1000), "centiseconds"}, // the agent
+					"hrSystemProcesses": {"", uint64(42), "processes"},
+					"memorySize":        {"", int64(2048 * 1024), "bytes"},
+				} {
+					if s, ok := find(b, metric, w.idx, config.ModeRaw); !ok || s.Value != w.value || s.Unit != w.unit {
+						t.Errorf("%s = %+v (found %v), want %v %s", metric, s, ok, w.value, w.unit)
+					}
+				}
+				for _, w := range []struct {
+					metric, idx string
+					value       any // nil: no sample
+				}{
+					{"storageSize", "1", int64(2048 * 1024)},
+					{"storageUsed", "1", int64(512 * 1024)},
+					{"storageFree", "1", int64(1536 * 1024)},
+					{"storageUsedPercent", "1", 25.0},
+					{"storageFreePercent", "1", 75.0},
+					{"storageSize", "31", int64(math.MaxInt32) * 4096},
+					{"storageFree", "31", int64(math.MaxInt32-1000) * 4096},
+					{"storageSize", "40", int64(0)},
+					{"storageFree", "40", int64(0)},
+					{"storageUsedPercent", "40", nil}, // division by zero
+					{"storageFreePercent", "40", nil},
+				} {
+					s, ok := find(b, w.metric, w.idx, config.ModeRaw)
+					if ok != (w.value != nil) || (ok && (s.Value != w.value || s.Type != output.TypeFormula)) {
+						t.Errorf("%s.%s = %+v (found %v), want %v", w.metric, w.idx, s, ok, w.value)
+					}
+				}
+				if s, _ := find(b, "storageUsedPercent", "1", config.ModeRaw); s.Unit != "percent" ||
+					s.Labels["hrStorageDescr"] != "Physical memory" || s.Labels["hrStorageType"] != ".1.3.6.1.2.1.25.2.1.4" {
+					t.Errorf("storage sample = %+v", s)
+				}
+				// Inputs of formulas are polled but not emitted.
+				for _, m := range []string{"hrMemorySize", "hrStorageAllocationUnits", "hrStorageSize", "hrStorageUsed"} {
+					for _, s := range b.Samples {
+						if s.Metric == m {
+							t.Errorf("input %s emitted: %+v", m, s)
+						}
+					}
+				}
+				var cpus []string
+				for _, s := range b.Samples {
+					if s.Metric == "hrProcessorLoad" {
+						cpus = append(cpus, fmt.Sprintf("%s=%v%%(%s)", s.Index, s.Value, s.Labels["hrDeviceDescr"]))
+					}
+				}
+				if got := fmt.Sprint(cpus); got != "[196608=10%(CPU0) 196609=20%(CPU1)]" {
+					t.Errorf("processors = %s", got)
+				}
+			})
+			// Without HOST-RESOURCES-MIB, uptime falls back to sysUpTime.
+			t.Run("network device", func(t *testing.T) {
+				agent := testagent.Start(t, nil, testagent.NewMIB(sysMIB("sw")), nil)
+				out := &capture{}
+				d, store := shippedDevice(t, fmt.Sprintf(`
+devices: [{ id: sw, address: 127.0.0.1, port: %d, snmp: { version: "%s", community: %s } }]
+`, agent.Port, version, testagent.Community), out)
+				res, err := d.poll(context.Background(), store, time.Now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.missing != 0 {
+					t.Errorf("missing oids = %d, want 0", res.missing)
+				}
+				disc := loadDiscovery(t, store, "sw")
+				if got := fmt.Sprint(disc.Capabilities); got != "[interfaces system]" {
+					t.Errorf("capabilities = %s", got)
+				}
+				if s, ok := find(out.batches[0], "uptime", "", config.ModeRaw); !ok || s.Value != uint64(1000) {
+					t.Errorf("uptime = %+v (found %v), want sysUpTime", s, ok)
+				}
+			})
+		})
+	}
+}
+
+// TestFormulas covers formulas on walked tables, missing inputs, emit:
+// false and unit suffixes on rates, with custom capabilities.
+func TestFormulas(t *testing.T) {
+	caps := map[string]string{"f": `
+scalars:
+  - { name: up, oid: 1.3.6.1.2.1.1.3.0, unit: centiseconds, modes: [raw, rate] }
+  - { name: upSeconds, formula: "up / 100", unit: seconds }
+  - { name: gone, oid: 1.3.6.1.2.1.1.99.0, emit: false }
+  - { name: needsGone, formula: "gone + up" }
+  - { name: name, oid: 1.3.6.1.2.1.1.5.0, emit: false }
+  - { name: notNumber, formula: "name * 2" }
+tables:
+  - name: walked
+    columns:
+      - { name: v, oid: 1.3.6.1.2.1.25.2.3.1.6, emit: false }
+      - { name: double, formula: "v * 2" }
+`}
+	agent := testagent.Start(t, nil, ifMIB(), nil)
+	out := &capture{}
+	d, store := newDevice(t, fmt.Sprintf(`
+devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, community: %s } }]
+`, agent.Port, testagent.Community), caps, out)
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	for range 2 {
+		if _, err := d.poll(context.Background(), store, clk.now); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(10 * time.Second)
+	}
+	b := out.batches[1]
+	if s, ok := find(b, "upSeconds", "", config.ModeRaw); !ok || s.Value != 10.0 || s.Unit != "seconds" {
+		t.Errorf("upSeconds = %+v (found %v)", s, ok)
+	}
+	if s, ok := find(b, "up", "", config.ModeRate); !ok || s.Unit != "centiseconds/s" {
+		t.Errorf("up rate = %+v (found %v), want unit centiseconds/s", s, ok)
+	}
+	for _, m := range []string{"gone", "needsGone", "name", "notNumber", "v"} {
+		for _, s := range b.Samples {
+			if s.Metric == m {
+				t.Errorf("%s emitted: %+v", m, s)
+			}
+		}
+	}
+	for idx, want := range map[string]int64{"1.1": 20, "2.1": 40} {
+		if s, ok := find(b, "double", idx, config.ModeRaw); !ok || s.Value != want || s.Table != "walked" {
+			t.Errorf("double.%s = %+v (found %v), want %d", idx, s, ok, want)
+		}
+	}
+}
+
 // TestCapabilityDetection covers detect (present, absent at the end of the
 // MIB, absent with a following subtree) and exclude, on v1 and v2c.
 func TestCapabilityDetection(t *testing.T) {

@@ -27,14 +27,22 @@ type Sample struct {
 	Labels map[string]string
 	// Mode is raw, rate or volume.
 	Mode config.Mode
-	// Type is the SNMP type name of the polled value (e.g. Counter64).
+	// Type is the SNMP type name of the polled value (e.g. Counter64), or
+	// TypeFormula for a value computed by a formula.
 	Type string
+	// Unit is the unit configured for the metric (e.g. bytes, percent),
+	// with "/s" appended for rates; empty when not configured.
+	Unit string
 	// Value is the sample value: for raw mode an int64, uint64, float64 or
-	// string depending on the SNMP type; for rate and volume a float64.
+	// string depending on the SNMP type; for rate and volume a float64; for
+	// a formula an int64 or a float64 (see config.Formula).
 	Value any
 	// Time is when the value was received.
 	Time time.Time
 }
+
+// TypeFormula is the Type of samples computed by a formula.
+const TypeFormula = "Formula"
 
 // Batch is every sample produced by one poll of one device.
 type Batch struct {

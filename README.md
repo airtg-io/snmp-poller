@@ -79,7 +79,9 @@ Each poll:
       every listed OID subtree exists on the agent (one GETNEXT each).
    3. The discovery scalars of those capabilities are fetched (`sysDescr`, `sysObjectID`,
       `sysUpTime`, `sysContact`, `sysName`, `sysLocation` with the shipped `system`
-      capability) and their discovery columns are walked (e.g. `ifDescr`, `ifSpeed`).
+      capability) and their discovery columns are walked (e.g. `ifDescr`, `ifSpeed`). In the
+      same GET, scalars with candidate `oids` pick the first one the agent has (the shipped
+      `uptime` prefers `hrSystemUptime` to `sysUpTime`).
    4. Table rows are selected from the label column and the `include` patterns. For
       `high_capacity` tables (the shipped `interfaces`), the probe OID is fetched for the first
       row: if the agent answers, rows faster than `above` use their 64-bit `hc_oid` columns
@@ -98,6 +100,9 @@ Each poll:
    - `raw`: the value as returned (integer, unsigned, float or string).
    - `volume`: `v2 - v1`.
    - `rate`: `(v2 - v1) / (t2 - t1)`, per second.
+
+   Then [formulas](#formulas) compute their values from the values of this poll (e.g. storage
+   bytes from allocation units).
 
    Rates and volumes need the previous value, which is read from and written to
    `data/<device_id>/state.json`. The first poll after startup or discovery has no previous
@@ -314,9 +319,10 @@ Shipped in `etc/conf.d`:
 
 | Capability | Detect | Collects |
 |------------|--------|----------|
-| `system` | every device | Discovery: `sysDescr`, `sysObjectID`, `sysUpTime`, `sysContact`, `sysName`, `sysLocation` (SNMPv2-MIB system group, `1.3.6.1.2.1.1`). Polled every cycle: `sysUpTime`. |
+| `system` | every device | Discovery: `sysDescr`, `sysObjectID`, `sysUpTime`, `sysContact`, `sysName`, `sysLocation` (SNMPv2-MIB system group, `1.3.6.1.2.1.1`). Polled every cycle: `uptime`, the system uptime (HOST-RESOURCES-MIB `hrSystemUptime` when the agent has it, else `sysUpTime`), and `sysUpTime`, the agent uptime. |
 | `interfaces` | every device | IF-MIB counters, status and speed of every interface, with 64-bit ifXTable counters on interfaces faster than 100 Mbit/s when available (v2c and v3). |
 | `entity` | `entPhysicalModelName` | Discovery: ENTITY-MIB name, model and serial number of every physical entity. |
+| `host-resources` | HOST-RESOURCES-MIB (`1.3.6.1.2.1.25`) | Number of processes, memory size, size, used and free bytes and used and free percentages of every storage (RAM, swap, file systems), load of every processor. See [below](#the-host-resources-capability). |
 
 Every device gets every capability discovery finds, except those listed in its `exclude`.
 Scalar and table names must be unique across all capabilities, since several of them apply
@@ -343,7 +349,11 @@ A table can only use discovery columns of its own capability as labels.
 |-----|-------------|
 | `name` | Metric name. |
 | `oid` | Full OID, including the instance (`.0` for scalars). Leading dot optional. |
-| `modes` | List of `raw`, `rate`, `volume`. Default `[raw]`. |
+| `oids` | Instead of `oid`: candidate OIDs, in order of preference. Discovery picks the first one the agent has, and only that one is polled until the next discovery (none: the scalar is not polled). |
+| `formula` | Instead of `oid`: computes the value from scalars of the same capability defined above it. See [Formulas](#formulas). |
+| `unit` | Optional free text sent with every sample (e.g. `bytes`, `percent`). `/s` is appended for `rate`. |
+| `modes` | List of `raw`, `rate`, `volume`. Default `[raw]`. Not allowed with `formula`, always `raw`. |
+| `emit` | `false` makes the scalar an input of formulas only: polled, not sent to outputs. Default `true`. |
 
 ### Capability `tables`
 
@@ -354,7 +364,7 @@ A table can only use discovery columns of its own capability as labels.
 | `include` | Optional list of regular expressions ([RE2 syntax](https://github.com/google/re2/wiki/Syntax)). A row is polled if **any** pattern matches its label (or its index when there is no label). No patterns: every row. Use anchors (`^...$`) for exact matches. Devices can override it with their own `include`. |
 | `labels` | Optional extra discovery columns attached to each sample (e.g. `[ifName, ifAlias]`). |
 | `high_capacity` | Optional, needs a `label`: `{ probe, speed, above }`. At discovery, `probe` (a column OID) is fetched for the first row. If the agent has it, rows whose `speed` discovery column is strictly greater than `above` (default `100000000`) use the `hc_oid` of their columns. Never used over SNMPv1, which cannot carry 64-bit counters. |
-| `columns` | List of `{ name, oid, hc_oid, modes }`. `oid` is the column OID, without row index. `hc_oid` is the column used on high-capacity rows instead. A column with only `hc_oid` is polled on high-capacity rows only. |
+| `columns` | List of `{ name, oid, hc_oid, formula, unit, modes, emit }`. `oid` is the column OID, without row index. `hc_oid` is the column used on high-capacity rows instead. A column with only `hc_oid` is polled on high-capacity rows only. A column with a `formula` is computed, per row, from the columns of the same table defined above it (see [Formulas](#formulas)). `unit`, `modes` and `emit` are as for scalars. A table without `label` needs at least one column with an `oid`. |
 
 The shipped `interfaces` capability uses `high_capacity` to pick, per interface, between the
 32-bit ifTable counters and the 64-bit ifXTable counters (probing `ifHCInOctets` rather than
@@ -379,6 +389,73 @@ tables:
     columns:
       - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume] }
       - { name: ifHighSpeed, hc_oid: 1.3.6.1.2.1.31.1.1.1.15 }   # high-capacity rows only
+```
+
+### Formulas
+
+A scalar or a column with a `formula` is not polled: it is computed on every poll from other
+values, so the configuration shows every operation applied to the data. Typical uses are unit
+conversions (to bytes, to seconds) and derived values (free space, percentages).
+
+- Operators: `+`, `-`, `*`, `/`, unary `-`, parentheses, with the usual precedence. Numbers
+  are decimal (`1024`, `0.5`).
+- Names: a scalar formula reads scalars of its capability, a column formula reads columns of
+  the same row of its table, in both cases only those defined **above** it (other formulas
+  included). It reads their raw value, whatever their `modes`.
+- Arithmetic is exact (rational numbers): `hrStorageSize * hrStorageAllocationUnits` is exact
+  even for petabytes. The result is a float when the formula has a division or a decimal
+  number, otherwise an integer (a float if it does not fit in 64 bits), so a metric never
+  changes type. Samples have the type `Formula` and mode `raw`.
+- When a value it reads is missing (not returned by the agent, or not a number), or a divisor
+  is zero (a storage of size 0), the formula gives no sample on that poll (a `debug` line
+  says why).
+- `emit: false` on its inputs keeps raw values in device units out of the outputs.
+
+### The `host-resources` capability
+
+Detected on agents that implement HOST-RESOURCES-MIB (RFC 2790), mostly servers (net-snmp,
+Windows SNMP service) and some appliances. Every size is in **bytes**: the agent counts storage
+in allocation units of `hrStorageAllocationUnits` bytes and memory in KiB, so those raw values
+are inputs only, and formulas convert them:
+
+| Metric | Table | Unit | From |
+|--------|-------|------|------|
+| `hrSystemProcesses` | | processes | `hrSystemProcesses` |
+| `memorySize` | | bytes | `hrMemorySize * 1024` |
+| `storageSize` | `storage` | bytes | `hrStorageSize * hrStorageAllocationUnits` |
+| `storageUsed` | `storage` | bytes | `hrStorageUsed * hrStorageAllocationUnits` |
+| `storageFree` | `storage` | bytes | `storageSize - storageUsed` |
+| `storageUsedPercent` | `storage` | percent | `storageUsed * 100 / storageSize` |
+| `storageFreePercent` | `storage` | percent | `storageFree * 100 / storageSize` |
+| `hrProcessorLoad` | `processors` | percent | `hrProcessorLoad`: share of the last minute the processor was busy |
+
+Storage rows are labelled by `hrStorageDescr` (`Physical memory`, `Swap space`, `/var`, ...),
+which a device's `include` can filter (e.g. `include: { storage: ["^/"] }` for file systems
+only), and carry `hrStorageType` (e.g. `.1.3.6.1.2.1.25.2.1.4`, hrStorageFixedDisk).
+Processor rows carry `hrDeviceDescr`. The system uptime is the `uptime` metric of the
+`system` capability, which prefers `hrSystemUptime` to `sysUpTime`: on a host, `sysUpTime` is
+the uptime of the SNMP agent, which can restart without the system.
+
+```yaml
+# conf.d/host-resources.yaml (excerpt)
+discovery:
+  columns:
+    hrStorageDescr: 1.3.6.1.2.1.25.2.3.1.3
+scalars:
+  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: KiB, emit: false }
+  - { name: memorySize, formula: "hrMemorySize * 1024", unit: bytes }
+tables:
+  - name: storage
+    label: hrStorageDescr
+    columns:
+      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: bytes, emit: false }
+      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation units, emit: false }
+      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation units, emit: false }
+      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: bytes }
+      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: bytes }
+      - { name: storageFree, formula: "storageSize - storageUsed", unit: bytes }
+      - { name: storageUsedPercent, formula: "storageUsed * 100 / storageSize", unit: percent }
+      - { name: storageFreePercent, formula: "storageFree * 100 / storageSize", unit: percent }
 ```
 
 ### Capability examples
@@ -412,16 +489,19 @@ scalars:
 ```
 
 A table without label: columns are walked on every poll and `include` matches the row index
-(the OID suffix after the column). This suits tables whose rows change often.
+(the OID suffix after the column). This suits tables whose rows change often. Formulas work
+on walked rows too:
 
 ```yaml
-# conf.d/host.yaml
-description: HOST-RESOURCES-MIB processors and UDP listeners
-detect: [1.3.6.1.2.1.25.3.3]
+# conf.d/ucd-load.yaml
+description: UCD-SNMP-MIB load averages (net-snmp) and UDP listeners
+detect: [1.3.6.1.4.1.2021.10]
 tables:
-  - name: cpu
+  - name: load
     columns:
-      - { name: hrProcessorLoad, oid: 1.3.6.1.2.1.25.3.3.1.2 }
+      # laLoadInt is the load average times 100 (1, 5 and 15 minutes).
+      - { name: laLoadInt, oid: 1.3.6.1.4.1.2021.10.1.5, emit: false }
+      - { name: loadAverage, formula: "laLoadInt / 100" }
   - name: udpListeners
     include: ['^1\.4\.0\.0\.0\.0\.']   # IPv4 0.0.0.0 listeners only
     columns:
@@ -940,7 +1020,7 @@ Logs are meant to be read: there is no line per poll at `info` level.
 data/
   key.dat            # credentials key (32 bytes, mode 0600): back it up, never deleted
   <device_id>/
-    discovery.json   # discovery cache: capabilities, scalars, columns, selected rows
+    discovery.json   # discovery cache: capabilities, scalars, columns, selected rows, scalar sources
     state.json       # previous value and timestamp of every rate/volume OID
 ```
 
@@ -952,7 +1032,8 @@ For example, for a switch with ifXTable:
   "capabilities": ["entity", "interfaces", "system"],
   "scalars": { "sysName": "access-sw1", "sysLocation": "rack 1", "sysUpTime": "8640000", "...": "..." },
   "columns": { "ifDescr": { "1": "TenGigE0/1", "2": "GigE0/2" }, "ifSpeed": { "1": "4294967295", "2": "1000000000" } },
-  "tables": { "interfaces": { "rows": ["1", "2"], "high_capacity": true, "high_capacity_rows": ["1", "2"] } }
+  "tables": { "interfaces": { "rows": ["1", "2"], "high_capacity": true, "high_capacity_rows": ["1", "2"] } },
+  "sources": { "uptime": ".1.3.6.1.2.1.1.3.0" }
 }
 ```
 

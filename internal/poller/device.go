@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
+	"math/big"
 	"slices"
 	"sort"
 	"strconv"
@@ -30,6 +32,8 @@ type Discovery struct {
 	Columns map[string]map[string]string `json:"columns"`
 	// Tables holds the row selection of every labelled table.
 	Tables map[string]*TableDiscovery `json:"tables"`
+	// Sources maps a scalar with candidate oids to the one the agent has.
+	Sources map[string]string `json:"sources"`
 }
 
 // TableDiscovery is the row selection of one labelled table.
@@ -189,6 +193,7 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		Scalars:      map[string]string{},
 		Columns:      map[string]map[string]string{},
 		Tables:       map[string]*TableDiscovery{},
+		Sources:      map[string]string{},
 	}
 
 	// 1. Capabilities: those without detect always apply, the others when
@@ -223,17 +228,45 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 	}
 
-	// 2. Scalars, in one chunked GET.
-	oids := slices.Sorted(maps.Keys(scalars))
-	pdus, err := c.Get(oids)
+	// 2. Scalars, in one chunked GET, with the candidate oids of polled
+	// scalars.
+	get := map[string]bool{}
+	for oid := range scalars {
+		get[oid] = true
+	}
+	for _, cp := range active {
+		for _, sc := range cp.Scalars {
+			for _, oid := range sc.OIDs {
+				get[oid] = true
+			}
+		}
+	}
+	pdus, err := c.Get(slices.Sorted(maps.Keys(get)))
 	if err != nil {
 		return nil, err
 	}
+	has := map[string]bool{}
 	for _, p := range pdus {
 		if v, ok := snmp.Convert(p); ok {
+			has[p.Name] = true
 			for _, name := range scalars[p.Name] {
 				disc.Scalars[name] = v.String()
 			}
+		}
+	}
+	// The first candidate the agent has is polled until the next discovery.
+	for _, cp := range active {
+		for _, sc := range cp.Scalars {
+			if len(sc.OIDs) == 0 {
+				continue
+			}
+			for _, oid := range sc.OIDs {
+				if has[oid] {
+					disc.Sources[sc.Name] = oid
+					break
+				}
+			}
+			d.log.Debug("scalar source selected", "scalar", sc.Name, "oid", disc.Sources[sc.Name])
 		}
 	}
 
@@ -353,6 +386,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 
 	// Scalars and labelled tables: one chunked GET for everything.
 	type target struct {
+		cap    *config.Capability
 		table  *config.TableSpec
 		column *config.Column
 		scalar *config.Scalar
@@ -369,7 +403,14 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 	}
 	for _, cp := range caps {
 		for i := range cp.Scalars {
-			add(cp.Scalars[i].OID, target{scalar: &cp.Scalars[i]})
+			sc := &cp.Scalars[i]
+			oid := sc.OID
+			if len(sc.OIDs) > 0 {
+				oid = disc.Sources[sc.Name] // empty: the agent has none of them
+			}
+			if oid != "" {
+				add(oid, target{cap: cp, scalar: sc})
+			}
 		}
 		for i := range cp.Tables {
 			t := &cp.Tables[i]
@@ -390,7 +431,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 						base = col.HCOID
 					}
 					if base == "" {
-						continue // hc_oid only, on a row that is not high-capacity
+						continue // formula, or hc_oid only on a row that is not high-capacity
 					}
 					add(base+"."+idx, target{table: t, column: col, index: idx})
 				}
@@ -416,6 +457,7 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 		d.log.Debug("oids not returned by agent", "count", missing, "first", names)
 	}
 	ts := now()
+	fv := newFormulaValues(caps)
 	for _, p := range pdus {
 		v, ok := snmp.Convert(p)
 		if !ok {
@@ -423,11 +465,17 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 		}
 		for _, tg := range targets[p.Name] {
 			if tg.scalar != nil {
-				em.emit(p.Name, tg.scalar.Name, "", "", nil, tg.scalar.Modes, v, ts)
+				fv.scalar(tg.cap, tg.scalar.Name, v)
+				if tg.scalar.Emitted() {
+					em.emit(p.Name, tg.scalar.Name, "", "", nil, tg.scalar.Modes, tg.scalar.Unit, v, ts)
+				}
 				continue
 			}
-			em.emit(p.Name, tg.column.Name, tg.table.Name, tg.index, labels(tg.table, tg.index, disc),
-				tg.column.Modes, v, ts)
+			fv.column(tg.table, tg.index, tg.column.Name, v, ts)
+			if tg.column.Emitted() {
+				em.emit(p.Name, tg.column.Name, tg.table.Name, tg.index, labels(tg.table, tg.index, disc),
+					tg.column.Modes, tg.column.Unit, v, ts)
+			}
 		}
 	}
 
@@ -446,7 +494,9 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 			}
 			for j := range t.Columns {
 				col := &t.Columns[j]
-				walks[col.OID] = append(walks[col.OID], walked{table: t, column: col})
+				if col.OID != "" { // not a formula
+					walks[col.OID] = append(walks[col.OID], walked{table: t, column: col})
+				}
 			}
 		}
 	}
@@ -462,8 +512,13 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 			}
 			ts := now()
 			for _, w := range walks[root] {
-				if w.table.Selects(idx) {
-					em.emit(p.Name, w.column.Name, w.table.Name, idx, labels(w.table, idx, disc), w.column.Modes, v, ts)
+				if !w.table.Selects(idx) {
+					continue
+				}
+				fv.column(w.table, idx, w.column.Name, v, ts)
+				if w.column.Emitted() {
+					em.emit(p.Name, w.column.Name, w.table.Name, idx, labels(w.table, idx, disc),
+						w.column.Modes, w.column.Unit, v, ts)
 				}
 			}
 			return nil
@@ -473,10 +528,107 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 		}
 	}
 
+	// Formulas, once every value of the poll is known.
+	for _, cp := range caps {
+		if env := fv.scalars[cp]; env != nil {
+			for i := range cp.Scalars {
+				if sc := &cp.Scalars[i]; sc.Expr != nil {
+					em.compute(env, sc.Expr, sc.Name, "", "", nil, sc.Unit, sc.Emitted(), ts)
+				}
+			}
+		}
+		for i := range cp.Tables {
+			t := &cp.Tables[i]
+			rows := fv.rows[t]
+			for _, idx := range slices.SortedFunc(maps.Keys(rows), compareOID) {
+				r := rows[idx]
+				for j := range t.Columns {
+					if col := &t.Columns[j]; col.Expr != nil {
+						em.compute(r.vals, col.Expr, col.Name, t.Name, idx, labels(t, idx, disc), col.Unit, col.Emitted(), r.time)
+					}
+				}
+			}
+		}
+	}
+
 	if err := st.Save(); err != nil {
 		d.log.Warn("state save failed", "err", err)
 	}
 	return batch, missing, nil
+}
+
+// formulaValues collects the numeric values of one poll that formulas read:
+// scalars per capability, columns per table row. Only capabilities and
+// tables that have formulas are tracked.
+type formulaValues struct {
+	scalars map[*config.Capability]map[string]*big.Rat
+	rows    map[*config.TableSpec]map[string]*formulaRow
+}
+
+type formulaRow struct {
+	vals map[string]*big.Rat
+	time time.Time // when the last value of the row was received
+}
+
+func newFormulaValues(caps []*config.Capability) *formulaValues {
+	fv := &formulaValues{
+		scalars: map[*config.Capability]map[string]*big.Rat{},
+		rows:    map[*config.TableSpec]map[string]*formulaRow{},
+	}
+	for _, cp := range caps {
+		if cp.HasScalarFormulas() {
+			fv.scalars[cp] = map[string]*big.Rat{}
+		}
+		for i := range cp.Tables {
+			if t := &cp.Tables[i]; t.HasFormulas {
+				fv.rows[t] = map[string]*formulaRow{}
+			}
+		}
+	}
+	return fv
+}
+
+func (fv *formulaValues) scalar(cp *config.Capability, name string, v snmp.Value) {
+	if env := fv.scalars[cp]; env != nil {
+		if r, ok := ratOf(v); ok {
+			env[name] = r
+		}
+	}
+}
+
+func (fv *formulaValues) column(t *config.TableSpec, idx, name string, v snmp.Value, ts time.Time) {
+	rows := fv.rows[t]
+	if rows == nil {
+		return
+	}
+	r := rows[idx]
+	if r == nil {
+		r = &formulaRow{vals: map[string]*big.Rat{}}
+		rows[idx] = r
+	}
+	if ts.After(r.time) {
+		r.time = ts
+	}
+	if x, ok := ratOf(v); ok {
+		r.vals[name] = x
+	}
+}
+
+// ratOf converts a numeric value exactly. Strings, NaN and infinities are
+// not numbers.
+func ratOf(v snmp.Value) (*big.Rat, bool) {
+	switch v.Kind {
+	case snmp.KindCounter32, snmp.KindCounter64, snmp.KindUnsigned:
+		return new(big.Rat).SetUint64(v.Uint), true
+	case snmp.KindInteger:
+		return new(big.Rat).SetInt64(v.Int), true
+	case snmp.KindFloat:
+		if math.IsNaN(v.Float) || math.IsInf(v.Float, 0) {
+			return nil, false
+		}
+		return new(big.Rat).SetFloat64(v.Float), true
+	}
+	return nil, false
 }
 
 func labels(t *config.TableSpec, idx string, disc *Discovery) map[string]string {
@@ -512,9 +664,9 @@ type delta struct {
 // emit adds the samples of one value read from oid: one per mode. Rate and
 // volume come from the same delta.
 func (e *emitter) emit(oid, metric, table, idx string, labels map[string]string,
-	modes []config.Mode, v snmp.Value, ts time.Time,
+	modes []config.Mode, unit string, v snmp.Value, ts time.Time,
 ) {
-	sample := output.Sample{Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Time: ts}
+	sample := output.Sample{Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Unit: unit, Time: ts}
 	needDelta := false
 	for _, m := range modes {
 		if m == config.ModeRaw {
@@ -549,11 +701,35 @@ func (e *emitter) emit(oid, metric, table, idx string, labels map[string]string,
 			s.Value = vol
 		case config.ModeRate:
 			s.Value = vol / secs
+			if unit != "" {
+				s.Unit = unit + "/s"
+			}
 		default:
 			continue
 		}
 		e.batch.Samples = append(e.batch.Samples, s)
 	}
+}
+
+// compute evaluates a formula over env, the values of its scalars or row,
+// and stores the result in env for the formulas below it. A formula whose
+// inputs are missing, or that divides by zero, gives no sample.
+func (e *emitter) compute(env map[string]*big.Rat, f *config.Formula, metric, table, idx string,
+	labels map[string]string, unit string, emitted bool, ts time.Time,
+) {
+	r, err := f.Eval(func(name string) (*big.Rat, bool) { v, ok := env[name]; return v, ok })
+	if err != nil {
+		e.log.Debug("formula not computed", "metric", metric, "table", table, "index", idx, "reason", err)
+		return
+	}
+	env[metric] = r
+	if !emitted {
+		return
+	}
+	e.batch.Samples = append(e.batch.Samples, output.Sample{
+		Metric: metric, Table: table, Index: idx, Labels: labels, Mode: config.ModeRaw,
+		Type: output.TypeFormula, Unit: unit, Value: f.Value(r), Time: ts,
+	})
 }
 
 func rowCount(d *Discovery) int {
@@ -567,6 +743,16 @@ func rowCount(d *Discovery) int {
 // sortIndexes orders OID suffixes numerically, component by component.
 func sortIndexes(idx []string) {
 	sort.Slice(idx, func(i, j int) bool { return lessOID(idx[i], idx[j]) })
+}
+
+func compareOID(a, b string) int {
+	switch {
+	case lessOID(a, b):
+		return -1
+	case lessOID(b, a):
+		return 1
+	}
+	return 0
 }
 
 func lessOID(a, b string) bool {

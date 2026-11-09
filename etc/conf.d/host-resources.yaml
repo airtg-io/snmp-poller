@@ -1,0 +1,49 @@
+# Capability "host-resources": HOST-RESOURCES-MIB (1.3.6.1.2.1.25), RFC 2790:
+# processes, memory, storage (RAM, swap, file systems) and processor load of
+# servers and other hosts. Applies to devices that implement the MIB
+# (detected at discovery). Its hrSystemUptime is the preferred source of the
+# `uptime` metric of the "system" capability.
+#
+# Every size is sent in bytes: the agent counts storage in allocation units
+# (hrStorageAllocationUnits bytes each) and memory in KiB, so the raw
+# columns are inputs only (`emit: false`) and the formulas below compute the
+# bytes and percentages, per row. A formula reads the values of the same
+# poll defined above it; when one is missing, or a size is 0, it gives no
+# sample.
+description: HOST-RESOURCES-MIB processes, memory, storage and processor load
+
+detect:
+  - 1.3.6.1.2.1.25                     # host
+
+discovery:
+  columns:
+    hrStorageType:  1.3.6.1.2.1.25.2.3.1.2   # an OID, e.g. ...25.2.1.4 = hrStorageFixedDisk
+    hrStorageDescr: 1.3.6.1.2.1.25.2.3.1.3   # e.g. "Physical memory", "/var"
+    hrDeviceDescr:  1.3.6.1.2.1.25.3.2.1.3   # e.g. the processor model
+
+scalars:
+  - { name: hrSystemProcesses, oid: 1.3.6.1.2.1.25.1.6.0, unit: processes }
+  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: KiB, emit: false }
+  - { name: memorySize, formula: "hrMemorySize * 1024", unit: bytes }
+
+tables:
+  - name: storage
+    label: hrStorageDescr
+    labels: [hrStorageType]
+    columns:
+      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: bytes, emit: false }
+      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation units, emit: false }
+      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation units, emit: false }
+      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: bytes }
+      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: bytes }
+      - { name: storageFree, formula: "storageSize - storageUsed", unit: bytes }
+      - { name: storageUsedPercent, formula: "storageUsed * 100 / storageSize", unit: percent }
+      - { name: storageFreePercent, formula: "storageFree * 100 / storageSize", unit: percent }
+
+  # hrProcessorTable shares its index with hrDeviceTable. Walked on every
+  # poll: its rows are the processors only.
+  - name: processors
+    labels: [hrDeviceDescr]
+    columns:
+      # Average share of the last minute the processor was not idle.
+      - { name: hrProcessorLoad, oid: 1.3.6.1.2.1.25.3.3.1.2, unit: percent }

@@ -50,12 +50,30 @@ const (
 	ModeVolume Mode = "volume"
 )
 
-// Scalar is a single OID polled every cycle.
+// Scalar is a single value polled every cycle. Exactly one of OID, OIDs
+// and Formula is set:
+//   - OID is polled as is;
+//   - OIDs are candidates in order of preference: discovery picks the first
+//     one the agent has, and only that one is polled until the next
+//     discovery;
+//   - Formula computes the value from scalars of the same capability
+//     defined above it.
 type Scalar struct {
-	Name  string `yaml:"name"`
-	OID   string `yaml:"oid"`
-	Modes []Mode `yaml:"modes"`
+	Name    string   `yaml:"name"`
+	OID     string   `yaml:"oid"`
+	OIDs    []string `yaml:"oids"`
+	Formula string   `yaml:"formula"`
+	Unit    string   `yaml:"unit"`
+	Modes   []Mode   `yaml:"modes"`
+	// Emit false makes the scalar an input of formulas only: it is polled
+	// but not sent to outputs.
+	Emit *bool `yaml:"emit"`
+
+	Expr *Formula `yaml:"-"` // compiled Formula
 }
+
+// Emitted reports whether the scalar's samples are sent to outputs.
+func (s *Scalar) Emitted() bool { return s.Emit == nil || *s.Emit }
 
 // Table is a set of columns polled for every selected row.
 type Table struct {
@@ -79,13 +97,25 @@ type HighCapacity struct {
 }
 
 // Column is one table column polled for each selected row. A column with
-// only an hc_oid is polled on high-capacity rows only.
+// only an hc_oid is polled on high-capacity rows only. A column with a
+// Formula is not polled: it is computed, per row, from the columns of the
+// same table defined above it.
 type Column struct {
-	Name  string `yaml:"name"`
-	OID   string `yaml:"oid"`
-	HCOID string `yaml:"hc_oid"`
-	Modes []Mode `yaml:"modes"`
+	Name    string `yaml:"name"`
+	OID     string `yaml:"oid"`
+	HCOID   string `yaml:"hc_oid"`
+	Formula string `yaml:"formula"`
+	Unit    string `yaml:"unit"`
+	Modes   []Mode `yaml:"modes"`
+	// Emit false makes the column an input of formulas only: it is polled
+	// but not sent to outputs.
+	Emit *bool `yaml:"emit"`
+
+	Expr *Formula `yaml:"-"` // compiled Formula
 }
+
+// Emitted reports whether the column's samples are sent to outputs.
+func (c *Column) Emitted() bool { return c.Emit == nil || *c.Emit }
 
 // Capability is a validated, normalized capability file.
 type Capability struct {
@@ -102,6 +132,18 @@ type Capability struct {
 type TableSpec struct {
 	Table
 	IncludeRE []*regexp.Regexp
+	// HasFormulas reports whether a column has a formula.
+	HasFormulas bool
+}
+
+// HasScalarFormulas reports whether a scalar of the capability has a formula.
+func (c *Capability) HasScalarFormulas() bool {
+	for i := range c.Scalars {
+		if c.Scalars[i].Expr != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Selects reports whether a row whose match key is key must be polled.
@@ -211,10 +253,24 @@ func checkCapability(f CapabilityFile) error {
 		case scalars[sc.Name]:
 			add("duplicate scalar %q", sc.Name)
 		}
-		scalars[sc.Name] = true
-		if !oidPattern.MatchString(sc.OID) {
+		switch n := countSet(sc.OID != "", len(sc.OIDs) > 0, sc.Formula != ""); {
+		case n != 1:
+			add("scalar %q: exactly one of oid, oids and formula is required", sc.Name)
+		case sc.OID != "" && !oidPattern.MatchString(sc.OID):
 			add("scalar %q: invalid oid %q", sc.Name, sc.OID)
+		case sc.Formula != "":
+			if len(sc.Modes) > 0 {
+				add("scalar %q: modes cannot be used with formula (a formula is always raw)", sc.Name)
+			}
+			checkFormula(sc.Formula, scalars, func(err error) { add("scalar %q: %w", sc.Name, err) },
+				"is not a scalar defined above it in this capability")
 		}
+		for _, oid := range sc.OIDs {
+			if !oidPattern.MatchString(oid) {
+				add("scalar %q: oids: invalid oid %q", sc.Name, oid)
+			}
+		}
+		scalars[sc.Name] = true
 		if err := checkModes(sc.Modes); err != nil {
 			add("scalar %q: %w", sc.Name, err)
 		}
@@ -254,6 +310,7 @@ func checkCapability(f CapabilityFile) error {
 			}
 		}
 		cols := map[string]bool{}
+		polled, computed := false, false
 		for j, col := range t.Columns {
 			switch {
 			case col.Name == "":
@@ -261,10 +318,18 @@ func checkCapability(f CapabilityFile) error {
 			case cols[col.Name]:
 				add("table %q: duplicate column %q", t.Name, col.Name)
 			}
-			cols[col.Name] = true
+			polled, computed = polled || col.OID != "", computed || col.Formula != ""
 			switch {
+			case col.Formula != "" && (col.OID != "" || col.HCOID != ""):
+				add("table %q: column %q: formula cannot be used with oid or hc_oid", t.Name, col.Name)
+			case col.Formula != "":
+				if len(col.Modes) > 0 {
+					add("table %q: column %q: modes cannot be used with formula (a formula is always raw)", t.Name, col.Name)
+				}
+				checkFormula(col.Formula, cols, func(err error) { add("table %q: column %q: %w", t.Name, col.Name, err) },
+					"is not a column defined above it in this table")
 			case col.OID == "" && col.HCOID == "":
-				add("table %q: column %q: oid or hc_oid is required", t.Name, col.Name)
+				add("table %q: column %q: oid, hc_oid or formula is required", t.Name, col.Name)
 			case col.OID != "" && !oidPattern.MatchString(col.OID):
 				add("table %q: column %q: invalid oid %q", t.Name, col.Name, col.OID)
 			case col.HCOID != "" && !oidPattern.MatchString(col.HCOID):
@@ -272,12 +337,41 @@ func checkCapability(f CapabilityFile) error {
 			case col.HCOID != "" && t.HighCapacity == nil:
 				add("table %q: column %q: hc_oid requires high_capacity on the table", t.Name, col.Name)
 			}
+			cols[col.Name] = true
 			if err := checkModes(col.Modes); err != nil {
 				add("table %q: column %q: %w", t.Name, col.Name, err)
 			}
 		}
+		if t.Label == "" && computed && !polled {
+			add("table %q: a table without label is walked: at least one column needs an oid", t.Name)
+		}
 	}
 	return errors.Join(errs...)
+}
+
+func countSet(set ...bool) int {
+	n := 0
+	for _, b := range set {
+		if b {
+			n++
+		}
+	}
+	return n
+}
+
+// checkFormula compiles src and checks that it only reads known names (the
+// values defined above the formula).
+func checkFormula(src string, known map[string]bool, add func(error), unknown string) {
+	f, err := ParseFormula(src)
+	if err != nil {
+		add(err)
+		return
+	}
+	for _, r := range f.Refs() {
+		if !known[r] {
+			add(fmt.Errorf("formula %q: %q %s", src, r, unknown))
+		}
+	}
 }
 
 func normalizeCapability(name string, f CapabilityFile) *Capability {
@@ -296,7 +390,15 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 		c.Discovery.Columns[k] = normOID(v)
 	}
 	for _, sc := range f.Scalars {
-		sc.OID = normOID(sc.OID)
+		if sc.OID != "" {
+			sc.OID = normOID(sc.OID)
+		}
+		oids := make([]string, len(sc.OIDs))
+		for i, oid := range sc.OIDs {
+			oids[i] = normOID(oid)
+		}
+		sc.OIDs = oids
+		sc.Expr = mustFormula(sc.Formula)
 		sc.Modes = normModes(sc.Modes)
 		c.Scalars = append(c.Scalars, sc)
 	}
@@ -318,6 +420,8 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 			if col.HCOID != "" {
 				col.HCOID = normOID(col.HCOID)
 			}
+			col.Expr = mustFormula(col.Formula)
+			ts.HasFormulas = ts.HasFormulas || col.Expr != nil
 			col.Modes = normModes(col.Modes)
 			ts.Columns[i] = col
 		}
@@ -366,6 +470,18 @@ func checkUnique(caps []*Capability) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// mustFormula compiles an already checked formula; nil for none.
+func mustFormula(src string) *Formula {
+	if src == "" {
+		return nil
+	}
+	f, err := ParseFormula(src)
+	if err != nil {
+		panic(err) // checked by checkCapability
+	}
+	return f
 }
 
 func compile(patterns []string) []*regexp.Regexp {

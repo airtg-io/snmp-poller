@@ -24,8 +24,20 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   lists it in `exclude` (only explicit exclusion removes one). Devices may override a table's
   `include` with `include: {table: [...]}`. Names are unique across capabilities; labels must
   come from the same capability. Shipped: `system` (always; sysDescr, sysObjectID, sysUpTime,
-  sysContact, sysName, sysLocation as discovery scalars, plus sysUpTime polled every cycle),
-  `interfaces` (always), `entity` (detected).
+  sysContact, sysName, sysLocation as discovery scalars; polled: `uptime` = hrSystemUptime if
+  the agent has it, else sysUpTime (sysUpTime is the agent's uptime, not the system's), and
+  sysUpTime), `interfaces` (always), `entity` (detected), `host-resources` (detected:
+  hrSystemProcesses, memorySize, hrStorageTable size/used/free in bytes + used/free percent,
+  hrProcessorLoad).
+- **Formulas, units, fallbacks**: a scalar is exactly one of `oid`, `oids` (candidates in
+  preference order, the first the agent has is chosen at discovery, cached as `sources` in
+  discovery.json) or `formula`; a column is `oid`/`hc_oid` or `formula`. Formulas (`+ - * /`,
+  parentheses, numbers, names of values defined above: same capability for scalars, same row
+  for columns) make every computation visible in the config. Exact `big.Rat` arithmetic;
+  result float64 iff the formula has `/` or a decimal number, else int64 (type never flips);
+  missing input or division by zero = no sample. Always raw (no modes), Sample.Type `Formula`.
+  `emit: false` = input only. `unit` is passed to Sample.Unit (`/s` appended for rate). Every
+  size is sent in bytes: convert device units (KiB, allocation units) with formulas.
 - **Shared OIDs**: an OID used by several metrics (same or different capabilities, discovery or
   polling) is fetched/walked once per cycle and emitted for each. Previous values in state.json
   are keyed by OID, so rate and volume (and every metric on that OID) share one delta.
@@ -116,7 +128,7 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 ## Layout
 
 - `cmd/snmp-poller` - entry point (flags, signals).
-- `internal/config` - YAML schema, defaults, validation, `Secret`, encryption (`crypt.go`), Vault schema.
+- `internal/config` - YAML schema, defaults, validation, `Secret`, encryption (`crypt.go`), Vault schema, formulas (`formula.go`).
 - `internal/logging` - slog setup (console + rotating file), per-device level override.
 - `internal/snmp` - gosnmp wrapper (version/auth/priv mapping, chunked GET, walks, v1 error handling).
 - `internal/state` - on-disk previous-value store and delta/rate math.
