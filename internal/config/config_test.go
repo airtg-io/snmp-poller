@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,15 +17,15 @@ import (
 // uptime is a minimal capability, for tests that need one.
 const uptime = `scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]`
 
-// writeCaps creates dir/conf.d with one file per capability and returns dir.
+// writeCaps creates dir/capabilities.d with one file per capability and returns dir.
 func writeCaps(t *testing.T, caps map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "conf.d"), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, "capabilities.d"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	for name, doc := range caps {
-		if err := os.WriteFile(filepath.Join(dir, "conf.d", name), []byte(doc), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "capabilities.d", name), []byte(doc), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -93,38 +94,105 @@ func TestDefaults(t *testing.T) {
 	if sc := s.Capabilities[0].Scalars[0]; sc.OID != ".1.3.6.1.2.1.1.3.0" || sc.Modes[0] != ModeRaw {
 		t.Errorf("scalar not normalized: %+v", sc)
 	}
-	if filepath.Base(g.ConfDir) != "conf.d" || !filepath.IsAbs(g.ConfDir) {
-		t.Errorf("conf_dir = %q, want <base dir>/conf.d", g.ConfDir)
+	if filepath.Base(g.CapabilitiesDir) != "capabilities.d" || !filepath.IsAbs(g.CapabilitiesDir) {
+		t.Errorf("capabilities_dir = %q, want <base dir>/capabilities.d", g.CapabilitiesDir)
+	}
+	if filepath.Base(g.IncludeDir) != "conf.d" || !filepath.IsAbs(g.IncludeDir) {
+		t.Errorf("include_dir = %q, want <base dir>/conf.d", g.IncludeDir)
 	}
 	if len(s.Outputs) != 1 || s.Outputs[0] != "null" {
 		t.Errorf("device outputs = %v", s.Outputs)
 	}
 }
 
-// The shipped configuration is a template: running the poller with it
-// encrypts its example credentials with a local key, which must not be
-// committed (nobody else has that key).
-func TestDefaultConfigFileNotSealed(t *testing.T) {
-	data, err := os.ReadFile(repoPath(DefaultPath))
-	if err != nil {
-		t.Fatal(err)
+// shippedFiles returns the configuration files shipped in etc/ (the main
+// file and the examples of etc/conf.d), not local files that are ignored
+// by git, such as etc/conf.d/*.yaml.
+func shippedFiles(t *testing.T) []string {
+	t.Helper()
+	examples, err := filepath.Glob(repoPath("etc", "conf.d", "*.example"))
+	if err != nil || len(examples) == 0 {
+		t.Fatalf("no example in etc/conf.d (%v)", err)
 	}
-	for i, line := range strings.Split(string(data), "\n") {
-		if encrypted := regexp.MustCompile(`~~(?:[0-9A-Fa-f]{2})+~~`).FindString(line); encrypted != "" {
-			t.Errorf("%s:%d holds an encrypted credential: the poller was run with the shipped file, "+
-				"which encrypted it with a local key. Put the clear example value back "+
-				"(git checkout %s) and run with a copy (-config).", DefaultPath, i+1, DefaultPath)
+	return append([]string{repoPath(DefaultPath)}, examples...)
+}
+
+// shippedDir copies the shipped main configuration and capabilities to a
+// temporary directory, with the given files in its conf.d (name ->
+// content), and returns the path of the main file. Local files of
+// etc/conf.d are never read.
+func shippedDir(t *testing.T, include map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	copyFile := func(src, dst string) {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	main := filepath.Join(dir, "snmp-poller.yaml")
+	copyFile(repoPath(DefaultPath), main)
+	for _, d := range []string{"capabilities.d", "conf.d"} {
+		if err := os.Mkdir(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	caps, err := filepath.Glob(repoPath("etc", "capabilities.d", "*.yaml"))
+	if err != nil || len(caps) == 0 {
+		t.Fatalf("no shipped capability (%v)", err)
+	}
+	for _, c := range caps {
+		copyFile(c, filepath.Join(dir, "capabilities.d", filepath.Base(c)))
+	}
+	for name, doc := range include {
+		if err := os.WriteFile(filepath.Join(dir, "conf.d", name), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return main
+}
+
+// The shipped configuration is a template: running the poller with it
+// encrypts the credentials of its examples with a local key, which must
+// not be committed (nobody else has that key).
+func TestDefaultConfigFileNotSealed(t *testing.T) {
+	for _, file := range shippedFiles(t) {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(data), "\n") {
+			if encrypted := regexp.MustCompile(`~~(?:[0-9A-Fa-f]{2})+~~`).FindString(line); encrypted != "" {
+				t.Errorf("%s:%d holds an encrypted credential: the poller was run with the shipped file, "+
+					"which encrypted it with a local key. Put the clear example value back "+
+					"(git checkout %s) and run with a copy (-config).", file, i+1, file)
+			}
 		}
 	}
 }
 
+// The shipped main file is valid on its own and configures no device:
+// devices go in files of etc/conf.d.
 func TestDefaultConfigFileIsValid(t *testing.T) {
-	c, err := Load(repoPath(DefaultPath))
+	data, err := os.ReadFile(repoPath(DefaultPath))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Global.ConfDir != repoPath("etc", "conf.d") {
-		t.Errorf("conf_dir = %q, want it relative to the config file", c.Global.ConfDir)
+	if strings.Contains(string(data), "\ndevices:") || strings.Contains(string(data), "\nvault:") {
+		t.Errorf("%s configures devices or vault: they belong in etc/conf.d", DefaultPath)
+	}
+	c, err := Load(shippedDir(t, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Devices) != 0 || c.Vault != nil || len(c.Files()) != 1 {
+		t.Errorf("devices = %d, vault = %v, files = %v: want none, nil, the main file", len(c.Devices), c.Vault, c.Files())
+	}
+	if filepath.Base(c.Global.CapabilitiesDir) != "capabilities.d" || filepath.Base(c.Global.IncludeDir) != "conf.d" {
+		t.Errorf("capabilities_dir = %q, include_dir = %q", c.Global.CapabilitiesDir, c.Global.IncludeDir)
 	}
 	caps := map[string]*Capability{}
 	for _, cp := range c.Capabilities() {
@@ -155,9 +223,42 @@ func TestDefaultConfigFileIsValid(t *testing.T) {
 	}
 }
 
+// The examples of etc/conf.d are valid once copied to a *.yaml file.
+func TestDefaultConfigExamples(t *testing.T) {
+	t.Setenv("SNMP_AUTH_PASS", "auth-pass-123")
+	t.Setenv("SNMP_PRIV_PASS", "priv-pass-123")
+	include := map[string]string{}
+	for _, f := range shippedFiles(t)[1:] {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		include[strings.TrimSuffix(filepath.Base(f), ".example")] = string(data)
+	}
+	c, err := Load(shippedDir(t, include))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, s := range c.DeviceSpecs() {
+		got = append(got, s.ID+" "+s.SNMP.Version)
+	}
+	if want := []string{"192.0.2.10-161 2c", "core-1 3"}; !slices.Equal(got, want) {
+		t.Errorf("devices = %q, want %q", got, want)
+	}
+}
+
+// readmeBase returns a directory holding a copy of the shipped capabilities
+// (capabilities.d), to check README examples without local files.
+func readmeBase(t *testing.T) string {
+	return filepath.Dir(shippedDir(t, nil))
+}
+
 // Every ```yaml block of the README must be valid. A block whose first line
-// is "# conf.d/<name>.yaml" is a capability file; any other block is a
-// complete main configuration, checked against the shipped etc/conf.d.
+// is "# capabilities.d/<name>.yaml" is a capability file; one whose first
+// line is "# conf.d/<name>.yaml" is a file of the include directory, checked
+// with the shipped main file; any other block is a complete main
+// configuration. All are checked against the shipped capabilities.
 func TestReadmeExamplesAreValid(t *testing.T) {
 	data, err := os.ReadFile(repoPath("README.md"))
 	if err != nil {
@@ -172,12 +273,12 @@ func TestReadmeExamplesAreValid(t *testing.T) {
 	if len(blocks) < 2 {
 		t.Fatal("no yaml examples found in README.md")
 	}
-	var caps, mains int
+	var caps, includes, mains int
 	for i, b := range blocks[1:] {
 		doc, _, _ := strings.Cut(b, "```")
 		first, _, _ := strings.Cut(doc, "\n")
 		t.Run(fmt.Sprintf("example-%d", i+1), func(t *testing.T) {
-			if file, ok := strings.CutPrefix(first, "# conf.d/"); ok {
+			if file, ok := strings.CutPrefix(first, "# capabilities.d/"); ok {
 				file, _, _ = strings.Cut(file, " ")
 				caps++
 				name := strings.TrimSuffix(file, ".yaml")
@@ -186,14 +287,22 @@ func TestReadmeExamplesAreValid(t *testing.T) {
 				}
 				return
 			}
+			if file, ok := strings.CutPrefix(first, "# conf.d/"); ok {
+				file, _, _ = strings.Cut(file, " ")
+				includes++
+				if _, err := Load(shippedDir(t, map[string]string{file: doc})); err != nil {
+					t.Errorf("%v\n---\n%s", err, doc)
+				}
+				return
+			}
 			mains++
-			if _, err := Parse(strings.NewReader(doc), repoPath("etc")); err != nil {
+			if _, err := Parse(strings.NewReader(doc), readmeBase(t)); err != nil {
 				t.Errorf("%v\n---\n%s", err, doc)
 			}
 		})
 	}
-	if caps == 0 || mains == 0 {
-		t.Errorf("found %d capability and %d main examples, want both", caps, mains)
+	if caps == 0 || includes == 0 || mains == 0 {
+		t.Errorf("found %d capability, %d conf.d and %d main examples, want all three", caps, includes, mains)
 	}
 }
 
@@ -333,7 +442,7 @@ func TestValidationErrors(t *testing.T) {
 		{`logging: { level: verbose }`, "logging.level"},
 		{`bogus: 1`, "field bogus not found"},
 		{`profiles: {}`, "field profiles not found"},
-		{`global: { conf_dir: nope }`, "capabilities: open"},
+		{`global: { capabilities_dir: nope }`, "capabilities: open"},
 		{`devices: [{ id: "bad id", address: x }]`, "id may only contain"},
 		{`devices: [{ id: key.dat, address: x }]`, "is reserved"},
 		{`devices: [{ id: d, snmp: { version: 2c, community: c } }]`, "devices[0]: address is required"},
@@ -553,5 +662,174 @@ devices:
 	_, err := parse(t, `devices: [{ id: d, address: x, snmp: { version: 3, username: u, auth_protocol: MD5, auth_password: leak } }]`)
 	if err == nil || strings.Contains(err.Error(), "leak") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// writeConfig writes a main file and its conf.d files (name -> content)
+// next to a capabilities.d holding the uptime capability, and returns the
+// path of the main file.
+func writeConfig(t *testing.T, main string, include map[string]string) string {
+	t.Helper()
+	dir := writeCaps(t, map[string]string{"uptime.yaml": uptime})
+	if include != nil {
+		if err := os.Mkdir(filepath.Join(dir, "conf.d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, doc := range include {
+		if err := os.WriteFile(filepath.Join(dir, "conf.d", name), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, "snmp-poller.yaml")
+	if err := os.WriteFile(path, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestIncludeDir(t *testing.T) {
+	t.Setenv("SNMP_COMMUNITY", "from-env")
+	path := writeConfig(t, `
+global: { poll_interval: 30s }
+outputs: [{ name: main, type: "null" }]
+devices:
+  - { id: from-main, address: 192.0.2.1, snmp: { version: 2c, community: c } }
+`, map[string]string{
+		"20-devices.yaml": `
+devices:
+  - address: 192.0.2.10
+    snmp: { version: 2c, community: public }
+  - id: legacy-ups
+    address: 192.0.2.11
+    port: 1161
+    transport: tcp
+    outputs: [extra]
+    snmp: { version: 1, community: "${SNMP_COMMUNITY}" }
+  - id: core-1
+    address: 192.0.2.12
+    walk: getnext
+    poll_interval: 10s
+    snmp:
+      version: 3
+      username: poller
+      security_level: authPriv
+      auth_protocol: SHA256
+      auth_password: change-me-auth
+      priv_protocol: AES
+`,
+		"10-vault.yml": `
+vault:
+  address: https://vault.example.net:8200
+  auth: { method: approle, role_id: snmp-poller, secret_id: change-me }
+devices:
+  - { id: edge-1, address: 192.0.2.13, snmp: { vault: true } }
+  - { id: edge-2, address: 192.0.2.14, snmp: { vault: network/edge-v3 } }
+`,
+		"30-outputs.yaml":   `outputs: [{ name: extra, type: "null" }]`,
+		"40-logging.yaml":   `logging: { level: debug }`,
+		"50-empty.yaml":     "# nothing yet\n",
+		"devices.yaml.bak":  "not: yaml: [",                       // not *.yaml: ignored
+		".#lock.yaml":       "not: yaml: [",                       // hidden: ignored
+		"devices.yaml.orig": `devices: [{ address: 192.0.2.99 }]`, // ignored
+	})
+	if err := os.Mkdir(filepath.Join(filepath.Dir(path), "conf.d", "sub.yaml"), 0o755); err != nil {
+		t.Fatal(err) // a directory: ignored
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(path)
+	wantFiles := []string{path, filepath.Join(dir, "conf.d", "10-vault.yml"), filepath.Join(dir, "conf.d", "20-devices.yaml"),
+		filepath.Join(dir, "conf.d", "30-outputs.yaml"), filepath.Join(dir, "conf.d", "40-logging.yaml"),
+		filepath.Join(dir, "conf.d", "50-empty.yaml")}
+	if !slices.Equal(c.Files(), wantFiles) {
+		t.Errorf("files = %q\nwant %q", c.Files(), wantFiles)
+	}
+	// Main file first, then the files in name order.
+	var got []string
+	for _, s := range c.DeviceSpecs() {
+		got = append(got, fmt.Sprintf("%s %s %s %s %v %s %v", s.ID, s.SNMP.Version, s.Transport, s.Walk,
+			s.PollInterval, s.VaultPath, s.Outputs))
+	}
+	want := []string{
+		"from-main 2c udp bulk 30s  [main extra]",
+		"edge-1  udp bulk 30s snmp-poller/edge-1 [main extra]",
+		"edge-2  udp bulk 30s network/edge-v3 [main extra]",
+		"192.0.2.10-161 2c udp bulk 30s  [main extra]",
+		"legacy-ups 1 tcp getnext 30s  [extra]",
+		"core-1 3 udp getnext 10s  [main extra]",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("devices:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if s := c.DeviceSpecs()[5].SNMP; s.SecurityLevel != AuthPriv || s.PrivPassword.Reveal() != "change-me-auth" {
+		t.Errorf("core-1 snmp = %+v", s)
+	}
+	if v := c.DeviceSpecs()[4].SNMP.Community.Reveal(); v != "from-env" {
+		t.Errorf("legacy-ups community = %q", v)
+	}
+	if a := c.Vault.Auth; a.Method != VaultAppRole || a.SecretID.Reveal() != "change-me" {
+		t.Errorf("vault auth = %+v", a)
+	}
+	if c.Logging.Level != "debug" || !*c.Logging.Console.Enabled {
+		t.Errorf("logging = %+v", c.Logging)
+	}
+
+	// No include directory: only the main file (the default is optional).
+	c = mustParse(t, minimalDevice)
+	if len(c.Files()) != 0 || len(c.DeviceSpecs()) != 1 {
+		t.Errorf("files = %v, devices = %d", c.Files(), len(c.DeviceSpecs()))
+	}
+}
+
+func TestIncludeDirErrors(t *testing.T) {
+	dev := func(id, addr string) string {
+		return "devices: [{ id: " + id + ", address: " + addr + ", snmp: { version: 2c, community: c } }]\n"
+	}
+	for _, tc := range []struct {
+		name    string
+		main    string
+		include map[string]string
+		want    []string
+	}{
+		{"global in an included file", "", map[string]string{"a.yaml": "global: { threads: 2 }"},
+			[]string{"conf.d/a.yaml: line 1: global is only allowed in the main configuration file"}},
+		{"logging twice", "logging: { level: debug }", map[string]string{"a.yaml": "logging: { level: warn }"},
+			[]string{"conf.d/a.yaml: logging is already defined in ", "snmp-poller.yaml"}},
+		{"vault twice", "", map[string]string{
+			"a.yaml": "vault: { address: https://v:8200, auth: { method: token, token: t } }",
+			"b.yaml": "vault: { address: https://v:8200, auth: { method: token, token: t } }"},
+			[]string{"conf.d/b.yaml: vault is already defined in ", "conf.d/a.yaml"}},
+		{"duplicate id across files", dev("r1", "192.0.2.1"), map[string]string{"a.yaml": dev("r1", "192.0.2.2")},
+			[]string{`conf.d/a.yaml: device "r1": duplicate id (also `, `snmp-poller.yaml devices[0])`}},
+		{"duplicate address across files", "", map[string]string{"a.yaml": dev("r1", "192.0.2.1"), "b.yaml": dev("r2", "192.0.2.1")},
+			[]string{`conf.d/b.yaml: device "r2": address 192.0.2.1 port 161 is already used by device "r1"`}},
+		{"device error names its file", "", map[string]string{"a.yaml": "devices: [{ id: d }]"},
+			[]string{"conf.d/a.yaml: devices[0]: address is required"}},
+		{"duplicate output across files", "outputs: [{ name: o, type: \"null\" }]", map[string]string{"a.yaml": "outputs: [{ name: o, type: \"null\" }]"},
+			[]string{`conf.d/a.yaml: outputs[0]: duplicate name "o" (also in `, "snmp-poller.yaml)"}},
+		{"unknown key names its file and line", "", map[string]string{"a.yaml": "devices: []\ndevice: []"},
+			[]string{"conf.d/a.yaml: yaml: unmarshal errors:", "line 2: field device not found"}},
+		{"capability in conf.d", "", map[string]string{"system.yaml": uptime},
+			[]string{"conf.d/system.yaml: this is a capability, not a configuration file"}},
+		{"conf_dir renamed", "global: { conf_dir: conf.d }", nil,
+			[]string{"snmp-poller.yaml: line 1: global.conf_dir was renamed global.capabilities_dir"}},
+		{"explicit include_dir missing", "global: { include_dir: nope }", nil,
+			[]string{"snmp-poller.yaml: global.include_dir: open ", "nope: no such file or directory"}},
+		{"same directories", "global: { include_dir: capabilities.d }", nil,
+			[]string{"global.include_dir and global.capabilities_dir must be different directories"}},
+		{"several errors at once", "", map[string]string{"a.yaml": "devices: [{ id: d }]", "b.yaml": "global: {}"},
+			[]string{"conf.d/b.yaml: line 1: global is only allowed"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tc.main, tc.include))
+			for _, w := range tc.want {
+				if err == nil || !strings.Contains(filepath.ToSlash(err.Error()), w) {
+					t.Errorf("err = %v, want %q", err, w)
+				}
+			}
+		})
 	}
 }

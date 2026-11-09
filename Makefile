@@ -42,7 +42,7 @@ $(PLATFORMS):
 		$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(call out,$@) $(PKG)
 	@echo "built $(call out,$@)"
 
-# One archive per platform: the binary, etc/ (configuration and conf.d),
+# One archive per platform: the binary, etc/ (configuration, conf.d, capabilities.d),
 # README.md and LICENSE, in a snmp-poller-<version>-<os>-<arch> directory;
 # .zip for Windows, .tar.gz otherwise. Files come from the git commit, not
 # the working tree, so local edits or encrypted credentials never ship.

@@ -108,3 +108,74 @@ func TestTimestampsCarryZone(t *testing.T) {
 		}
 	}
 }
+
+// Reconfigure applies to loggers derived before it (devices keep theirs),
+// keeps the log file when its settings are unchanged, switches it
+// otherwise, and leaves everything as is on error.
+func TestReconfigure(t *testing.T) {
+	dir := t.TempDir()
+	first, second := filepath.Join(dir, "a.log"), filepath.Join(dir, "b.log")
+	var console bytes.Buffer
+	l, err := New(cfg(t, `logging: { level: info, file: { path: `+first+` } }`), &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	dev := l.With("device", "r1").WithGroup("g")
+	traced := WithMinLevel(l.With("device", "r2"), slog.LevelDebug)
+	dev.Debug("hidden-1")
+	file := l.cur.Load().file
+
+	// Level only: same file, derived loggers follow.
+	if err := l.Reconfigure(cfg(t, `logging: { level: debug, file: { path: `+first+` } }`)); err != nil {
+		t.Fatal(err)
+	}
+	if l.cur.Load().file != file {
+		t.Error("log file reopened for a level change")
+	}
+	dev.Debug("shown-1", "k", "v")
+
+	// Another file, warn level: the trace override still logs debug.
+	if err := l.Reconfigure(cfg(t, `logging: { level: warn, file: { path: `+second+` } }`)); err != nil {
+		t.Fatal(err)
+	}
+	dev.Info("hidden-2")
+	traced.Debug("traced-2")
+	dev.Warn("shown-2")
+
+	// An unwritable file: error, previous configuration kept.
+	blocker := filepath.Join(dir, "blocker")
+	os.WriteFile(blocker, nil, 0o644)
+	if err := l.Reconfigure(cfg(t, `logging: { level: debug, file: { path: `+filepath.Join(blocker, "x.log")+` } }`)); err == nil {
+		t.Error("expected an error for an unwritable log file")
+	}
+	dev.Info("hidden-3")
+	dev.Warn("shown-3")
+	l.Close()
+
+	a, _ := os.ReadFile(first)
+	b, _ := os.ReadFile(second)
+	if !strings.Contains(string(a), "msg=shown-1 device=r1 g.k=v") || strings.Contains(string(a), "shown-2") {
+		t.Errorf("%s = %q", first, a)
+	}
+	for _, w := range []string{"msg=shown-2 device=r1", "msg=traced-2 device=r2", "msg=shown-3"} {
+		if !strings.Contains(string(b), w) {
+			t.Errorf("%s: missing %q in %q", second, w, b)
+		}
+	}
+	all := console.String() + string(a) + string(b)
+	for _, h := range []string{"hidden-1", "hidden-2", "hidden-3"} {
+		if strings.Contains(all, h) {
+			t.Errorf("%s logged", h)
+		}
+	}
+	// A record for a closed file (a race with Reconfigure) is dropped.
+	f, _ := openFile(cfg(t, `logging: { file: { path: `+filepath.Join(dir, "c.log")+` } }`))
+	f.Close()
+	if n, err := f.Write([]byte("late\n")); err != nil || n != 5 {
+		t.Errorf("write after close = %d, %v", n, err)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "c.log")); len(data) != 0 {
+		t.Errorf("closed file written: %q", data)
+	}
+}

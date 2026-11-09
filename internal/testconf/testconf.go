@@ -14,12 +14,12 @@ import (
 // Uptime is a capability polling sysUpTime, for tests that need any metric.
 const Uptime = `scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]`
 
-// Write creates dir/conf.d with one file per capability (name -> YAML) and
+// Write creates dir/capabilities.d with one file per capability (name -> YAML) and
 // returns dir, to be passed to config.Parse as the base directory.
 func Write(t testing.TB, caps map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
-	conf := filepath.Join(dir, "conf.d")
+	conf := filepath.Join(dir, "capabilities.d")
 	if err := os.Mkdir(conf, 0o755); err != nil {
 		t.Fatal(err)
 	}

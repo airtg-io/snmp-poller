@@ -81,8 +81,12 @@ func (c *Config) Capabilities() []*Capability { return c.capabilities }
 
 func (c *Config) validate() error {
 	var errs []error
-	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	// in returns a function adding an error of file.
+	in := func(file string) func(format string, a ...any) {
+		return func(format string, a ...any) { errs = append(errs, inFile(file, fmt.Errorf(format, a...))) }
+	}
 
+	add := in(c.files[0].path)
 	g := c.Global
 	if g.Threads < 1 {
 		add("global.threads must be >= 1")
@@ -112,6 +116,7 @@ func (c *Config) validate() error {
 		add("global.%w", err)
 	}
 
+	add = in(c.loggingFile)
 	switch strings.ToLower(c.Logging.Level) {
 	case "debug", "info", "warn", "warning", "error":
 	default:
@@ -121,17 +126,18 @@ func (c *Config) validate() error {
 		add("logging.file.max_size_mb must be >= 1")
 	}
 
-	outputs := map[string]bool{}
-	for i, o := range c.Outputs {
-		switch {
+	outputs := map[string]string{} // name -> file defining it
+	for _, o := range c.Outputs {
+		add = in(o.file)
+		switch prev, dup := outputs[o.Name]; {
 		case o.Name == "":
-			add("outputs[%d]: name is required", i)
-		case outputs[o.Name]:
-			add("outputs[%d]: duplicate name %q", i, o.Name)
+			add("outputs[%d]: name is required", o.index)
+		case dup:
+			add("outputs[%d]: duplicate name %q (also in %s)", o.index, o.Name, nameOf(prev))
 		case o.Type == "":
 			add("output %q: type is required", o.Name)
 		}
-		outputs[o.Name] = true
+		outputs[o.Name] = o.file
 	}
 
 	// Credentials are validated where they are used (see resolve and
@@ -144,14 +150,15 @@ func (c *Config) validate() error {
 	}
 	if c.Vault != nil {
 		if err := c.Vault.validate(usesVault); err != nil {
-			errs = append(errs, err)
+			errs = append(errs, inFile(c.vaultFile, err))
 		}
 	}
 
 	ids := map[string]string{}       // id -> label of the device using it
 	endpoints := map[string]string{} // address/port -> id
 	for i, d := range c.Devices {
-		label := fmt.Sprintf("devices[%d]", i)
+		add = in(d.file)
+		label := fmt.Sprintf("devices[%d]", d.index)
 		if d.Address == "" {
 			add("%s: address is required", label)
 			continue
@@ -172,7 +179,10 @@ func (c *Config) validate() error {
 			add("%s: duplicate id (also %s)", label, ids[d.ID])
 			continue
 		}
-		ids[d.ID] = fmt.Sprintf("devices[%d]", i)
+		ids[d.ID] = fmt.Sprintf("devices[%d]", d.index)
+		if d.file != "" {
+			ids[d.ID] = d.file + " " + ids[d.ID]
+		}
 		// The same agent may only be polled twice for two SNMPv3 contexts.
 		ep := endpoint(d.Address, port)
 		if d.SNMP != nil {
@@ -219,7 +229,7 @@ func endpoint(address string, port uint16) string {
 	return net.JoinHostPort(a, strconv.Itoa(int(port)))
 }
 
-func (c *Config) resolve(d Device, outputs map[string]bool) (DeviceSpec, error) {
+func (c *Config) resolve(d Device, outputs map[string]string) (DeviceSpec, error) {
 	g := c.Global
 	s := DeviceSpec{
 		ID:                d.ID,
@@ -279,7 +289,7 @@ func (c *Config) resolve(d Device, outputs map[string]bool) (DeviceSpec, error) 
 		}
 	}
 	for _, o := range d.Outputs {
-		if !outputs[o] {
+		if _, ok := outputs[o]; !ok {
 			return s, fmt.Errorf("unknown output %q", o)
 		}
 		s.Outputs = append(s.Outputs, o)

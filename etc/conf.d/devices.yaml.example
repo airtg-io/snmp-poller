@@ -1,0 +1,29 @@
+# Example devices. This file is not read (only *.yaml and *.yml files of
+# etc/conf.d are): copy it to a name ending in .yaml, e.g. devices.yaml, and
+# edit it. Every option is documented in README.md.
+#
+# Clear-text credentials are encrypted in place on startup: the value
+# becomes ~~HEX~~ (AES-256-GCM) with the key data/key.dat, generated on
+# first start. Back that key up: encrypted values cannot be read without it.
+# ${ENV_VAR} references are read from the environment and left as is.
+
+devices:
+  # SNMPv2c. No id: it defaults to <address>-<port>, here "192.0.2.10-161".
+  - address: 192.0.2.10
+    snmp:
+      version: 2c
+      community: public              # encrypted on startup
+
+  # SNMPv3 authPriv. Every capability of etc/capabilities.d
+  # found on the device is polled, except those listed in exclude.
+  - id: core-1
+    address: 192.0.2.12
+    snmp:
+      version: 3
+      username: poller
+      security_level: authPriv       # noAuthNoPriv, authNoPriv or authPriv
+      auth_protocol: SHA256          # MD5, SHA, SHA224, SHA256, SHA384, SHA512
+      auth_password: ${SNMP_AUTH_PASS}
+      priv_protocol: AES             # DES, AES, AES192, AES256, AES192C, AES256C
+      priv_password: ${SNMP_PRIV_PASS}  # defaults to auth_password
+    # exclude: [interfaces]

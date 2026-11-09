@@ -116,8 +116,9 @@ func newGCM(key []byte) cipher.AEAD {
 	return gcm
 }
 
-// secrets returns every secret of the configuration file, with its location
-// for error messages, including those of disabled devices.
+// secrets returns every secret of one decoded configuration file, with its
+// location in that file for error messages, including those of disabled
+// devices.
 func (c *Config) secrets() []namedSecret {
 	var out []namedSecret
 	add := func(name string, s *Secret) {
@@ -163,9 +164,11 @@ func (c *Config) resolveSecrets() error {
 		return k, err
 	}
 	var errs []error
-	for _, s := range c.secrets() {
-		if err := s.resolve(getKey); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", s.name, err))
+	for _, f := range c.files {
+		for _, s := range f.doc.secrets() {
+			if err := s.resolve(getKey); err != nil {
+				errs = append(errs, inFile(f.path, fmt.Errorf("%s: %w", s.name, err)))
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -175,16 +178,19 @@ func (c *Config) resolveSecrets() error {
 type SealResult struct {
 	KeyPath    string
 	KeyCreated bool
-	// Encrypted is the number of clear-text credentials encrypted in the
-	// configuration file.
+	// Encrypted is the number of clear-text credentials encrypted, in
+	// Files, the configuration files rewritten.
 	Encrypted int
+	Files     []string
 }
 
-// Seal makes sure the key exists, generating it when needed, and replaces
-// every clear-text credential of the configuration file with its encrypted
-// form. Only the credential values change: comments, layout and everything
-// else are kept byte for byte. The file is replaced atomically. Seal only
-// applies to a configuration read by Load.
+// Seal makes sure the key exists, generating it when missing (even with
+// nothing to encrypt: it is ready for later credentials and for -encrypt),
+// and replaces every clear-text credential of the configuration files with
+// its encrypted form. Only the credential values change:
+// comments, layout and everything else are kept byte for byte. Each file is
+// replaced atomically; a file that cannot be rewritten (e.g. read-only)
+// does not prevent the others.
 func (c *Config) Seal() (SealResult, error) {
 	res := SealResult{KeyPath: KeyPath(c.Global.DataDir)}
 	key, created, err := ensureKey(res.KeyPath)
@@ -192,49 +198,64 @@ func (c *Config) Seal() (SealResult, error) {
 		return res, fmt.Errorf("key: %w", err)
 	}
 	res.KeyCreated = created
-	if c.path == "" {
-		return res, errors.New("seal: configuration not read from a file")
+	var errs []error
+	for _, f := range c.files {
+		n, err := f.seal(key)
+		if err != nil {
+			errs = append(errs, inFile(f.path, err))
+		}
+		if n > 0 {
+			res.Encrypted += n
+			res.Files = append(res.Files, f.path)
+		}
 	}
+	return res, errors.Join(errs...)
+}
 
+// seal encrypts the clear-text credentials of one file and returns how
+// many it encrypted.
+func (f *configFile) seal(key []byte) (int, error) {
 	type edit struct {
 		start, end int
 		text       string
 	}
 	var edits []edit
 	seen := map[[2]int]bool{} // a YAML alias repeats the same scalar
-	for _, s := range c.secrets() {
+	for _, s := range f.doc.secrets() {
 		pos := [2]int{s.src.line, s.src.col}
 		if !s.isClear() || seen[pos] {
 			continue
 		}
 		seen[pos] = true
-		start, end, err := scalarSpan(c.source, s.Secret)
+		start, end, err := scalarSpan(f.source, s.Secret)
 		if err != nil {
-			return res, fmt.Errorf("%s (line %d): %w", s.name, s.src.line, err)
+			return 0, fmt.Errorf("%s (line %d): %w", s.name, s.src.line, err)
 		}
 		edits = append(edits, edit{start, end, encrypt(key, s.value)})
 	}
 	if len(edits) == 0 {
-		return res, nil
+		return 0, nil
+	}
+	if f.path == "" {
+		return 0, errors.New("seal: configuration not read from a file")
 	}
 	// Apply from the end so earlier offsets stay valid.
 	slices.SortFunc(edits, func(a, b edit) int { return a.start - b.start })
-	out := bytes.Clone(c.source)
+	out := bytes.Clone(f.source)
 	for i := len(edits) - 1; i >= 0; i-- {
 		e := edits[i]
 		out = append(out[:e.start:e.start], append([]byte(e.text), out[e.end:]...)...)
 	}
 
 	// Never write a file that would not read back to the same credentials.
-	if err := verifySealed(out, key, len(edits), c.secretValues()); err != nil {
-		return res, fmt.Errorf("seal: %w", err)
+	if err := verifySealed(out, key, len(edits), f.doc.secretValues()); err != nil {
+		return 0, fmt.Errorf("seal: %w", err)
 	}
-	if err := writeAtomic(c.path, out); err != nil {
-		return res, err
+	if err := writeAtomic(f.path, out); err != nil {
+		return 0, err
 	}
-	c.source = out
-	res.Encrypted = len(edits)
-	return res, nil
+	f.source = out
+	return len(edits), nil
 }
 
 // secretValues returns the clear-text value of every secret, in order.

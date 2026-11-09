@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -257,5 +258,86 @@ func TestEncryptValue(t *testing.T) {
 	os.WriteFile(path, []byte("logging: {}\n"), 0o644)
 	if got, _ := DataDir(path); got != "data" {
 		t.Errorf("default DataDir = %q", got)
+	}
+}
+
+// Credentials are encrypted in the file they are written in, and a file
+// that cannot be sealed does not prevent the others.
+func TestSealIncludedFiles(t *testing.T) {
+	dir := writeCaps(t, map[string]string{"uptime.yaml": uptime})
+	dataDir := filepath.Join(dir, "data")
+	files := map[string]string{
+		"snmp-poller.yaml": "global: { data_dir: " + dataDir + " }\n" +
+			"vault: { address: https://vault:8200, auth: { method: token, token: main-token } }\n",
+		"conf.d/a.yaml": "# devices of site a\ndevices:\n" +
+			"  - { address: 10.0.0.1, snmp: { version: 2c, community: a-community } }   # kept\n",
+		"conf.d/b.yaml": "devices:\n  - address: 10.0.0.2\n    snmp:\n      version: 2c\n" +
+			"      community: |\n        b-block\n", // a block scalar: cannot be sealed
+		"conf.d/c.yaml": "devices: [{ address: 10.0.0.3, snmp: { version: 2c, community: \"${SEAL_C}\" } }]\n",
+	}
+	t.Setenv("SEAL_C", "from-env")
+	os.Mkdir(filepath.Join(dir, "conf.d"), 0o755)
+	for name, doc := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	main := filepath.Join(dir, "snmp-poller.yaml")
+	c := load(t, main)
+	res, err := c.Seal()
+	if err == nil || !strings.Contains(err.Error(), filepath.Join(dir, "conf.d", "b.yaml")+": devices[0].snmp.community (line 5): cannot encrypt in place") {
+		t.Errorf("err = %v, want b.yaml reported", err)
+	}
+	if want := []string{main, filepath.Join(dir, "conf.d", "a.yaml")}; res.Encrypted != 2 || !slices.Equal(res.Files, want) {
+		t.Errorf("seal = %+v, want 2 credentials in %q", res, want)
+	}
+	read := func(name string) string {
+		data, _ := os.ReadFile(filepath.Join(dir, name))
+		return string(data)
+	}
+	if s := read("snmp-poller.yaml"); strings.Contains(s, "main-token") || !strings.Contains(s, "token: ~~") {
+		t.Errorf("main file not sealed:\n%s", s)
+	}
+	if s := read("conf.d/a.yaml"); strings.Contains(s, "a-community") || !strings.Contains(s, "community: ~~") ||
+		!strings.HasPrefix(s, "# devices of site a\n") || !strings.Contains(s, "} }   # kept\n") {
+		t.Errorf("a.yaml not sealed in place:\n%s", s)
+	}
+	for _, name := range []string{"conf.d/b.yaml", "conf.d/c.yaml"} {
+		if read(name) != files[name] {
+			t.Errorf("%s changed:\n%s", name, read(name))
+		}
+	}
+
+	// Everything reads back, and only b.yaml is still in clear text.
+	c2 := load(t, main)
+	if got, want := c2.secretValues(), c.secretValues(); !slices.Equal(got, want) {
+		t.Errorf("read back %q, want %q", got, want)
+	}
+	if res, _ := c2.Seal(); res.Encrypted != 0 {
+		t.Errorf("second seal = %+v", res)
+	}
+}
+
+// The key is created even with nothing to encrypt: it is ready for later
+// credentials and for -encrypt.
+func TestSealNothingToEncrypt(t *testing.T) {
+	t.Setenv("SEAL_ENV", "from-env")
+	dir := writeCaps(t, map[string]string{"uptime.yaml": uptime})
+	dataDir := filepath.Join(dir, "data")
+	path := filepath.Join(dir, "snmp-poller.yaml")
+	doc := "global: { data_dir: " + dataDir + " }\n" +
+		"devices: [{ address: 10.0.0.1, snmp: { version: 2c, community: \"${SEAL_ENV}\" } }]\n"
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := load(t, path).Seal()
+	if err != nil || !res.KeyCreated || res.Encrypted != 0 {
+		t.Errorf("seal = %+v, %v: want a new key and nothing encrypted", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, KeyFile)); err != nil {
+		t.Errorf("key: %v", err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != doc {
+		t.Errorf("file rewritten:\n%s", data)
 	}
 }

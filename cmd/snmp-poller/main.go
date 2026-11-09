@@ -67,8 +67,9 @@ func run() int {
 		for _, c := range cfg.Capabilities() {
 			names = append(names, c.Name)
 		}
-		fmt.Printf("configuration OK: %d enabled device(s), %d output(s), %d capabilities from %s (%s)\n",
-			len(cfg.DeviceSpecs()), len(cfg.Outputs), len(names), cfg.Global.ConfDir, strings.Join(names, ", "))
+		fmt.Printf("configuration OK: %d file(s) (%s), %d enabled device(s), %d output(s), %d capabilities from %s (%s)\n",
+			len(cfg.Files()), strings.Join(cfg.Files(), ", "), len(cfg.DeviceSpecs()), len(cfg.Outputs),
+			len(names), cfg.Global.CapabilitiesDir, strings.Join(names, ", "))
 		return 0
 	}
 
@@ -78,40 +79,38 @@ func run() int {
 		return 1
 	}
 	defer log.Close()
-	log.Info("starting AIrtg snmp-poller", "version", version, "commit", commit, "config", *path)
+	log.Info("starting AIrtg snmp-poller", "version", version, "commit", commit, "config", *path,
+		"files", len(cfg.Files()), "devices", len(cfg.DeviceSpecs()))
+	if len(cfg.DeviceSpecs()) == 0 {
+		log.Warn("no enabled device: add devices to a file of the include directory",
+			"include_dir", cfg.Global.IncludeDir)
+	}
 
-	// Encrypt the clear-text credentials of the (valid) configuration file.
-	// A read-only file is not fatal: polling works, the file stays in clear.
-	sealed, err := cfg.Seal()
-	if sealed.KeyCreated {
-		log.Info("credentials key generated: back it up, encrypted credentials cannot be read without it",
-			"key", sealed.KeyPath)
-	}
-	switch {
-	case err != nil:
-		log.Warn("credentials not encrypted in the configuration file", "config", *path,
-			"key", sealed.KeyPath, "err", err)
-	case sealed.Encrypted > 0:
-		log.Info("credentials encrypted in the configuration file", "config", *path,
-			"count", sealed.Encrypted, "key", sealed.KeyPath)
-	}
+	// Encrypt the clear-text credentials of the (valid) configuration files.
+	poller.Seal(cfg, log.Logger)
 
 	outs, err := output.Build(cfg.Outputs, log.Logger)
 	if err != nil {
 		log.Error("outputs", "err", err)
 		return 1
 	}
-	defer func() {
-		if err := output.CloseAll(outs); err != nil {
-			log.Error("closing outputs", "err", err)
-		}
-	}()
-
-	p, err := poller.New(cfg, log.Logger, outs)
+	p, err := poller.New(cfg, log.Logger, outs) // owns outs from now on
 	if err != nil {
+		output.CloseAll(outs)
 		log.Error("poller", "err", err)
 		return 1
 	}
+	// Reload on file changes (global.hot_reload) and on SIGHUP.
+	p.EnableReload(config.Load, log.Reconfigure)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go func() {
+		for range hup {
+			log.Info("SIGHUP received: reloading the configuration")
+			p.Reload()
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

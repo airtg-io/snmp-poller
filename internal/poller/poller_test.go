@@ -158,7 +158,7 @@ func newDevice(t *testing.T, doc string, caps map[string]string, out output.Outp
 	return deviceFrom(t, testconf.Parse(t, doc, caps), out)
 }
 
-// shippedDevice uses the capabilities shipped in etc/conf.d.
+// shippedDevice uses the capabilities shipped in etc/capabilities.d.
 func shippedDevice(t *testing.T, doc string, out output.Output) (*device, *state.Store) {
 	t.Helper()
 	_, file, _, _ := runtime.Caller(0)
@@ -401,7 +401,7 @@ tables:
 }
 
 // TestShippedInterfaces polls agents with and without ifXTable using the
-// capabilities shipped in etc/conf.d.
+// capabilities shipped in etc/capabilities.d.
 func TestShippedInterfaces(t *testing.T) {
 	for _, tc := range []struct {
 		name, include, caps, rows string
@@ -954,7 +954,11 @@ func TestRunNoDevices(t *testing.T) {
 		defer logMu.Unlock()
 		return logs.Write(p)
 	}), nil))
-	p, err := New(cfg, log, map[string]output.Output{})
+	outs, err := output.Build(cfg.Outputs, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(cfg, log, outs)
 	if err != nil {
 		t.Fatal(err)
 	}

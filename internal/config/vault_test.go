@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -67,44 +66,5 @@ devices:
 		if err != nil && strings.Contains(err.Error(), "leaked") {
 			t.Errorf("error leaks a secret: %v", err)
 		}
-	}
-}
-
-// Every example device of the shipped configuration is valid once enabled.
-func TestDefaultConfigExamples(t *testing.T) {
-	t.Setenv("SNMP_COMMUNITY", "from-env")
-	data, err := os.ReadFile(repoPath(DefaultPath))
-	if err != nil {
-		t.Fatal(err)
-	}
-	doc := strings.ReplaceAll(string(data), "enabled: false", "enabled: true")
-	c, err := Parse(strings.NewReader(doc), repoPath("etc"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := map[string]string{}
-	for _, s := range c.DeviceSpecs() {
-		got[s.ID] = strings.Join([]string{s.SNMP.Version, s.Transport, s.Walk, s.VaultPath}, " ")
-	}
-	want := map[string]string{
-		"192.0.2.10-161": "2c udp bulk ",
-		"legacy-ups":     "1 tcp getnext ",
-		"core-1":         "3 udp getnext ",
-		"edge-1":         " udp bulk snmp-poller/edge-1",
-		"edge-2":         " udp bulk network/edge-v3",
-	}
-	if len(got) != len(want) {
-		t.Errorf("devices = %v", got)
-	}
-	for id, w := range want {
-		if got[id] != w {
-			t.Errorf("%s = %q, want %q", id, got[id], w)
-		}
-	}
-	if s := c.DeviceSpecs()[2].SNMP; s.SecurityLevel != AuthPriv || s.AuthProtocol != "SHA256" || s.PrivProtocol != "AES" {
-		t.Errorf("core-1 snmp = %+v", s)
-	}
-	if a := c.Vault.Auth; a.Method != VaultAppRole || a.RoleID == "" || !a.SecretID.IsSet() {
-		t.Errorf("vault auth = %+v", a)
 	}
 }

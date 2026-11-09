@@ -14,11 +14,20 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   (`-version`). CI (`.github/workflows/go.yml`) builds every push/PR; a push to main whose
   version has no tag `v<version>` yet creates the tag and a GitHub release with the archives.
   Unchanged VERSION = build only. Never create release tags by hand for unreleased versions. Plain `go build ./cmd/snmp-poller` / `go test ./...` work too.
-- **Configuration**: YAML. Default file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
-  The main file holds process settings, outputs, `vault` and devices only: **no SNMP metric
-  definitions** (no profiles, no inline sets, no named credentials: reuse = YAML anchors). What to poll lives in `global.conf_dir`
-  (default `conf.d`, relative to the main file, so `etc/conf.d`).
-- **Capabilities**: one `*.yaml`/`*.yml` file per capability in conf_dir, named after the file.
+- **Configuration**: YAML. Main file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
+  Every `*.yaml`/`*.yml` of `global.include_dir` (default `conf.d`, i.e. `etc/conf.d`; hidden
+  files, subdirs and other extensions ignored; missing = fine unless set explicitly) is read
+  after it in name order, same schema: `devices`/`outputs` concatenated (ids, endpoints,
+  output names unique across files), `logging`/`vault` in one file only, `global` main file
+  only. Errors name their file. Config files hold process settings, outputs, `vault` and
+  devices only: **no SNMP metric definitions** (no profiles, no inline sets, no named
+  credentials: reuse = YAML anchors, within one file). What to poll lives in
+  `global.capabilities_dir` (default `capabilities.d`; both dirs relative to the main file).
+  Old `conf_dir` and capability files found in conf.d are rejected with an explanatory error.
+- **Shipped config**: valid, polls nothing: main file with defaults only (no devices, no
+  vault), `etc/conf.d/devices.yaml.example` (not loaded; validated by a test once renamed).
+  Test devices live in tests only. Local `etc/conf.d/*.yaml` are git-ignored.
+- **Capabilities**: one `*.yaml`/`*.yml` file per capability in capabilities_dir, named after the file.
   No `detect` = applies to every device; `detect: [oid...]` = applies when every OID subtree
   exists (one GETNEXT each, at discovery). Every capability found is polled unless the device
   lists it in `exclude` (only explicit exclusion removes one). Devices may override a table's
@@ -38,6 +47,18 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   missing input or division by zero = no sample. Always raw (no modes), Sample.Type `Formula`.
   `emit: false` = input only. `unit` is passed to Sample.Unit (`/s` appended for rate). Every
   size is sent in bytes: convert device units (KiB, allocation units) with formulas.
+- **Reload**: `global.hot_reload` (default true) checks the files' fingerprint every 2s
+  (`Config.DiskFingerprint` vs `Fingerprint`, change applied once stable for one check);
+  SIGHUP (`Poller.Reload`) reloads in any case. New config fully validated (Load, outputs,
+  Vault client, logging) before anything changes; failure = error log, previous config kept,
+  not retried until the files change. `data_dir` change refused (restart). Applied in the
+  scheduler goroutine (`poller/reload.go`): devices matched by id; unchanged and
+  settings-only changes keep their poll phase and discovery cycle; rediscovery only when
+  `DeviceSpec.DiscoveryKey` changes (agent, credentials, context, Vault path, capability
+  fingerprints incl. include patterns). A device being polled gets its config when the poll
+  ends; replaced outputs close after the polls that may use them; removed devices' data dirs
+  are deleted; worker pool resized. The logger (`logging.Logger.Reconfigure`) is live:
+  derived loggers follow. The key is always created on startup/reload (`Seal`).
 - **Shared OIDs**: an OID used by several metrics (same or different capabilities, discovery or
   polling) is fetched/walked once per cycle and emitted for each. Previous values in state.json
   are keyed by OID, so rate and volume (and every metric on that OID) share one delta.
@@ -54,8 +75,9 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   `global`; v1 always getnext, explicit `walk: bulk` on v1 is an error.
 - **Credentials**: in the device's `snmp:` block (v1/v2c `community`; v3 `username`,
   `security_level`, `auth_protocol`, `auth_password`, `priv_protocol`, `priv_password`
-  defaulting to auth_password). Clear-text secrets are **encrypted in place** on startup once
-  the config is valid (`Config.Seal`, not on `-check`): `~~HEX~~` (exactly `~~` + hex pairs +
+  defaulting to auth_password). Clear-text secrets are **encrypted in place**, in the file
+  they are written in, on startup once the config is valid (`Config.Seal`, not on `-check`;
+  a file that fails does not stop the others; the key is always generated, even with nothing to encrypt): `~~HEX~~` (exactly `~~` + hex pairs +
   `~~`, else it is clear text), AES-256-GCM, key `<data_dir>/key.dat` generated if missing
   (0600, kept by the data dir cleanup). Only the value bytes change (comments/layout kept,
   atomic write, verified by re-decoding); read-only file = warn and continue. `${ENV}` refs
@@ -108,8 +130,7 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Scheduling**: first polls spread over one interval; a device is never polled twice at once
   (overrun = `skipped`); graceful shutdown waits `shutdown_timeout` for in-flight polls.
 - **Config strictness**: unknown YAML keys are errors; credentials are validated only when used;
-  every ```yaml block in README.md must be valid (enforced by a test): a complete main config
-  checked against `etc/conf.d`, or a capability file when its first line is `# conf.d/<name>.yaml`.
+  every ```yaml block in README.md must be valid (enforced by a test, see Testing notes).
 
 ## Testing notes
 
@@ -119,9 +140,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   `dpkg -x` each into a scratch dir, run `snmpd -C -c <conf> -I -smux` on a high port with
   `LD_LIBRARY_PATH`, `SNMP_PERSISTENT_DIR` and `MIBS=""` set. net-snmp supports every v3
   combination above (AES192/256 = Blumenthal), and contexts via `access ... <context> ...`.
-- Running the poller with the shipped `etc/snmp-poller.yaml` encrypts its example credentials
-  with a local `data/key.dat`: never commit that (`TestDefaultConfigFileNotSealed` fails). Run
-  with a copy (`-config`) and run the package (`go run ./cmd/snmp-poller`), not `main.go` alone.
+- Never commit a sealed shipped file or a local `etc/conf.d/*.yaml` (`TestDefaultConfigFileNotSealed`,
+  `.gitignore`). For E2E, copy `etc/` to a scratch dir, add `etc/conf.d/devices.yaml` there, and
+  run the package (`go run ./cmd/snmp-poller` or a built binary), not `main.go` alone.
+- Config tests never read local `etc/conf.d` files: they copy the shipped files to a temp dir
+  (`shippedDir`). README ```yaml blocks: `# capabilities.d/<n>.yaml` = capability,
+  `# conf.d/<n>.yaml` = include file (checked with the shipped main), else a main file.
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
 
@@ -134,7 +158,8 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - `internal/state` - on-disk previous-value store and delta/rate math.
 - `internal/output` - `Output` interface, registry, `null` output.
 - `internal/vault` - Vault KV client (login, token reuse/renewal).
-- `internal/poller` - scheduler, worker pool, discovery, polling, stats.
+- `internal/poller` - scheduler, worker pool, discovery, polling, configuration reload, stats.
 - `internal/testagent` - in-process SNMP agent used by integration tests (v1/v2c/v3).
-- `internal/testconf` - test helper writing a config plus its conf.d to a temp dir.
-- `etc/snmp-poller.yaml` - default configuration; `etc/conf.d/` - shipped capabilities.
+- `internal/testconf` - test helper writing a config plus its capabilities.d to a temp dir.
+- `etc/snmp-poller.yaml` - main configuration; `etc/conf.d/` - config files (example only);
+  `etc/capabilities.d/` - shipped capabilities.

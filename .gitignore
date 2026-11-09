@@ -38,3 +38,7 @@ go.work.sum
 /dist/
 /data/
 /logs/
+# Local configuration files (devices, credentials, encrypted with the local
+# key): only the examples of etc/conf.d are shipped
+/etc/conf.d/*.yaml
+/etc/conf.d/*.yml

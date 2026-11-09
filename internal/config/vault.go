@@ -197,3 +197,17 @@ func (s *DeviceSpec) WithVaultSecret(secret map[string]string) (*DeviceSpec, err
 	}
 	return &out, nil
 }
+
+// Equal reports whether v and o configure the same Vault access (nil for
+// no vault section). Credentials are compared by value, wherever they are
+// written in the files.
+func (v *Vault) Equal(o *Vault) bool {
+	if v == nil || o == nil {
+		return v == o
+	}
+	a, b := *v, *o
+	for _, s := range []*Secret{&a.Auth.Token, &a.Auth.SecretID, &a.Auth.Password, &b.Auth.Token, &b.Auth.SecretID, &b.Auth.Password} {
+		*s = Secret{value: s.value}
+	}
+	return a == b
+}

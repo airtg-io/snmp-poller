@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +22,7 @@ import (
 const DefaultHighCapacitySpeed = 100_000_000
 
 // CapabilityFile is the YAML schema of one file in the capabilities
-// directory (conf.d). The capability is named after the file.
+// directory (capabilities.d). The capability is named after the file.
 type CapabilityFile struct {
 	Description string `yaml:"description"`
 	// Detect lists OID subtrees that must all exist on the agent for the
@@ -126,6 +128,8 @@ type Capability struct {
 	Discovery Discovery
 	Scalars   []Scalar
 	Tables    []TableSpec
+
+	hash string // of the file content, see Fingerprint
 }
 
 // TableSpec is a validated table with its include patterns compiled.
@@ -165,18 +169,25 @@ func (t *TableSpec) Selects(key string) bool {
 // and discovery entries must be unique across all capabilities, since any
 // combination of them can apply to one device.
 func LoadCapabilities(dir string) ([]*Capability, error) {
+	caps, _, err := loadCapabilities(dir)
+	return caps, err
+}
+
+// loadCapabilities is LoadCapabilities, also returning the files read.
+func loadCapabilities(dir string) ([]*Capability, []fileData, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("capabilities: %w", err)
+		return nil, nil, fmt.Errorf("capabilities: %w", err)
 	}
 	var caps []*Capability
+	var read []fileData
 	var errs []error
 	files := map[string]string{}
 	for _, e := range entries {
-		ext := filepath.Ext(e.Name())
-		if e.IsDir() || (ext != ".yaml" && ext != ".yml") {
+		if !isYAMLFile(e) {
 			continue
 		}
+		ext := filepath.Ext(e.Name())
 		name := strings.TrimSuffix(e.Name(), ext)
 		if prev, ok := files[name]; ok {
 			errs = append(errs, fmt.Errorf("capability %q: defined by both %s and %s", name, prev, e.Name()))
@@ -189,6 +200,7 @@ func LoadCapabilities(dir string) ([]*Capability, error) {
 			errs = append(errs, err)
 			continue
 		}
+		read = append(read, fileData{path, data})
 		c, err := ParseCapability(name, bytes.NewReader(data))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", path, err))
@@ -197,13 +209,13 @@ func LoadCapabilities(dir string) ([]*Capability, error) {
 		caps = append(caps, c)
 	}
 	if err := errors.Join(errs...); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sort.Slice(caps, func(i, j int) bool { return caps[i].Name < caps[j].Name })
 	if err := checkUnique(caps); err != nil {
-		return nil, fmt.Errorf("capabilities in %s: %w", dir, err)
+		return nil, nil, fmt.Errorf("capabilities in %s: %w", dir, err)
 	}
-	return caps, nil
+	return caps, read, nil
 }
 
 // ParseCapability decodes and validates one capability file.
@@ -211,8 +223,12 @@ func ParseCapability(name string, r io.Reader) (*Capability, error) {
 	if !idPattern.MatchString(name) {
 		return nil, fmt.Errorf("capability name %q (from the file name) may only contain letters, digits, '.', '_' and '-'", name)
 	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
 	var f CapabilityFile
-	dec := yaml.NewDecoder(r)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
@@ -220,7 +236,22 @@ func ParseCapability(name string, r io.Reader) (*Capability, error) {
 	if err := checkCapability(f); err != nil {
 		return nil, err
 	}
-	return normalizeCapability(name, f), nil
+	c := normalizeCapability(name, f)
+	sum := sha256.Sum256(data)
+	c.hash = hex.EncodeToString(sum[:])
+	return c, nil
+}
+
+// Fingerprint identifies the capability as a device polls it: its file
+// content and the include patterns of its tables (which a device may
+// override). Two capabilities with the same fingerprint discover the same.
+func (c *Capability) Fingerprint() string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s", c.Name, c.hash)
+	for _, t := range c.Tables {
+		fmt.Fprintf(h, "\x00%s%q", t.Name, t.Include)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func checkCapability(f CapabilityFile) error {

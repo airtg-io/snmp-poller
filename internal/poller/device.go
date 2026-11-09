@@ -60,6 +60,29 @@ type device struct {
 	// fromVault is spec completed with the Vault secret, read at every
 	// discovery and only kept in memory.
 	fromVault *config.DeviceSpec
+
+	// Scheduler only: next poll and poll interval.
+	next     time.Time
+	interval time.Duration
+
+	// Protected by Poller.mu.
+	busy    bool          // queued or being polled
+	removed bool          // no longer in the configuration
+	latest  *deviceConf   // last configuration applied or pending
+	pending *deviceConf   // configuration to apply when the poll ends
+	waiters []*retirement // retired outputs waiting for this poll to end
+}
+
+// applyConf sets the device's configuration. Only called while the device
+// is not being polled.
+func (d *device) applyConf(dc *deviceConf) {
+	d.spec, d.log, d.outputs, d.vault = dc.spec, dc.log, dc.outputs, dc.vault
+	if dc.rediscover {
+		d.discoveredAt = time.Time{}
+	}
+	if dc.resetVault {
+		d.fromVault = nil
+	}
 }
 
 // secretReader reads a KV secret (see package vault).

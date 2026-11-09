@@ -1,6 +1,13 @@
-# AIrtg snmp-poller - default configuration.
+# AIrtg snmp-poller - main configuration file.
 # Every option is documented in README.md. Values shown are the defaults
 # unless stated otherwise.
+#
+# The configuration can be split: every *.yaml and *.yml file of
+# global.include_dir (etc/conf.d) is read after this file, in name order,
+# with the same format. Devices and outputs of all files are combined;
+# logging and vault may be defined in one file only; global only here.
+# No device is configured by default: add yours in a file of etc/conf.d
+# (see etc/conf.d/devices.yaml.example).
 
 global:
   threads: 250                 # concurrent polls (worker pool size)
@@ -14,9 +21,11 @@ global:
   transport: udp               # default for devices: udp or tcp
   walk: bulk                   # default for devices: bulk (GETBULK) or getnext; SNMPv1 always uses getnext
   data_dir: data               # on-disk state for rate/volume; wiped on startup
-  conf_dir: conf.d             # SNMP capabilities, one file each (relative to this file)
+  include_dir: conf.d          # more configuration files (relative to this file)
+  capabilities_dir: capabilities.d  # SNMP capabilities, one file each (relative to this file)
   stats_interval: 1m           # periodic summary log line
   shutdown_timeout: 30s        # grace period for in-flight polls on SIGINT/SIGTERM
+  hot_reload: true             # reload when a file changes (false: on SIGHUP only)
 
 logging:
   level: info                  # debug, info, warn, error
@@ -34,73 +43,3 @@ logging:
 outputs:
   - name: blackhole
     type: "null"               # discards everything (the only output type for now)
-
-# Credentials (community strings, passwords, Vault secrets) written in clear
-# text below are encrypted in place on startup, once the configuration is
-# valid: the value becomes ~~HEX~~ (AES-256-GCM), with the key data/key.dat,
-# generated on first start. Back that key up: encrypted values cannot be read
-# without it. ${ENV_VAR} references are read from the environment and left as is.
-
-# HashiCorp Vault, for devices with `snmp: { vault: ... }` only. Each such
-# device reads a KV secret (keys: version, community, username,
-# security_level, auth_protocol, auth_password, priv_protocol, priv_password,
-# context_name, context_engine_id) on every discovery.
-vault:
-  address: https://vault.example.net:8200
-  mount: secret                # KV secrets engine mount
-  kv_version: 2
-  prefix: snmp-poller          # default secret of a device: <mount>/<prefix>/<device id>
-  auth:
-    method: approle            # token, approle, userpass or kubernetes
-    role_id: snmp-poller
-    secret_id: change-me       # encrypted on startup
-
-devices:
-  # Examples, all disabled: set enabled: true (or remove it) to poll one.
-
-  # SNMPv2c. No id: it defaults to <address>-<port>, here "192.0.2.10-161".
-  - address: 192.0.2.10
-    enabled: false
-    snmp:
-      version: 2c
-      community: public        # encrypted on startup
-
-  # SNMPv1 over TCP, custom port and id; v1 always walks with GETNEXT.
-  - id: legacy-ups
-    address: 192.0.2.11
-    port: 1161
-    transport: tcp
-    enabled: false
-    snmp:
-      version: 1
-      community: ${SNMP_COMMUNITY}   # read from the environment, never rewritten
-
-  # SNMPv3 authPriv, walked with GETNEXT (for agents with broken GETBULK).
-  - id: core-1
-    address: 192.0.2.12
-    walk: getnext
-    enabled: false
-    snmp:
-      version: 3
-      username: poller
-      security_level: authPriv       # noAuthNoPriv, authNoPriv or authPriv
-      auth_protocol: SHA256          # MD5, SHA, SHA224, SHA256, SHA384, SHA512
-      auth_password: change-me-auth  # encrypted on startup
-      priv_protocol: AES             # DES, AES, AES192, AES256, AES192C, AES256C
-      priv_password: change-me-priv  # defaults to auth_password; encrypted on startup
-    # Every capability of etc/conf.d found on the device is polled, except:
-    # exclude: [interfaces]
-
-  # Credentials from Vault, default path: secret/snmp-poller/edge-1.
-  - id: edge-1
-    address: 192.0.2.13
-    enabled: false
-    snmp:
-      vault: true
-
-  # Credentials from Vault, explicit path (relative to the mount).
-  - id: edge-2
-    address: 192.0.2.14
-    enabled: false
-    snmp:
-      vault: network/edge-v3

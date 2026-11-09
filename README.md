@@ -6,10 +6,14 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
   SHA-384, SHA-512; DES, AES-128, AES-192, AES-256 in both Blumenthal and Reeder/Cisco variants),
   **contexts**, UDP and TCP, GETBULK or GETNEXT walks, per device.
 - **Credentials encrypted at rest**: community strings and passwords written in clear text are
-  encrypted in place in the configuration file on startup (`~~HEX~~`, AES-256-GCM, key in
+  encrypted in place in the configuration files on startup (`~~HEX~~`, AES-256-GCM, key in
   `data/key.dat`), or read from **HashiCorp Vault** and refreshed at every discovery.
-- **Capabilities**: what to poll lives in `etc/conf.d/`, one file per capability (system group,
-  interfaces, inventory, ...). Discovery finds which capabilities each device has, and every one
+- **Split configuration**: process settings in `etc/snmp-poller.yaml`, devices and the rest in
+  any number of files of `etc/conf.d/`, read automatically. No device is configured by default.
+- **Hot reload**: edited files are validated and applied without restart (or on `SIGHUP`);
+  devices keep their discovery cycle, an invalid change is logged and ignored.
+- **Capabilities**: what to poll lives in `etc/capabilities.d/`, one file per capability (system
+  group, interfaces, host resources, inventory, ...). Discovery finds which capabilities each device has, and every one
   found is polled unless the device excludes it.
 - **Discovery** on the first poll and then every hour (configurable) for slow-changing data:
   sysDescr, sysName, sysLocation, model, interface names, ... cached **on disk**.
@@ -41,8 +45,9 @@ Requires Go 1.27 or later.
 
 ```sh
 make build                               # or: go build -o snmp-poller ./cmd/snmp-poller
-./snmp-poller -check                     # validate etc/snmp-poller.yaml and etc/conf.d, and exit
-./snmp-poller                            # run with etc/snmp-poller.yaml
+cp etc/conf.d/devices.yaml.example etc/conf.d/devices.yaml   # then edit: your devices
+./snmp-poller -check                     # validate the configuration and the capabilities, and exit
+./snmp-poller                            # run with etc/snmp-poller.yaml and etc/conf.d/*.yaml
 ./snmp-poller -config /path/to/file.yaml # run with another file
 ./snmp-poller -encrypt foobar            # encrypt a credential by hand, see below
 ./snmp-poller -version
@@ -55,11 +60,16 @@ make build                               # or: go build -o snmp-poller ./cmd/snm
 static binaries with no dependency: copy one with the `etc/` directory and run it.
 
 Stop with `Ctrl-C` or `SIGTERM`: in-flight polls get `global.shutdown_timeout` to finish.
+Configuration changes apply without restart: see [Reloading](#reloading-the-configuration).
+
+The shipped configuration polls nothing: add devices in a file of `etc/conf.d` (see
+[Configuration files](#configuration-files)). Without any, the poller runs idle and logs a warning.
 
 Relative paths (`data_dir`, log file) are relative to the working directory, except
-`conf_dir`, which is relative to the directory of the configuration file.
+`include_dir` and `capabilities_dir`, which are relative to the directory of the main
+configuration file.
 
-On startup, once the configuration is valid, clear-text credentials in the configuration file
+On startup, once the configuration is valid, clear-text credentials in the configuration files
 are [encrypted in place](#credentials-encryption) with the key `data/key.dat`, generated on
 first start. `-check` never modifies anything.
 
@@ -74,7 +84,7 @@ Each poll:
 1. **Discovery**, when due: on the first poll, then every `discovery_interval`.
    1. **Credentials**: a device using [Vault](#vault) reads its secret again. If Vault fails,
       the previous credentials are kept (a device that never got any fails its poll).
-   2. **Capabilities**: every capability of `conf_dir` not excluded by the device is a
+   2. **Capabilities**: every capability of `capabilities_dir` not excluded by the device is a
       candidate. One without `detect` applies to every device. One with `detect` applies when
       every listed OID subtree exists on the agent (one GETNEXT each).
    3. The discovery scalars of those capabilities are fetched (`sysDescr`, `sysObjectID`,
@@ -114,10 +124,91 @@ Each poll:
 
 ## Configuration reference
 
-The configuration is YAML: the main file (`etc/snmp-poller.yaml`) holds the process settings,
-outputs, Vault and devices (with their credentials), and `etc/conf.d/` holds what to poll, one
-[capability](#capabilities) per file. Unknown keys are rejected, so typos are caught by `-check`.
-Durations use Go syntax: `500ms`, `30s`, `5m`, `1h`.
+The configuration is YAML, in three places:
+
+| Path | Holds |
+|------|-------|
+| `etc/snmp-poller.yaml` | The main file: `global`, and anything else below. Shipped with the defaults, no device. |
+| `etc/conf.d/*.yaml` | More configuration files, read automatically: devices (with their credentials), outputs, `vault`, `logging`. See [Configuration files](#configuration-files). |
+| `etc/capabilities.d/*.yaml` | What to poll, one [capability](#capabilities) per file. |
+
+Unknown keys are rejected, so typos are caught by `-check`. Durations use Go syntax: `500ms`,
+`30s`, `5m`, `1h`.
+
+### Configuration files
+
+Every `*.yaml` and `*.yml` file of `global.include_dir` (`etc/conf.d` by default) is read after
+the main file, in name order, and has the same format as the main file. Other files (such as
+the shipped `devices.yaml.example`), hidden files and subdirectories are ignored.
+
+- `devices` and `outputs` of every file are combined (main file first, then the files in name
+  order). Device ids, device addresses and output names are unique across all files.
+- `logging` and `vault` may each be defined in one file only, any of them.
+- `global` is only allowed in the main file.
+- Clear-text credentials are [encrypted](#credentials-encryption) in the file they are written in.
+- Errors name the file: `etc/conf.d/core.yaml: devices[2]: address is required`.
+
+For example, one file per site, and Vault in its own file:
+
+```yaml
+# conf.d/site-paris.yaml
+devices:
+  - id: paris-core-1
+    address: 192.0.2.20
+    snmp: { version: 2c, community: paris-ro }   # encrypted in this file on startup
+  - id: paris-ups
+    address: 192.0.2.21
+    snmp: { version: 1, community: "${SNMP_COMMUNITY}" }
+```
+
+```yaml
+# conf.d/vault.yaml
+vault:
+  address: https://vault.example.net:8200
+  auth: { method: token, token: "${VAULT_TOKEN}" }
+devices:
+  - id: paris-edge-1
+    address: 192.0.2.22
+    snmp: { vault: true }
+```
+
+Only files ending in `.yaml` or `.yml` are read: rename a file to `.yaml.off` to disable it. A
+missing `etc/conf.d` is fine; an `include_dir` set explicitly must exist. Local files of
+`etc/conf.d` are ignored by git: only the examples are part of the repository.
+
+### Reloading the configuration
+
+With `global.hot_reload: true` (the default), the poller checks every 2 seconds whether a file
+of the configuration changed: the main file, a file of `include_dir` or of `capabilities_dir`
+(added, edited or removed). A change is read once it has been stable for one check, so a file
+being saved is not read half way. With `hot_reload: false`, changes wait for a `SIGHUP`
+(`kill -HUP <pid>`), which reloads in any case (not available on Windows).
+
+The new configuration is validated first, completely, as on startup. If anything fails
+(syntax, validation, an output or the Vault client that cannot be built, an unwritable log
+file), an `error` line says why and **the previous configuration stays in force**; the same
+broken files are not reported again until they change. Otherwise it is applied at once,
+and new clear-text credentials are encrypted:
+
+```text
+level=INFO msg="configuration reloaded" reason="file change" files=3 devices=12 added=1 removed=1 changed=2 rediscovered=1
+level=ERROR msg="configuration reload failed, the previous configuration stays in force" reason="file change" err="etc/conf.d/core.yaml: devices[2]: address is required"
+```
+
+| Change | Effect |
+|--------|--------|
+| Device added | Polled from now on, first polls spread over one poll interval; discovered on its first poll. |
+| Device removed | No longer polled (a poll in progress ends normally); its data directory is deleted. |
+| Address, port, transport, SNMP version, credentials, context, Vault path, capabilities (excluded, edited, include patterns) of a device | The device is discovered again on its next poll. |
+| Anything else on a device (intervals, timeouts, retries, walk, outputs, trace, ...) | Applied on its next poll. Its discovery cycle is kept: `discovery_interval` counts from its last discovery. A shorter `poll_interval` applies at once, a longer one after the next poll. |
+| Unchanged devices | Nothing: same poll phase, same discovery cycle, rate/volume state kept. |
+| `outputs` | New or changed outputs are built; replaced ones are closed once the polls using them are done. Unchanged outputs are kept as they are. |
+| `vault` | A new client logs in on its next use; an unchanged section keeps its token. |
+| `logging` | Applied at once (level, sinks, file). |
+| `global.threads`, `stats_interval`, `shutdown_timeout`, `hot_reload`, defaults inherited by devices | Applied at once. |
+| `global.data_dir` | Refused (error, previous configuration kept): restart to change it. |
+
+A device being polled during a reload gets its new configuration when that poll ends.
 
 ### `global`
 
@@ -134,9 +225,11 @@ Durations use Go syntax: `500ms`, `30s`, `5m`, `1h`.
 | `transport` | `udp` | Default transport: `udp` or `tcp`. |
 | `walk` | `bulk` | Default walk method: `bulk` (GETBULK) or `getnext` (GETNEXT, one OID per request, for agents with a broken GETBULK). SNMPv1 has no GETBULK: v1 devices always use `getnext`. |
 | `data_dir` | `data` | On-disk state directory. Device directories are wiped on startup; the credentials key `key.dat` is kept. |
-| `conf_dir` | `conf.d` | [Capabilities](#capabilities) directory. Relative to the directory of the configuration file (`etc/conf.d` by default). |
+| `include_dir` | `conf.d` | [Configuration files](#configuration-files) read after the main file. Relative to the directory of the main file (`etc/conf.d` by default). Main file only. |
+| `capabilities_dir` | `capabilities.d` | [Capabilities](#capabilities) directory. Relative to the directory of the main file (`etc/capabilities.d` by default). Formerly `conf_dir`, which is now rejected with a message saying so. |
 | `stats_interval` | `1m` | Interval of the stats log line. |
 | `shutdown_timeout` | `30s` | Grace period for in-flight polls on shutdown. |
+| `hot_reload` | `true` | Reload the configuration when its files change. `false`: only on `SIGHUP`. See [Reloading](#reloading-the-configuration). |
 
 ### `logging`
 
@@ -223,8 +316,8 @@ device, `snmp: *campus` on the others), see [the example](#shared-credentials).
 Credentials (`community`, `auth_password`, `priv_password`, and the Vault `token`,
 `secret_id` and `password`) are written in one of three ways:
 
-- **Clear text**: on startup, once the whole configuration is valid, the value is encrypted
-  and written back to the configuration file in place of the clear text. Only the values
+- **Clear text**: on startup and on every reload, once the whole configuration is valid, the value is encrypted
+  and written back to its configuration file in place of the clear text. Only the values
   change: comments and layout are kept, and the file is replaced atomically, keeping its
   permissions. Encrypted values are on one line, so a credential written as a block scalar
   (`|`, `>`) is reported and left as is.
@@ -314,8 +407,8 @@ enabled device uses it.
 ## Capabilities
 
 A capability is a set of OIDs to collect from devices that support it. Each `*.yaml` (or
-`*.yml`) file of `conf_dir` is one capability, named after the file. Other files are ignored.
-Shipped in `etc/conf.d`:
+`*.yml`) file of `capabilities_dir` is one capability, named after the file. Other files are
+ignored. Shipped in `etc/capabilities.d`:
 
 | Capability | Detect | Collects |
 |------------|--------|----------|
@@ -374,7 +467,7 @@ counter wraps every
 sample type (`Counter32` or `Counter64`) tells them apart:
 
 ```yaml
-# conf.d/interfaces.yaml (excerpt)
+# capabilities.d/interfaces.yaml (excerpt)
 discovery:
   columns:
     ifDescr: 1.3.6.1.2.1.2.2.1.2
@@ -437,7 +530,7 @@ Processor rows carry `hrDeviceDescr`. The system uptime is the `uptime` metric o
 the uptime of the SNMP agent, which can restart without the system.
 
 ```yaml
-# conf.d/host-resources.yaml (excerpt)
+# capabilities.d/host-resources.yaml (excerpt)
 discovery:
   columns:
     hrStorageDescr: 1.3.6.1.2.1.25.2.3.1.3
@@ -460,12 +553,12 @@ tables:
 
 ### Capability examples
 
-Each example is one file of `conf_dir` (the test suite validates each of them).
+Each example is one file of `capabilities_dir` (the test suite validates each of them).
 
 A vendor capability, polled only on devices that have the Cisco CPU MIB:
 
 ```yaml
-# conf.d/cisco-cpu.yaml
+# capabilities.d/cisco-cpu.yaml
 description: Cisco CPU load
 detect:
   - 1.3.6.1.4.1.9.9.109.1.1.1.1.8      # cpmCPUTotal5minRev
@@ -478,7 +571,7 @@ tables:
 Raw, rate and volume:
 
 ```yaml
-# conf.d/tcp.yaml
+# capabilities.d/tcp.yaml
 description: TCP statistics (MIB-II)
 detect: [1.3.6.1.2.1.6]
 scalars:
@@ -493,7 +586,7 @@ A table without label: columns are walked on every poll and `include` matches th
 on walked rows too:
 
 ```yaml
-# conf.d/ucd-load.yaml
+# capabilities.d/ucd-load.yaml
 description: UCD-SNMP-MIB load averages (net-snmp) and UDP listeners
 detect: [1.3.6.1.4.1.2021.10]
 tables:
@@ -511,7 +604,7 @@ tables:
 A labelled table filtered at discovery, with extra discovery scalars:
 
 ```yaml
-# conf.d/ups.yaml
+# capabilities.d/ups.yaml
 description: UPS-MIB battery and inputs
 detect: [1.3.6.1.2.1.33.1.1]
 discovery:
@@ -533,11 +626,13 @@ tables:
 ## Examples
 
 Every example below is a complete main configuration file, used with the capabilities
-shipped in `etc/conf.d` (the test suite validates each of them).
+shipped in `etc/capabilities.d` (the test suite validates each of them). Everything but `global`
+can equally go in a file of `etc/conf.d`, as in the first one.
 
 ### Minimal: SNMPv2c
 
 ```yaml
+# conf.d/devices.yaml
 devices:
   - address: 192.0.2.10        # id: 192.0.2.10-161
     snmp:
@@ -545,8 +640,8 @@ devices:
       community: public        # encrypted in this file on startup
 ```
 
-Run it with `./snmp-poller -config etc/minimal.yaml`: the device gets every capability of
-`etc/conf.d` it supports (system group, interfaces, inventory). After the first start, the file
+Save it as `etc/conf.d/devices.yaml` and run `./snmp-poller`: the device gets every capability
+of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory). After the first start, the file
 reads `community: ~~6A0F...E1~~` (see [Credentials encryption](#credentials-encryption)).
 
 ### Device ids
@@ -759,7 +854,7 @@ with these log lines:
 
 ```text
 level=INFO msg="credentials key generated: back it up, encrypted credentials cannot be read without it" key=data/key.dat
-level=INFO msg="credentials encrypted in the configuration file" config=etc/snmp-poller.yaml count=1 key=data/key.dat
+level=INFO msg="credentials encrypted in the configuration" files=etc/conf.d/devices.yaml count=1 key=data/key.dat
 ```
 
 ### Vault: AppRole, default secret paths
@@ -1009,8 +1104,10 @@ Logs are meant to be read: there is no line per poll at `info` level.
 - **Credentials are never logged**: community strings, passwords and Vault tokens are
   redacted in every log line, error and data file. Vault errors carry Vault's own error
   messages only.
-- **Credentials**: on startup, `info` lines report a newly generated key and how many
-  credentials were encrypted in the configuration file, and a `warn` line why they could not
+- **Reloads**: an `info` line per applied configuration (devices added, removed, changed,
+  rediscovered), an `error` line per rejected one, with the reason.
+- **Credentials**: on startup and reload, `info` lines report a newly generated key and how many
+  credentials were encrypted in which configuration files, and a `warn` line why they could not
   be (read-only file, block scalar). A device whose Vault refresh fails logs a `warn` and keeps
   its previous credentials.
 
@@ -1038,7 +1135,7 @@ For example, for a switch with ifXTable:
 ```
 
 Device directories are wiped on startup (files such as `key.dat` are kept), and a device's
-directory is wiped on each of its rediscoveries. Files are replaced atomically. The discovery and state of a device are only
+directory is wiped on each of its rediscoveries and when a reload removes the device. Files are replaced atomically. The discovery and state of a device are only
 loaded in memory while that device is being polled, so memory does not grow with the number
 of devices, rows or polled OIDs.
 
@@ -1070,10 +1167,11 @@ credentials and the scheduler. The Vault client is tested against a fake Vault H
 | `internal/state` | On-disk previous values and rate/volume math. |
 | `internal/vault` | HashiCorp Vault client (KV v1/v2; token, AppRole, userpass, Kubernetes auth). |
 | `internal/output` | Output interface, registry and the `null` output. |
-| `internal/poller` | Scheduler, workers, discovery, collection, stats. |
+| `internal/poller` | Scheduler, workers, discovery, collection, configuration reload, stats. |
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
-| `etc/snmp-poller.yaml` | Default configuration. |
-| `etc/conf.d/` | Shipped capabilities (`system`, `interfaces`, `entity`). |
+| `etc/snmp-poller.yaml` | Default main configuration (no device). |
+| `etc/conf.d/` | Local configuration files (git-ignored), and `devices.yaml.example`. |
+| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`). |
 
 ### Versions and releases
 
@@ -1095,7 +1193,7 @@ commits and pull requests since the previous release, and these files:
 | `SHA256SUMS` | Checksums of the archives (`sha256sum -c SHA256SUMS`) |
 
 Each archive holds a `snmp-poller-<version>-<os>-<arch>/` directory with the binary, `etc/`
-(the configuration and `conf.d`), `README.md` and `LICENSE`, taken from the commit.
+(the main configuration, `conf.d` with its example and `capabilities.d`), `README.md` and `LICENSE`, taken from the commit.
 
 To release: change `VERSION` (e.g. `0.2`) and push to `main`. Pushing without changing
 `VERSION` only builds and tests. A failing check releases nothing; once fixed, the next push

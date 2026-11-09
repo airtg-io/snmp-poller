@@ -58,14 +58,18 @@ func (s *stats) snapshot() (interval, total counters) {
 }
 
 // reportStats logs one summary line per stats interval until ctx is done,
-// and a final one on exit.
+// and a final one on exit. The interval is read again after each line, so
+// a reload changes it.
 func (p *Poller) reportStats(ctx context.Context) {
-	t := time.NewTicker(p.cfg.StatsInterval)
-	defer t.Stop()
 	last := p.now()
 	for {
+		p.mu.Lock()
+		every := p.cfg.StatsInterval
+		p.mu.Unlock()
+		t := time.NewTimer(every)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			p.logStats(p.now().Sub(last))
 			return
 		case <-t.C:
@@ -85,7 +89,7 @@ func (p *Poller) logStats(window time.Duration) {
 	}
 	p.log.Info("poller stats",
 		"window", window.Round(time.Second),
-		"devices", len(p.devices),
+		"devices", p.count.Load(),
 		"in_progress", p.stats.inProgress.Load(),
 		"queued", p.stats.queued.Load(),
 		"failing_devices", p.stats.failing.Load(),
