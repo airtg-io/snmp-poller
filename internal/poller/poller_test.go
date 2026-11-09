@@ -764,6 +764,146 @@ devices: [{ id: rtr, address: 127.0.0.1, port: %d, snmp: { version: "%s", commun
 	}
 }
 
+// ciscoMemMIB has the memory pools of a chassis: CISCO-ENHANCED-MEMPOOL-MIB
+// (enhanced; hc adds its 64-bit columns) with a 6 GiB processor pool on the
+// route processor, an I/O pool and a line card pool, and/or
+// CISCO-MEMORY-POOL-MIB (old), its 32-bit view.
+func ciscoMemMIB(enhanced, hc, old bool) *testagent.MIB {
+	vals := sysMIB("rtr")
+	set := func(oid string, typ gosnmp.Asn1BER, v any) { vals[oid] = testagent.Value{Type: typ, Value: v} }
+	set("1.3.6.1.2.1.47.1.1.1.1.7.22", gosnmp.OctetString, "RP0")
+	set("1.3.6.1.2.1.47.1.1.1.1.7.1000", gosnmp.OctetString, "Line Card 1")
+	const gib = uint64(1) << 30
+	for _, row := range []struct {
+		idx, name  string
+		used, free uint64
+	}{
+		{"22.1", "Processor", 6 * gib, 2 * gib},
+		{"22.2", "I/O", 300, 700},
+		{"1000.1", "Processor", 1000, 3000},
+	} {
+		if !enhanced {
+			break
+		}
+		const cemp = "1.3.6.1.4.1.9.9.221.1.1.1.1."
+		set(cemp+"3."+row.idx, gosnmp.OctetString, row.name)
+		set(cemp+"7."+row.idx, gosnmp.Gauge32, uint(uint32(row.used))) // low 32 bits
+		set(cemp+"8."+row.idx, gosnmp.Gauge32, uint(uint32(row.free)))
+		set(cemp+"9."+row.idx, gosnmp.Gauge32, uint(uint32(row.free/2)))
+		if hc {
+			set(cemp+"18."+row.idx, gosnmp.Counter64, row.used)
+			set(cemp+"20."+row.idx, gosnmp.Counter64, row.free)
+			set(cemp+"22."+row.idx, gosnmp.Counter64, row.free/2)
+		}
+	}
+	if old {
+		const cmp = "1.3.6.1.4.1.9.9.48.1.1.1."
+		for _, row := range []struct {
+			idx, name  string
+			used, free uint
+		}{{"1", "Processor", 3_000_000, 1_000_000}, {"2", "I/O", 300, 700}} {
+			set(cmp+"2."+row.idx, gosnmp.OctetString, row.name)
+			set(cmp+"5."+row.idx, gosnmp.Gauge32, row.used)
+			set(cmp+"6."+row.idx, gosnmp.Gauge32, row.free)
+			set(cmp+"7."+row.idx, gosnmp.Gauge32, row.free/2)
+		}
+	}
+	return testagent.NewMIB(vals)
+}
+
+// TestShippedCiscoMemory polls the shipped memory capabilities:
+// cisco-enhanced-mempool is preferred, cisco-memory-pool is its fallback
+// (also when the device excludes the enhanced one), 64-bit columns are used
+// when the agent has them, except over SNMPv1.
+func TestShippedCiscoMemory(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		version           string
+		enhanced, hc, old bool
+		exclude           string
+		caps              string
+		want              []string // memory samples, sorted
+	}{
+		{"both MIBs, 64-bit", "2c", true, true, true, "", "[cisco-enhanced-mempool interfaces system]", []string{
+			"cempMemPoolFree.1000.1=3000 Counter64 (Processor,Line Card 1,1000)",
+			"cempMemPoolFree.22.1=2147483648 Counter64 (Processor,RP0,22)",
+			"cempMemPoolFree.22.2=700 Counter64 (I/O,RP0,22)",
+			"cempMemPoolLargestFree.1000.1=1500 Counter64 (Processor,Line Card 1,1000)",
+			"cempMemPoolLargestFree.22.1=1073741824 Counter64 (Processor,RP0,22)",
+			"cempMemPoolLargestFree.22.2=350 Counter64 (I/O,RP0,22)",
+			"cempMemPoolUsed.1000.1=1000 Counter64 (Processor,Line Card 1,1000)",
+			"cempMemPoolUsed.22.1=6442450944 Counter64 (Processor,RP0,22)",
+			"cempMemPoolUsed.22.2=300 Counter64 (I/O,RP0,22)",
+			"cempMemPoolUsedPercent.1000.1=25 Formula (Processor,Line Card 1,1000)",
+			"cempMemPoolUsedPercent.22.1=75 Formula (Processor,RP0,22)",
+			"cempMemPoolUsedPercent.22.2=30 Formula (I/O,RP0,22)",
+		}},
+		// The 32-bit view of the 6 GiB pool is wrong: what 64-bit columns are for.
+		{"enhanced, 32-bit only", "2c", true, false, false, "", "[cisco-enhanced-mempool interfaces system]", []string{
+			"cempMemPoolUsed.22.1=2147483648 Gauge32 (Processor,RP0,22)",
+		}},
+		{"enhanced over SNMPv1", "1", true, true, false, "", "[cisco-enhanced-mempool interfaces system]", []string{
+			"cempMemPoolUsed.22.1=2147483648 Gauge32 (Processor,RP0,22)",
+		}},
+		{"memory pool only", "2c", false, false, true, "", "[cisco-memory-pool interfaces system]", []string{
+			"ciscoMemoryPoolFree.1=1000000 Gauge32 (Processor,,)",
+			"ciscoMemoryPoolFree.2=700 Gauge32 (I/O,,)",
+			"ciscoMemoryPoolLargestFree.1=500000 Gauge32 (Processor,,)",
+			"ciscoMemoryPoolLargestFree.2=350 Gauge32 (I/O,,)",
+			"ciscoMemoryPoolUsed.1=3000000 Gauge32 (Processor,,)",
+			"ciscoMemoryPoolUsed.2=300 Gauge32 (I/O,,)",
+			"ciscoMemoryPoolUsedPercent.1=75 Formula (Processor,,)",
+			"ciscoMemoryPoolUsedPercent.2=30 Formula (I/O,,)",
+		}},
+		{"both MIBs, enhanced excluded", "2c", true, true, true, "cisco-enhanced-mempool", "[cisco-memory-pool interfaces system]", []string{
+			"ciscoMemoryPoolUsed.1=3000000 Gauge32 (Processor,,)",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := testagent.Start(t, nil, ciscoMemMIB(tc.enhanced, tc.hc, tc.old), nil)
+			out := &capture{}
+			d, store := shippedDevice(t, fmt.Sprintf(`
+devices: [{ id: rtr, address: 127.0.0.1, port: %d, exclude: [%s], snmp: { version: "%s", community: %s } }]
+`, agent.Port, tc.exclude, tc.version, testagent.Community), out)
+			res, err := d.poll(context.Background(), store, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.missing != 0 {
+				t.Errorf("missing oids = %d, want 0", res.missing)
+			}
+			if got := fmt.Sprint(loadDiscovery(t, store, "rtr").Capabilities); got != tc.caps {
+				t.Errorf("capabilities = %s, want %s", got, tc.caps)
+			}
+			got := map[string]bool{}
+			for _, s := range out.batches[0].Samples {
+				if s.Table != "enhanced_mempool" && s.Table != "memory_pool" {
+					continue
+				}
+				if want := "bytes"; strings.HasSuffix(s.Metric, "Percent") {
+					want = "percent"
+					if s.Unit != want {
+						t.Errorf("%s unit = %q", s.Metric, s.Unit)
+					}
+				} else if s.Unit != want {
+					t.Errorf("%s unit = %q", s.Metric, s.Unit)
+				}
+				got[fmt.Sprintf("%s.%s=%v %s (%s%s,%s,%s)", s.Metric, s.Index, s.Value, s.Type,
+					s.Labels["cempMemPoolName"], s.Labels["ciscoMemoryPoolName"],
+					s.Labels["mempoolEntityName"], s.Labels["mempoolPhysicalIndex"])] = true
+			}
+			for _, w := range tc.want {
+				if !got[w] {
+					t.Errorf("missing sample %s", w)
+				}
+			}
+			if n := len(tc.want); n > 1 && len(got) != n {
+				t.Errorf("%d memory samples, want %d:\n%s", len(got), n, strings.Join(slices.Sorted(maps.Keys(got)), "\n"))
+			}
+		})
+	}
+}
+
 // TestFormulas covers formulas on walked tables, missing inputs, emit:
 // false and unit suffixes on rates, with custom capabilities.
 func TestFormulas(t *testing.T) {

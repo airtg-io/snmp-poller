@@ -32,7 +32,8 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Capabilities**: one `*.yaml`/`*.yml` file per capability in capabilities_dir, named after the file.
   No `detect` = applies to every device; `detect: [oid...]` = applies when every OID subtree
   exists (one GETNEXT each, at discovery). Every capability found is polled unless the device
-  lists it in `exclude` (only explicit exclusion removes one). Devices may override a table's
+  lists it in `exclude` or it is `replaced_by` a capability that applies (detected, not
+  excluded, not itself replaced; names checked, no cycles) - the only two ways to remove one. Devices may override a table's
   `include` with `include: {table: [...]}`. Names are unique across capabilities; labels must
   come from the same capability. Shipped: `system` (always; sysDescr, sysObjectID, sysUpTime,
   sysContact, sysName, sysLocation as discovery scalars; polled: `uptime` = hrSystemUptime if
@@ -41,9 +42,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   hrSystemProcesses, memorySize, hrStorageTable size/used/free in bytes + used/free percent,
   hrProcessorLoad), `cisco-cpu` (detected: CISCO-PROCESS-MIB cpmCPUTotal5sec/1min/5minRev per
   CPU, per Cisco doc 15215; deprecated non-Rev objects not polled; rows named `cpuName` =
-  entPhysicalName via cpmCPUTotalPhysicalIndex). A discovery column is an OID or
-  `{oid, index}`: read at the index held by another (plain) discovery column of the same
-  capability, for cross-table names.
+  entPhysicalName via cpmCPUTotalPhysicalIndex), `cisco-enhanced-mempool` (detected,
+  per pool and entity, 64-bit HC columns via `high_capacity` probe without `speed` = all rows)
+  and its fallback `cisco-memory-pool` (CISCO-MEMORY-POOL-MIB, `replaced_by` the enhanced one:
+  never both). A discovery column is an OID, `{oid, index}` (read at the index held by another
+  discovery column of the same capability, itself without `index`) or `{oid, index_part: n}`
+  (rows of oid, value = n-th sub-id of the row index), for cross-table names.
 - **Formulas, units, fallbacks**: a scalar is exactly one of `oid`, `oids` (candidates in
   preference order, the first the agent has is chosen at discovery, cached as `sources` in
   discovery.json) or `formula`; a column is `oid`/`hc_oid` or `formula`. Formulas (`+ - * /`,

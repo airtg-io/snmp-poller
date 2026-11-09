@@ -1,0 +1,47 @@
+# Capability "cisco-enhanced-mempool": memory pools of Cisco devices, from
+# CISCO-ENHANCED-MEMPOOL-MIB cempMemPoolTable (1.3.6.1.4.1.9.9.221.1.1.1),
+# the memory MIB of current Cisco platforms (IOS XE, modular chassis, ...).
+# Applies to devices that have cempMemPoolUsed (detected at discovery).
+# Preferred to "cisco-memory-pool" (CISCO-MEMORY-POOL-MIB, older
+# platforms), which does not apply to a device this one applies to.
+#
+# One row per pool and physical entity: the table is indexed by
+# entPhysicalIndex (route processor, line card, ...) and cempMemPoolIndex,
+# so a chassis has a "Processor" pool per card. Rows are labelled by
+# cempMemPoolName, and carry mempoolPhysicalIndex (the first part of the
+# index) and mempoolEntityName (that entity's ENTITY-MIB entPhysicalName,
+# when the device has ENTITY-MIB).
+#
+# The Gauge32 columns stop at 4 GiB. At discovery, cempMemPoolHCUsed of the
+# first pool is fetched: if the agent has it, every pool is polled with the
+# 64-bit HC columns (hc_oid), else with the 32-bit ones (oid), and so over
+# SNMPv1, which cannot carry 64-bit values. Metric names do not change.
+description: Cisco CISCO-ENHANCED-MEMPOOL-MIB memory pools, 64-bit when available
+
+detect:
+  - 1.3.6.1.4.1.9.9.221.1.1.1.1.7      # cempMemPoolUsed
+
+discovery:
+  columns:
+    cempMemPoolName: 1.3.6.1.4.1.9.9.221.1.1.1.1.3     # e.g. "Processor", "I/O"
+    mempoolPhysicalIndex:                              # entPhysicalIndex, from the row index
+      oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+      index_part: 1
+    mempoolEntityName:                                 # entPhysicalName of that entity
+      oid: 1.3.6.1.2.1.47.1.1.1.1.7
+      index: mempoolPhysicalIndex
+
+tables:
+  - name: enhanced_mempool
+    label: cempMemPoolName
+    labels: [mempoolEntityName, mempoolPhysicalIndex]
+    high_capacity:
+      probe: 1.3.6.1.4.1.9.9.221.1.1.1.1.18           # cempMemPoolHCUsed.<first pool>
+    columns:
+      - { name: cempMemPoolUsed,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: bytes }
+      - { name: cempMemPoolFree,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.8, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.20, unit: bytes }
+      # Largest contiguous free block: fragmentation shows as a low value
+      # next to a high cempMemPoolFree.
+      - { name: cempMemPoolLargestFree, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.9, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.22, unit: bytes }
+      # Used + Free is the size of the pool.
+      - { name: cempMemPoolUsedPercent, formula: "cempMemPoolUsed * 100 / (cempMemPoolUsed + cempMemPoolFree)", unit: percent }

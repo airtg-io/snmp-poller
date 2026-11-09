@@ -1,0 +1,33 @@
+# Capability "cisco-memory-pool": memory pools of older Cisco devices, from
+# CISCO-MEMORY-POOL-MIB ciscoMemoryPoolTable (1.3.6.1.4.1.9.9.48.1.1).
+# Applies to devices that have ciscoMemoryPoolUsed (detected at discovery)
+# and to which "cisco-enhanced-mempool" (CISCO-ENHANCED-MEMPOOL-MIB, the
+# current MIB, 64-bit and per physical entity) does not apply: many devices
+# have both MIBs, and the same pools would be reported twice.
+#
+# One row per pool, indexed by ciscoMemoryPoolType (1 processor, 2 i/o,
+# 3 pci, 4 fast, 5 multibus, above for dynamic pools), labelled by
+# ciscoMemoryPoolName. Values are Gauge32 bytes: this MIB cannot report
+# pools of 4 GiB or more.
+description: Cisco CISCO-MEMORY-POOL-MIB memory pools, when CISCO-ENHANCED-MEMPOOL-MIB is missing
+
+detect:
+  - 1.3.6.1.4.1.9.9.48.1.1.1.5         # ciscoMemoryPoolUsed
+
+replaced_by: [cisco-enhanced-mempool]
+
+discovery:
+  columns:
+    ciscoMemoryPoolName: 1.3.6.1.4.1.9.9.48.1.1.1.2    # e.g. "Processor", "I/O"
+
+tables:
+  - name: memory_pool
+    label: ciscoMemoryPoolName
+    columns:
+      - { name: ciscoMemoryPoolUsed,        oid: 1.3.6.1.4.1.9.9.48.1.1.1.5, unit: bytes }
+      - { name: ciscoMemoryPoolFree,        oid: 1.3.6.1.4.1.9.9.48.1.1.1.6, unit: bytes }
+      # Largest contiguous free block: fragmentation shows as a low value
+      # next to a high ciscoMemoryPoolFree.
+      - { name: ciscoMemoryPoolLargestFree, oid: 1.3.6.1.4.1.9.9.48.1.1.1.7, unit: bytes }
+      # Used + Free is the size of the pool.
+      - { name: ciscoMemoryPoolUsedPercent, formula: "ciscoMemoryPoolUsed * 100 / (ciscoMemoryPoolUsed + ciscoMemoryPoolFree)", unit: percent }

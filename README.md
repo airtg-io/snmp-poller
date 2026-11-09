@@ -13,8 +13,8 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
 - **Hot reload**: edited files are validated and applied without restart (or on `SIGHUP`);
   devices keep their discovery cycle, an invalid change is logged and ignored.
 - **Capabilities**: what to poll lives in `etc/capabilities.d/`, one file per capability (system
-  group, interfaces, host resources, inventory, Cisco CPUs, ...). Discovery finds which capabilities each device has, and every one
-  found is polled unless the device excludes it.
+  group, interfaces, host resources, inventory, Cisco CPUs and memory, ...). Discovery finds which capabilities each device has, and every one
+  found is polled unless the device excludes it or a preferred capability replaces it.
 - **Discovery** on the first poll and then every hour (configurable) for slow-changing data:
   sysDescr, sysName, sysLocation, model, interface names, ... cached **on disk**.
 - **Interfaces** use 64-bit ifXTable counters when the agent has them and the interface is faster
@@ -455,8 +455,11 @@ ignored. Shipped in `etc/capabilities.d`:
 | `entity` | `entPhysicalModelName` | Discovery: ENTITY-MIB name, model and serial number of every physical entity. |
 | `host-resources` | HOST-RESOURCES-MIB (`1.3.6.1.2.1.25`) | Number of processes, memory size, size, used and free bytes and used and free percentages of every storage (RAM, swap, file systems), load of every processor. See [below](#the-host-resources-capability). |
 | `cisco-cpu` | `cpmCPUTotal5minRev` | CISCO-PROCESS-MIB busy percentage of every CPU over 5 seconds, 1 minute and 5 minutes, named after its ENTITY-MIB entry. See [below](#the-cisco-cpu-capability). |
+| `cisco-enhanced-mempool` | `cempMemPoolUsed` | CISCO-ENHANCED-MEMPOOL-MIB used, free and largest free bytes and used percentage of every memory pool of every card, 64-bit when available. See [below](#the-cisco-memory-capabilities). |
+| `cisco-memory-pool` | `ciscoMemoryPoolUsed`, unless `cisco-enhanced-mempool` applies | CISCO-MEMORY-POOL-MIB used, free and largest free bytes and used percentage of every memory pool, for older Cisco devices. See [below](#the-cisco-memory-capabilities). |
 
-Every device gets every capability discovery finds, except those listed in its `exclude`.
+Every device gets every capability discovery finds, except those listed in its `exclude` and
+those replaced by a capability that applies to it (`replaced_by`).
 Scalar and table names must be unique across all capabilities, since several of them apply
 to the same device. A discovery entry may appear in several capabilities with the same OID.
 Several metrics, in one or several capabilities, may read the same OID: it is fetched once per
@@ -470,8 +473,9 @@ A table can only use discovery columns of its own capability as labels.
 |-----|-------------|
 | `description` | Free text. |
 | `detect` | Optional list of OID subtrees that must **all** exist on the agent (checked with one GETNEXT each, at discovery). Without `detect`, the capability applies to every device. |
+| `replaced_by` | Optional list of capabilities preferred to this one: when one of them applies to the device (detected, not excluded by the device, not itself replaced), this one does not. For a fallback on agents without the preferred MIB, e.g. `replaced_by: [cisco-enhanced-mempool]`. The names must be capabilities of `capabilities_dir`, and no capability may be replaced by itself, even indirectly. |
 | `discovery.scalars` | Map of name to scalar OID, fetched on discovery (e.g. `sysName: 1.3.6.1.2.1.1.5.0`). Cached on disk and attached to every batch. |
-| `discovery.columns` | Map of name to table column OID, walked on discovery (e.g. `ifDescr: 1.3.6.1.2.1.2.2.1.2`). Used as table labels. A column of another table can be read through a column holding its index: `{ oid, index }` gives, at each row of the `index` discovery column (of the same capability, itself a plain OID), the value of `oid` at the index that row holds (e.g. `cpuName: { oid: 1.3.6.1.2.1.47.1.1.1.1.7, index: cpmCPUTotalPhysicalIndex }`, the entPhysicalName each CPU points to). Rows whose index is not found in `oid` have no value. |
+| `discovery.columns` | Map of name to table column OID, walked on discovery (e.g. `ifDescr: 1.3.6.1.2.1.2.2.1.2`). Used as table labels. A column of another table can be read through a column holding its index: `{ oid, index }` gives, at each row of the `index` discovery column (of the same capability, itself a plain OID), the value of `oid` at the index that row holds (e.g. `cpuName: { oid: 1.3.6.1.2.1.47.1.1.1.1.7, index: cpmCPUTotalPhysicalIndex }`, the entPhysicalName each CPU points to). Rows whose index is not found in `oid` have no value. `{ oid, index_part: n }` gives, at each row of `oid`, the n-th sub-identifier (from 1) of the row's index, for tables indexed by another table's index (e.g. the `entPhysicalIndex` that starts the index of `cempMemPoolTable`); it can be the `index` of another column. |
 | `scalars` | Metrics polled every cycle, see below. |
 | `tables` | Tables polled every cycle, see below. |
 
@@ -495,7 +499,7 @@ A table can only use discovery columns of its own capability as labels.
 | `label` | Optional discovery column naming each row (e.g. `ifDescr`). With a label, rows are selected at discovery and fetched with GET. Without one, columns are walked on every poll. |
 | `include` | Optional list of regular expressions ([RE2 syntax](https://github.com/google/re2/wiki/Syntax)). A row is polled if **any** pattern matches its label (or its index when there is no label). No patterns: every row. Use anchors (`^...$`) for exact matches. Devices can override it with their own `include`. |
 | `labels` | Optional extra discovery columns attached to each sample (e.g. `[ifName, ifAlias]`). |
-| `high_capacity` | Optional, needs a `label`: `{ probe, speed, above }`. At discovery, `probe` (a column OID) is fetched for the first row. If the agent has it, rows whose `speed` discovery column is strictly greater than `above` (default `100000000`) use the `hc_oid` of their columns. Never used over SNMPv1, which cannot carry 64-bit counters. |
+| `high_capacity` | Optional, needs a `label`: `{ probe, speed, above }`. At discovery, `probe` (a column OID) is fetched for the first row. If the agent has it, rows whose `speed` discovery column is strictly greater than `above` (default `100000000`) use the `hc_oid` of their columns; without `speed`, every row does. Never used over SNMPv1, which cannot carry 64-bit counters. |
 | `columns` | List of `{ name, oid, hc_oid, formula, unit, modes, emit }`. `oid` is the column OID, without row index. `hc_oid` is the column used on high-capacity rows instead. A column with only `hc_oid` is polled on high-capacity rows only. A column with a `formula` is computed, per row, from the columns of the same table defined above it (see [Formulas](#formulas)). `unit`, `modes` and `emit` are as for scalars. A table without `label` needs at least one column with an `oid`. |
 
 The shipped `interfaces` capability uses `high_capacity` to pick, per interface, between the
@@ -627,29 +631,73 @@ tables:
       - { name: cpmCPUTotal5minRev, oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8, unit: percent }
 ```
 
-### Capability examples
+### The Cisco memory capabilities
 
-Each example is one file of `capabilities_dir` (the test suite validates each of them).
+Cisco devices report memory pools ("Processor", "I/O", ...) in two MIBs: the current
+CISCO-ENHANCED-MEMPOOL-MIB (64-bit values, pools of every card of a chassis) and the older
+CISCO-MEMORY-POOL-MIB (32-bit values only, wrong for pools of 4 GiB or more). Many devices
+have both, which would report the same pools twice, so `cisco-memory-pool` has
+`replaced_by: [cisco-enhanced-mempool]`: discovery checks both, and picks the enhanced MIB when
+the device has it, CISCO-MEMORY-POOL-MIB otherwise. A device that excludes
+`cisco-enhanced-mempool` (e.g. a buggy agent) gets `cisco-memory-pool` instead.
 
-A vendor capability, polled only on devices that have the Cisco memory pool MIB, with rows
-named by pool:
+| Metric | Table | Unit | From |
+|--------|-------|------|------|
+| `cempMemPoolUsed` | `enhanced_mempool` | bytes | Bytes in use: `cempMemPoolHCUsed` (64-bit) when the agent has it, else `cempMemPoolUsed` |
+| `cempMemPoolFree` | `enhanced_mempool` | bytes | Free bytes: `cempMemPoolHCFree` or `cempMemPoolFree` |
+| `cempMemPoolLargestFree` | `enhanced_mempool` | bytes | Largest contiguous free block: `cempMemPoolHCLargestFree` or `cempMemPoolLargestFree` |
+| `cempMemPoolUsedPercent` | `enhanced_mempool` | percent | `cempMemPoolUsed * 100 / (cempMemPoolUsed + cempMemPoolFree)` |
+| `ciscoMemoryPoolUsed` | `memory_pool` | bytes | Bytes in use |
+| `ciscoMemoryPoolFree` | `memory_pool` | bytes | Free bytes |
+| `ciscoMemoryPoolLargestFree` | `memory_pool` | bytes | Largest contiguous free block |
+| `ciscoMemoryPoolUsedPercent` | `memory_pool` | percent | `ciscoMemoryPoolUsed * 100 / (ciscoMemoryPoolUsed + ciscoMemoryPoolFree)` |
+
+`enhanced_mempool` rows are indexed by `<entPhysicalIndex>.<cempMemPoolIndex>`, labelled by
+`cempMemPoolName`, and carry `mempoolPhysicalIndex` (the `entPhysicalIndex`) and
+`mempoolEntityName` (its ENTITY-MIB `entPhysicalName`, e.g. `RP0`, when the device has
+ENTITY-MIB). The 64-bit columns are chosen at discovery, for every pool, when the agent
+answers `cempMemPoolHCUsed` for the first one (never over SNMPv1). `memory_pool` rows are
+indexed by `ciscoMemoryPoolType` (1 processor, 2 I/O, ...) and labelled by
+`ciscoMemoryPoolName`. A low largest free block next to a high free amount means fragmented
+memory.
 
 ```yaml
-# capabilities.d/cisco-memory.yaml
-description: Cisco memory pools (CISCO-MEMORY-POOL-MIB)
+# capabilities.d/cisco-memory-pool.yaml (excerpt)
 detect:
   - 1.3.6.1.4.1.9.9.48.1.1.1.5         # ciscoMemoryPoolUsed
+replaced_by: [cisco-enhanced-mempool]
 discovery:
   columns:
-    ciscoMemoryPoolName: 1.3.6.1.4.1.9.9.48.1.1.1.2   # e.g. "Processor", "I/O"
+    ciscoMemoryPoolName: 1.3.6.1.4.1.9.9.48.1.1.1.2
 tables:
   - name: memory_pool
     label: ciscoMemoryPoolName
     columns:
       - { name: ciscoMemoryPoolUsed, oid: 1.3.6.1.4.1.9.9.48.1.1.1.5, unit: bytes }
-      - { name: ciscoMemoryPoolFree, oid: 1.3.6.1.4.1.9.9.48.1.1.1.6, unit: bytes }
-      - { name: ciscoMemoryPoolUsedPercent, formula: "ciscoMemoryPoolUsed * 100 / (ciscoMemoryPoolUsed + ciscoMemoryPoolFree)", unit: percent }
 ```
+
+```yaml
+# capabilities.d/cisco-enhanced-mempool.yaml (excerpt)
+detect:
+  - 1.3.6.1.4.1.9.9.221.1.1.1.1.7      # cempMemPoolUsed
+discovery:
+  columns:
+    cempMemPoolName: 1.3.6.1.4.1.9.9.221.1.1.1.1.3
+    mempoolPhysicalIndex: { oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.3, index_part: 1 }
+    mempoolEntityName: { oid: 1.3.6.1.2.1.47.1.1.1.1.7, index: mempoolPhysicalIndex }
+tables:
+  - name: enhanced_mempool
+    label: cempMemPoolName
+    labels: [mempoolEntityName, mempoolPhysicalIndex]
+    high_capacity:
+      probe: 1.3.6.1.4.1.9.9.221.1.1.1.1.18           # cempMemPoolHCUsed: no speed, every pool
+    columns:
+      - { name: cempMemPoolUsed, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: bytes }
+```
+
+### Capability examples
+
+Each example is one file of `capabilities_dir` (the test suite validates each of them).
 
 Raw, rate and volume:
 
@@ -882,7 +930,7 @@ devices:
 ```
 
 Save it as `etc/conf.d/devices.yaml` and run `./snmp-poller`: the device gets every capability
-of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory, Cisco CPUs). After the first start, the file
+of `etc/capabilities.d` it supports (system group, interfaces, host resources, inventory, Cisco CPUs and memory). After the first start, the file
 reads `community: ~~6A0F...E1~~` (see [Credentials encryption](#credentials-encryption)).
 
 ### Device ids
@@ -1191,7 +1239,8 @@ devices:
 
 ### Capabilities per device: exclude and row filter
 
-Every capability found by discovery is polled. `exclude` removes some for one device, and
+Every capability found by discovery is polled, except those replaced by a preferred one
+(`replaced_by`, e.g. `cisco-memory-pool` when `cisco-enhanced-mempool` applies). `exclude` removes some for one device, and
 `include` replaces the row filter of a table for one device. The shipped `interfaces` table
 is labelled by `ifDescr`, so the patterns match interface descriptions.
 
@@ -1377,7 +1426,7 @@ Logs are meant to be read: there is no line per poll at `info` level.
   `device` id and the error, and its recovery is an `info`. Repeated failures only show up in
   the stats line, so a dead device does not flood the logs.
 - **Tracing**: `trace: true` on a device (or `logging.level: debug` for all) adds debug lines
-  for that device only, all tagged with `device=<id>`: capabilities not detected, discovery
+  for that device only, all tagged with `device=<id>`: capabilities not detected or replaced, discovery
   results (capabilities, selected and high-capacity rows), poll
   duration and sample count, OIDs the agent did not return, skipped polls.
 - **Credentials are never logged**: community strings, passwords and Vault tokens are
@@ -1456,7 +1505,7 @@ server; the sinks against fake destinations, their requests decoded with indepen
 | `internal/testconf` | Test helper: a configuration with its capabilities in a temporary directory. |
 | `etc/snmp-poller.yaml` | Default main configuration (no device). |
 | `etc/conf.d/` | Local configuration files (git-ignored), `devices.yaml.example` and `sinks.yaml.example`. |
-| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`, `cisco-cpu`). |
+| `etc/capabilities.d/` | Shipped capabilities (`system`, `interfaces`, `entity`, `host-resources`, `cisco-cpu`, `cisco-enhanced-mempool`, `cisco-memory-pool`). |
 
 ### Versions and releases
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -28,10 +29,14 @@ type CapabilityFile struct {
 	// Detect lists OID subtrees that must all exist on the agent for the
 	// capability to apply. Without it, the capability applies to every
 	// device.
-	Detect    []string  `yaml:"detect"`
-	Discovery Discovery `yaml:"discovery"`
-	Scalars   []Scalar  `yaml:"scalars"`
-	Tables    []Table   `yaml:"tables"`
+	Detect []string `yaml:"detect"`
+	// ReplacedBy names capabilities that take precedence: when one of them
+	// applies to the device, this one does not (a fallback for agents
+	// without the preferred MIB).
+	ReplacedBy []string  `yaml:"replaced_by"`
+	Discovery  Discovery `yaml:"discovery"`
+	Scalars    []Scalar  `yaml:"scalars"`
+	Tables     []Table   `yaml:"tables"`
 }
 
 // Discovery lists slow-changing data collected on discovery runs.
@@ -43,21 +48,29 @@ type Discovery struct {
 }
 
 // DiscoveryColumn is a table column walked on discovery. Written as a bare
-// OID, its rows are the column's own. With Index, it belongs to another
-// table: row r takes the value of OID at the index found in column Index
-// at row r (e.g. CISCO-PROCESS-MIB cpmCPUTotalPhysicalIndex pointing into
-// ENTITY-MIB entPhysicalTable, for entPhysicalName).
+// OID, its rows and values are the column's own. Two forms read other data:
+//   - Index: OID belongs to another table: row r takes the value of OID at
+//     the index found in column Index at row r (e.g. CISCO-PROCESS-MIB
+//     cpmCPUTotalPhysicalIndex pointing into ENTITY-MIB entPhysicalTable,
+//     for entPhysicalName);
+//   - IndexPart n: the rows of OID, each valued with the n-th
+//     sub-identifier (from 1) of its own index (e.g. the entPhysicalIndex
+//     that starts the index of CISCO-ENHANCED-MEMPOOL-MIB cempMemPoolTable).
 type DiscoveryColumn struct {
-	OID   string `yaml:"oid"`
-	Index string `yaml:"index"`
+	OID       string `yaml:"oid"`
+	Index     string `yaml:"index"`
+	IndexPart int    `yaml:"index_part"`
 }
 
-// String is the OID, followed by the index column if any.
+// String is the OID, followed by the index column or index part if any.
 func (c DiscoveryColumn) String() string {
-	if c.Index == "" {
-		return c.OID
+	switch {
+	case c.Index != "":
+		return c.OID + " at index " + c.Index
+	case c.IndexPart > 0:
+		return fmt.Sprintf("%s index part %d", c.OID, c.IndexPart)
 	}
-	return c.OID + " at index " + c.Index
+	return c.OID
 }
 
 // UnmarshalYAML accepts a bare OID or a mapping { oid, index }.
@@ -66,11 +79,11 @@ func (c *DiscoveryColumn) UnmarshalYAML(n *yaml.Node) error {
 		return n.Decode(&c.OID)
 	}
 	if n.Kind != yaml.MappingNode {
-		return fmt.Errorf("line %d: a discovery column is an oid or { oid, index }", n.Line)
+		return fmt.Errorf("line %d: a discovery column is an oid or { oid, index } or { oid, index_part }", n.Line)
 	}
 	// Node.Decode does not inherit the decoder's KnownFields: check here.
 	for i := 0; i < len(n.Content); i += 2 {
-		if k := n.Content[i].Value; k != "oid" && k != "index" {
+		if k := n.Content[i].Value; k != "oid" && k != "index" && k != "index_part" {
 			return fmt.Errorf("line %d: field %s not found in discovery column", n.Content[i].Line, k)
 		}
 	}
@@ -127,7 +140,7 @@ type Table struct {
 // (typically ifTable 32-bit counters and ifXTable 64-bit counters).
 // At discovery, Probe is fetched for the first row: if the agent has it,
 // the high-capacity columns are available, and rows whose Speed column is
-// strictly above Above use hc_oid.
+// strictly above Above use hc_oid. Without Speed, every row uses hc_oid.
 type HighCapacity struct {
 	Probe string `yaml:"probe"`
 	Speed string `yaml:"speed"`
@@ -160,10 +173,12 @@ type Capability struct {
 	Name        string
 	Description string
 	// Detect is empty for capabilities that apply to every device.
-	Detect    []string
-	Discovery Discovery
-	Scalars   []Scalar
-	Tables    []TableSpec
+	Detect []string
+	// ReplacedBy: capabilities whose presence on a device removes this one.
+	ReplacedBy []string
+	Discovery  Discovery
+	Scalars    []Scalar
+	Tables     []TableSpec
 
 	hash string // of the file content, see Fingerprint
 }
@@ -248,7 +263,7 @@ func loadCapabilities(dir string) ([]*Capability, []fileData, error) {
 		return nil, nil, err
 	}
 	sort.Slice(caps, func(i, j int) bool { return caps[i].Name < caps[j].Name })
-	if err := checkUnique(caps); err != nil {
+	if err := errors.Join(checkUnique(caps), checkReplacements(caps)); err != nil {
 		return nil, nil, fmt.Errorf("capabilities in %s: %w", dir, err)
 	}
 	return caps, read, nil
@@ -307,10 +322,21 @@ func checkCapability(f CapabilityFile) error {
 			add("discovery scalar %q: invalid oid %q", k, f.Discovery.Scalars[k])
 		}
 	}
+	for i, r := range f.ReplacedBy {
+		if !idPattern.MatchString(r) {
+			add("replaced_by: invalid capability name %q", r)
+		}
+		if slices.Contains(f.ReplacedBy[:i], r) {
+			add("replaced_by: duplicate %q", r)
+		}
+	}
 	for _, k := range sortedKeys(f.Discovery.Columns) {
 		col := f.Discovery.Columns[k]
 		if !oidPattern.MatchString(col.OID) {
 			add("discovery column %q: invalid oid %q", k, col.OID)
+		}
+		if col.IndexPart < 0 || (col.IndexPart > 0 && col.Index != "") {
+			add("discovery column %q: index_part must be at least 1, without index", k)
 		}
 		if col.Index == "" {
 			continue
@@ -382,8 +408,11 @@ func checkCapability(f CapabilityFile) error {
 			if !oidPattern.MatchString(hc.Probe) {
 				add("table %q: high_capacity.probe: invalid oid %q", t.Name, hc.Probe)
 			}
-			if !isColumn(hc.Speed) {
+			switch {
+			case hc.Speed != "" && !isColumn(hc.Speed):
 				add("table %q: high_capacity.speed %q is not a discovery column of this capability", t.Name, hc.Speed)
+			case hc.Speed == "" && hc.Above != 0:
+				add("table %q: high_capacity.above requires high_capacity.speed", t.Name)
 			}
 		}
 		cols := map[string]bool{}
@@ -460,6 +489,7 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 	for _, oid := range f.Detect {
 		c.Detect = append(c.Detect, normOID(oid))
 	}
+	c.ReplacedBy = f.ReplacedBy
 	for k, v := range f.Discovery.Scalars {
 		c.Discovery.Scalars[k] = normOID(v)
 	}
@@ -485,7 +515,7 @@ func normalizeCapability(name string, f CapabilityFile) *Capability {
 		if hc := t.HighCapacity; hc != nil {
 			n := *hc
 			n.Probe = normOID(n.Probe)
-			if n.Above == 0 {
+			if n.Above == 0 && n.Speed != "" {
 				n.Above = DefaultHighCapacitySpeed
 			}
 			ts.HighCapacity = &n
@@ -549,6 +579,51 @@ func checkUnique(caps []*Capability) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// checkReplacements checks that replaced_by names existing capabilities,
+// without cycles (a capability replaced, even indirectly, by itself).
+func checkReplacements(caps []*Capability) error {
+	byName := map[string]*Capability{}
+	for _, c := range caps {
+		byName[c.Name] = c
+	}
+	var errs []error
+	for _, c := range caps {
+		for _, r := range c.ReplacedBy {
+			if byName[r] == nil {
+				errs = append(errs, fmt.Errorf("capability %q: replaced_by: no capability %q", c.Name, r))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	// Depth-first search: a capability met again on the current path is a cycle.
+	state := map[string]int{} // 1 = on the path, 2 = done
+	var visit func(c *Capability, path []string) error
+	visit = func(c *Capability, path []string) error {
+		switch state[c.Name] {
+		case 1:
+			return fmt.Errorf("capabilities replace each other: %s", strings.Join(append(path, c.Name), " replaced by "))
+		case 2:
+			return nil
+		}
+		state[c.Name] = 1
+		for _, r := range c.ReplacedBy {
+			if err := visit(byName[r], append(path, c.Name)); err != nil {
+				return err
+			}
+		}
+		state[c.Name] = 2
+		return nil
+	}
+	for _, c := range caps {
+		if err := visit(c, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // mustFormula compiles an already checked formula; nil for none.

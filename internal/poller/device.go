@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
@@ -216,8 +217,9 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 	}
 
 	// 1. Capabilities: those without detect always apply, the others when
-	// every detect subtree exists on the agent.
-	var active []*config.Capability
+	// every detect subtree exists on the agent; then a capability does not
+	// apply when one it is replaced by does.
+	detected := map[string]bool{}
 	for _, cp := range d.spec.Capabilities {
 		ok, err := detect(c, cp)
 		if err != nil {
@@ -225,6 +227,16 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 		if !ok {
 			d.log.Debug("capability not detected", "capability", cp.Name)
+		}
+		detected[cp.Name] = ok
+	}
+	var active []*config.Capability
+	for _, cp := range d.spec.Capabilities {
+		if !detected[cp.Name] {
+			continue
+		}
+		if by := d.replacedBy(cp, detected); by != "" {
+			d.log.Debug("capability replaced", "capability", cp.Name, "by", by)
 			continue
 		}
 		active = append(active, cp)
@@ -235,6 +247,7 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 	scalars := map[string][]string{} // oid -> names
 	columns := map[string][]string{}
 	indexed := map[string]config.DiscoveryColumn{} // name -> column read through an index column
+	parts := map[string]config.DiscoveryColumn{}   // name -> column valued by a part of its rows' index
 	for _, cp := range active {
 		for name, oid := range cp.Discovery.Scalars {
 			if !slices.Contains(scalars[oid], name) {
@@ -244,6 +257,9 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		for name, col := range cp.Discovery.Columns {
 			if col.Index != "" {
 				indexed[name] = col
+			}
+			if col.IndexPart > 0 {
+				parts[name] = col
 			}
 			if !slices.Contains(columns[col.OID], name) {
 				columns[col.OID] = append(columns[col.OID], name)
@@ -293,7 +309,9 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 	}
 
-	// 3. Columns, walked. A column read through an index column takes, at
+	// 3. Columns, walked. A column with an index_part takes the rows of its
+	// OID, each valued with that sub-identifier of its index. Then a column
+	// read through an index column (possibly an index_part one) takes, at
 	// each row of the index column, the value at the index it holds.
 	walked := map[string]map[string]string{} // oid -> index -> value
 	for _, root := range slices.Sorted(maps.Keys(columns)) {
@@ -313,10 +331,19 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 		walked[root] = vals
 		for _, name := range columns[root] {
-			if _, ok := indexed[name]; !ok {
+			if _, ok := indexed[name]; !ok && parts[name].IndexPart == 0 {
 				disc.Columns[name] = vals
 			}
 		}
+	}
+	for name, col := range parts {
+		vals := map[string]string{}
+		for idx := range walked[col.OID] {
+			if sub := strings.Split(idx, "."); col.IndexPart <= len(sub) {
+				vals[idx] = sub[col.IndexPart-1]
+			}
+		}
+		disc.Columns[name] = vals
 	}
 	for name, col := range indexed {
 		vals := map[string]string{}
@@ -343,6 +370,19 @@ func (d *device) discover(c *snmp.Client, now func() time.Time) (*Discovery, err
 		}
 	}
 	return disc, nil
+}
+
+// replacedBy returns the first capability of cp.ReplacedBy that applies to
+// the device (detected, and not itself replaced), or "". The configuration
+// has no replacement cycle. A capability the device excludes never applies.
+func (d *device) replacedBy(cp *config.Capability, detected map[string]bool) string {
+	for _, name := range cp.ReplacedBy {
+		i := slices.IndexFunc(d.spec.Capabilities, func(c *config.Capability) bool { return c.Name == name })
+		if i >= 0 && detected[name] && d.replacedBy(d.spec.Capabilities[i], detected) == "" {
+			return name
+		}
+	}
+	return ""
 }
 
 func detect(c *snmp.Client, cp *config.Capability) (bool, error) {
@@ -381,6 +421,10 @@ func (d *device) selectRows(c *snmp.Client, t *config.TableSpec, disc *Discovery
 		td.HighCapacity = len(pdus) > 0
 		if td.HighCapacity {
 			for _, idx := range td.Rows {
+				if hc.Speed == "" {
+					td.HighCapacityRows = append(td.HighCapacityRows, idx)
+					continue
+				}
 				speed, err := strconv.ParseUint(disc.Columns[hc.Speed][idx], 10, 64)
 				if err == nil && speed > hc.Above {
 					td.HighCapacityRows = append(td.HighCapacityRows, idx)

@@ -563,6 +563,21 @@ tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: 
 			"a.yaml": `discovery: { columns: { p: 1.2, n: { oid: 1.3, index: p } } }`,
 			"b.yaml": `discovery: { columns: { n: 1.3 } }`,
 		}, `discovery column "n" has different oids in "a" (.1.3 at index p) and "b" (.1.3)`},
+		{map[string]string{"a.yaml": `discovery: { columns: { n: { oid: 1.3, index_part: -1 } } }`}, "index_part must be at least 1"},
+		{map[string]string{"a.yaml": `discovery: { columns: { p: 1.2, n: { oid: 1.3, index: p, index_part: 1 } } }`}, "index_part must be at least 1, without index"},
+		{map[string]string{"a.yaml": `
+discovery: { columns: { n: 1.3.1 } }
+tables: [{ name: t, label: n, high_capacity: { probe: 1.3, above: 10 }, columns: [{ name: c, oid: 1.3 }] }]`}, "high_capacity.above requires high_capacity.speed"},
+		// replaced_by
+		{map[string]string{"a.yaml": "replaced_by: [b]\n" + uptime}, `capability "a": replaced_by: no capability "b"`},
+		{map[string]string{"a.yaml": "replaced_by: [a b]\n" + uptime}, `replaced_by: invalid capability name "a b"`},
+		{map[string]string{"a.yaml": "replaced_by: [b, b]\n" + uptime}, `replaced_by: duplicate "b"`},
+		{map[string]string{"a.yaml": "replaced_by: [a]\n" + uptime}, "capabilities replace each other: a replaced by a"},
+		{map[string]string{
+			"a.yaml": "replaced_by: [b]\n" + uptime,
+			"b.yaml": "replaced_by: [c]\nscalars: [{ name: b, oid: 1.3 }]",
+			"c.yaml": "replaced_by: [a]\nscalars: [{ name: c, oid: 1.3 }]",
+		}, "capabilities replace each other: a replaced by b replaced by c replaced by a"},
 	} {
 		_, err := parseWith(t, `devices: []`, tc.caps)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
