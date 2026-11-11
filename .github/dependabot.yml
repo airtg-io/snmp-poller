@@ -1,0 +1,17 @@
+# Keeps the Go dependencies and the GitHub Actions up to date. The AIrtg
+# schema (github.com/airtg-io/schema) gets PRs of its own: a new version
+# of the wire contract is reviewed on its own, never buried in a group.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns: ["*"]
+        exclude-patterns: ["github.com/airtg-io/*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

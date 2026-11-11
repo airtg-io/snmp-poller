@@ -13,7 +13,9 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Version and releases**: version in `VERSION` (MAJOR.MINOR[.PATCH]), embedded with the commit
   (`-version`). CI (`.github/workflows/go.yml`) builds every push/PR; a push to main whose
   version has no tag `v<version>` yet creates the tag and a GitHub release with the archives.
-  Unchanged VERSION = build only. Never create release tags by hand for unreleased versions. Plain `go build ./cmd/snmp-poller` / `go test ./...` work too.
+  Unchanged VERSION = build only. Never create release tags by hand for unreleased versions. Dependabot
+  (`.github/dependabot.yml`, weekly): Go modules (one group, except `github.com/airtg-io/*`,
+  whose updates come as PRs of their own) and GitHub Actions. Plain `go build ./cmd/snmp-poller` / `go test ./...` work too.
 - **Configuration**: YAML. Main file `etc/snmp-poller.yaml` (flag `-config`). `-check` validates and exits.
   Every `*.yaml`/`*.yml` of `global.include_dir` (default `conf.d`, i.e. `etc/conf.d`; hidden
   files, subdirs and other extensions ignored; missing = fine unless set explicitly) is read
