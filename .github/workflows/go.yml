@@ -58,7 +58,7 @@ jobs:
     - name: Build and package
       run: make package
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: snmp-poller-${{ steps.version.outputs.version }}
         path: |
