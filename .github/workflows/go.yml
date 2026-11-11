@@ -78,7 +78,7 @@ jobs:
       group: release
       cancel-in-progress: false
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v8
       with:
         name: snmp-poller-${{ needs.build.outputs.version }}
         path: dist
