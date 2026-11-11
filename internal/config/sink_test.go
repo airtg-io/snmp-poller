@@ -131,7 +131,7 @@ func TestSinkErrors(t *testing.T) {
 		{`[{ type: prometheus, url: "http://p" }]`, "sinks[0]: id is required"},
 		{`[{ id: "a b", ` + prom + ` }]`, "id may only contain"},
 		{`[{ id: a, type: "null" }]`, `type "null" was removed`},
-		{`[{ id: a, type: kafka, url: "http://x" }]`, `type "kafka": must be influxdb or prometheus`},
+		{`[{ id: a, type: kafka, url: "http://x" }]`, `type "kafka": must be airtg, influxdb or prometheus`},
 		{`[{ id: a, type: prometheus }]`, "url is required"},
 		{`[{ id: a, type: prometheus, url: "p:9090" }]`, "must be an http:// or https:// URL"},
 		{`[{ id: a, type: influxdb, url: "http://i" }]`, "database is required"},
@@ -164,6 +164,37 @@ func TestSinkErrors(t *testing.T) {
 	// A tag that is a field elsewhere only: no conflict once excluded.
 	if _, err := parseSinks(t, `  - { id: a, type: influxdb, url: "http://i", database: d, tags: [ifSpeed], keys: { exclude: ['^ifSpeed$'] } }`+"\n"); err != nil {
 		t.Errorf("excluded key: %v", err)
+	}
+}
+
+func TestAirtgSink(t *testing.T) {
+	c, err := parseSinks(t, "  - { id: analyzer, type: airtg }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := c.Sinks[0]
+	// Fixed parameters: the defaults of every sink, every label sent.
+	if k.Timeout != 10*time.Second || k.BatchSize != 5000 || k.FlushInterval != time.Second ||
+		k.DiskBuffer.Bytes != DefaultDiskBuffer || len(k.ResolvedTags) != 0 || !k.Sends("anything") {
+		t.Errorf("airtg sink = %+v", k)
+	}
+	for _, tc := range []struct{ sinks, want string }{
+		{`  - { id: a, type: airtg, url: "nats://x:4222" }`, "type airtg takes no settings besides id: remove url"},
+		{`  - { id: a, type: airtg, disk_buffer: 0, batch_size: 10 }`, "remove batch_size, disk_buffer"},
+		{`  - { id: a, type: airtg, disk_buffer: null }`, "remove disk_buffer"},
+		{`  - { id: a, type: airtg, tags: [device], keys: { include: [x] }, prefix: "" }`, "remove prefix, keys, tags"},
+		{`  - { id: a, type: airtg, token: t, timeout: 1s }`, "remove token, timeout"},
+		{"  - { id: a, type: airtg }\n  - { id: b, type: airtg }", `sink "b": only one sink of type airtg is allowed ("a" is one already)`},
+		{"  - { id: a, type: airtg }\n  - { id: a, type: airtg }", `duplicate id "a"`},
+	} {
+		_, err := parseSinks(t, tc.sinks+"\n")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s\n  err = %v, want containing %q", tc.sinks, err, tc.want)
+		}
+	}
+	// Alongside other sinks, selected per device like them.
+	if _, err := parseSinks(t, "  - { id: a, type: airtg }\n  - { id: p, type: prometheus, url: \"http://p\" }\n"); err != nil {
+		t.Error(err)
 	}
 }
 

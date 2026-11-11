@@ -24,6 +24,8 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
 - **Sinks**: **Prometheus remote write** (Prometheus, Mimir, VictoriaMetrics, Thanos, ...) and
   **InfluxDB 3**, any number of each, ready for Grafana. Each sink chooses the keys it sends
   and the tags attached to them from the discovery cache (sysName, ifName, ifAlias, ...).
+  The **AIrtg analyzer** sink publishes everything, discovery included, over NATS JetStream in
+  the open [AIrtg schema](https://github.com/airtg-io/schema).
   Sinks send in parallel and never delay polling; an unreachable destination's data waits in a
   **disk buffer** (1GB by default) and is sent in order once it is back. No sink, no data sent.
 - **Bounded worker pool** (250 threads by default) with overrun protection.
@@ -284,12 +286,17 @@ sinks:
     url: http://influxdb:8181
     database: snmp
     token: apiv3_xxxxxxxx               # encrypted in this file on startup
+  - id: analyzer                        # the AIrtg analyzer: nothing else to set
+    type: airtg
 ```
+
+An `airtg` sink takes no other key than `id` and `type`: see [AIrtg analyzer](#airtg-analyzer).
+The keys below are for the other types.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `id` | | Unique id (letters, digits, `.`, `_`, `-`), referenced by devices, used in logs and as the disk buffer directory name. Required. |
-| `type` | | `prometheus` ([remote write](#prometheus)) or `influxdb` ([InfluxDB 3](#influxdb-3)). Required. |
+| `type` | | `prometheus` ([remote write](#prometheus)), `influxdb` ([InfluxDB 3](#influxdb-3)) or `airtg` ([AIrtg analyzer](#airtg-analyzer)). Required. |
 | `url` | | `prometheus`: the remote write endpoint, e.g. `http://prometheus:9090/api/v1/write`. `influxdb`: the server, e.g. `http://influxdb:8181` (`/api/v2/write` is appended). Required. |
 | `database` | | `influxdb` only: the database (bucket). Required. |
 | `token` | | `influxdb`: sent as `Authorization: Token <token>`. `prometheus`: sent as `Authorization: Bearer <token>`. [Encrypted](#credentials-encryption) on startup like device credentials. |
@@ -805,13 +812,17 @@ tables:
 
 ## Sinks
 
-A sink sends the values of every poll of its devices to a time series database. Two types
-exist, both read by Grafana out of the box:
+A sink sends the values of every poll of its devices to a time series database, or to the
+AIrtg analyzer. Three types exist:
 
 - [`prometheus`](#prometheus): the Prometheus remote write protocol (1.0), accepted by
   Prometheus, Grafana Mimir, VictoriaMetrics, Thanos Receive, Cortex, Grafana Cloud, ...
 - [`influxdb`](#influxdb-3): InfluxDB line protocol to InfluxDB 3 Core, Enterprise and Cloud
   (the `/api/v2/write` endpoint, also served by InfluxDB 2).
+- [`airtg`](#airtg-analyzer): the AIrtg analyzer, over NATS JetStream.
+
+Grafana reads the first two out of the box. [Keys and tags](#keys-and-tags) apply to them only:
+the analyzer receives every value with all its labels.
 
 ### Keys and tags
 
@@ -934,13 +945,52 @@ WHERE device = 'core-1' AND $__timeFilter(time)
 ORDER BY time
 ```
 
+### AIrtg analyzer
+
+The `airtg` sink publishes to the AIrtg analyzer, in the
+[AIrtg schema](https://github.com/airtg-io/schema) (Protobuf, Apache-2.0): what it sends is
+documented there, and anyone can read it.
+
+```yaml
+# conf.d/analyzer.yaml
+sinks:
+  - id: analyzer
+    type: airtg
+```
+
+- **Nothing to configure**: the sink takes only its `id`. It publishes to the analyzer's NATS
+  server at `nats://127.0.0.1:4222`, a fixed address, so the poller and the analyzer must share
+  a network: the same host, or the same container. Separate containers do not reach each other
+  on `127.0.0.1` unless one joins the other's network namespace (Docker Compose:
+  `network_mode: "service:<other>"`). Bundling the analyzer in the same container as the
+  poller is planned.
+  The other parameters are the defaults of every sink: 1GB disk buffer, `10s` timeout,
+  requests of up to 5000 values sent within `1s`. A configuration has at most one `airtg` sink;
+  devices select it with `sinks` like any other.
+- **What is sent**: after each discovery of a device, an `Inventory` on
+  `airtg.v1.inventory.<device>` (its capabilities, discovery scalars such as sysName and
+  sysDescr, and discovery columns such as ifName and ifAlias, by row); after each poll, its
+  samples in one or more `MetricBatch` on `airtg.v1.metrics.<device>` (each value with its
+  capability, table, row index and labels, mode, SNMP type, unit and time, and the device's
+  poll interval). A poll is split into several messages to keep each one under 512KB. Strings
+  that are not valid UTF-8 (device octet strings may hold anything) are sent with U+FFFD in
+  place of the invalid bytes.
+- **Delivery**: each message is published with JetStream and counts as sent once the analyzer
+  has stored it. Until the analyzer is running and has created its stream, data waits in the
+  disk buffer, as for any unreachable destination. Each message carries a unique id, also
+  sent as the `Nats-Msg-Id` header, so that the analyzer drops a message published twice.
+- **Identity**: messages identify the producer as `snmp-poller` with its version and host
+  name, and devices by their [id](#device-ids): give a device the same id everywhere it is
+  collected from.
+
 ### Delivery and disk buffer
 
 - **Parallel and non-blocking**: a poll hands its batch to each of its sinks and moves on. Each
   sink groups values into requests (at most `batch_size` values, sent when full or `flush_interval` after the oldest) and
   sends them from its own goroutine, one request at a time, in order. A slow or unreachable
   destination never delays polling or the other sinks.
-- **Unreachable destination** (connection error, timeout, HTTP 5xx, 429, 401, 403, 404): the
+- **Unreachable destination** (connection error, timeout, HTTP 5xx, 429, 401, 403, 404; for
+  the analyzer, also no stream yet): the
   sink logs one `warn` line, keeps its data in the **disk buffer** `<data_dir>/sinks/<id>/` and
   retries (after 1s, doubling up to 30s). New data goes to the end of the buffer. Once the
   destination is back, an `info` line reports the outage duration and the buffer is sent, oldest
@@ -950,12 +1000,14 @@ ORDER BY time
   in the [stats](#logs)), so the most recent data is kept.
 - **Without disk buffer** (`disk_buffer: 0`): data waits in memory (up to 32MB of compressed
   requests, oldest dropped beyond) and is lost on stop.
-- **Rejected data** (other HTTP 4xx, e.g. 400 invalid data): that request is dropped with a
-  `warn` line, so it cannot block the ones after it.
+- **Rejected data** (other HTTP 4xx, e.g. 400 invalid data; for the analyzer, a message larger
+  than its server accepts or refused by its stream): that request is dropped with a `warn`
+  line, so it cannot block the ones after it.
 - **Restarts**: on stop, each sink gets its `timeout` to send what it holds in memory; the
   rest goes to its disk buffer, which the next run sends first. A crash loses at most the data
   of the last `flush_interval`; after one, data sent but not yet recorded as sent may be sent
-  twice, which both databases ignore (same series, same time).
+  twice, which both databases ignore (same series, same time), and the analyzer drops (same
+  message id) within its duplicate window.
 - **Reload**: a sink whose settings change is replaced; the new one takes over the disk
   buffer. A buffer written by a sink of another type is dropped (logged), not sent.
 - The disk buffer of a sink removed from the configuration stays on disk: it is sent if the

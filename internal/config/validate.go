@@ -127,6 +127,7 @@ func (c *Config) validate() error {
 	}
 
 	sinks := map[string]string{} // id -> file defining it
+	airtg := ""                  // id of the airtg sink
 	for i := range c.Sinks {
 		k := &c.Sinks[i]
 		add = in(k.file)
@@ -142,6 +143,13 @@ func (c *Config) validate() error {
 			continue
 		}
 		sinks[k.ID] = k.file
+		if k.Type == SinkAirtg {
+			if airtg != "" {
+				add("sink %q: only one sink of type airtg is allowed (%q is one already)", k.ID, airtg)
+				continue
+			}
+			airtg = k.ID
+		}
 		if err := k.validate(c.capabilities); err != nil {
 			add("sink %q: %w", k.ID, err)
 		}

@@ -40,6 +40,10 @@ func (s Secret) Reveal() string { return s.value }
 // IsSet reports whether the secret is non-empty.
 func (s Secret) IsSet() bool { return s.value != "" }
 
+// written reports whether the secret is written in the file, before or
+// after its resolution.
+func (s Secret) written() bool { return s.value != "" || s.src.raw != "" }
+
 func (s Secret) String() string   { return s.mask() }
 func (s Secret) GoString() string { return s.mask() }
 

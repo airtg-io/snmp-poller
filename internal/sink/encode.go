@@ -38,6 +38,7 @@ type unit struct {
 const (
 	kindPrometheus byte = 1
 	kindInfluxDB   byte = 2
+	kindAirtg      byte = 3
 )
 
 // promEncoder encodes Prometheus remote write 1.0 requests: a

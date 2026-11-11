@@ -95,6 +95,7 @@ func run() int {
 	poller.Seal(cfg, log.Logger)
 
 	sink.UserAgent = "airtg-snmp-poller/" + version
+	sink.Version = version
 	p, err := poller.New(cfg, log.Logger)
 	if err != nil {
 		log.Error("poller", "err", err)

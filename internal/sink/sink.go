@@ -61,6 +61,10 @@ const TypeFormula = "Formula"
 type Batch struct {
 	DeviceID string
 	Address  string
+	// Interval is the device's poll interval.
+	Interval time.Duration
+	// DiscoveredAt is when the discovery the batch was polled with ran.
+	DiscoveredAt time.Time
 	// Capabilities are the names of the capabilities found on the device.
 	Capabilities []string
 	// Discovery holds the device's discovery scalars (sysDescr, sysName, ...).
@@ -106,7 +110,7 @@ type Sink struct {
 	cfg     config.Sink
 	log     *slog.Logger
 	enc     encoder
-	client  *client
+	client  transport
 	dataDir string
 	fifo    *fifo
 
@@ -132,9 +136,16 @@ type Sink struct {
 // New validates what a sink needs to run (TLS files, ...) without touching
 // the disk: -check uses it. Open and Start follow.
 func New(cfg config.Sink, dataDir string, log *slog.Logger) (*Sink, error) {
-	c, err := newClient(&cfg)
-	if err != nil {
-		return nil, err
+	var c transport
+	if cfg.Type == config.SinkAirtg {
+		cfg.URL = AnalyzerURL // fixed: logged as the sink's destination
+		c = &natsClient{url: cfg.URL, timeout: cfg.Timeout}
+	} else {
+		hc, err := newClient(&cfg)
+		if err != nil {
+			return nil, err
+		}
+		c = hc
 	}
 	s := &Sink{
 		cfg:        cfg,
@@ -151,6 +162,8 @@ func New(cfg config.Sink, dataDir string, log *slog.Logger) (*Sink, error) {
 		s.enc = &promEncoder{sink: &s.cfg}
 	case config.SinkInfluxDB:
 		s.enc = &influxEncoder{sink: &s.cfg}
+	case config.SinkAirtg:
+		s.enc = newAirtgEncoder()
 	default:
 		return nil, fmt.Errorf("unknown sink type %q", cfg.Type)
 	}
@@ -201,7 +214,7 @@ func (s *Sink) ID() string { return s.cfg.ID }
 // blocks on the destination.
 func (s *Sink) Write(b *Batch) {
 	buf, units, n := s.enc.encode(nil, b, nil)
-	if n == 0 {
+	if len(units) == 0 {
 		return
 	}
 	now := time.Now()

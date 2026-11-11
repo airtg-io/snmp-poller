@@ -19,7 +19,14 @@ import (
 // UserAgent is sent with every request.
 var UserAgent = "airtg-snmp-poller"
 
-// client posts payloads to one destination.
+// transport delivers request payloads to a sink's destination.
+type transport interface {
+	// post sends one payload. Errors are retried, except *permanentError.
+	post(ctx context.Context, payload []byte) error
+	close()
+}
+
+// client posts payloads to one destination over HTTP.
 type client struct {
 	http    *http.Client
 	url     string
@@ -34,6 +41,9 @@ type permanentError struct {
 }
 
 func (e *permanentError) Error() string {
+	if e.status == 0 {
+		return e.body
+	}
 	if e.body == "" {
 		return fmt.Sprintf("HTTP %d", e.status)
 	}

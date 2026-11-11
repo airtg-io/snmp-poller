@@ -129,6 +129,22 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   truncated on open, corrupt records skipped. Close: `timeout` to send memory, rest to disk.
   Queues are shared by dir (registry): a reload's new sink takes over reading. `sinks/` is
   kept by the data dir cleanup; device id `sinks` is reserved. Per-sink stats line.
+- **airtg sink** (`internal/sink/airtg.go`, user decision: **not configurable**): `type: airtg`
+  takes only `id` (any other key written = error naming them, detected before defaults by
+  `Sink.writtenSettings`; secrets via `Secret.written`); at most one per config. Address
+  hardcoded `sink.AnalyzerURL` = `nats://127.0.0.1:4222` (a var only for tests); defaults of
+  every sink (1GB disk buffer, 10s, 5000, 1s); no keys/tags (all labels sent). Encodes
+  `github.com/airtg-io/schema` envelopes (producer type `snmp-poller`, `sink.Version` set by
+  main, hostname; tenant_id and producer id empty): an `Inventory` (subject
+  `schema.InventorySubject`) when `Batch.DiscoveredAt` changed since the last one sent for the
+  device (in memory: also after a restart), then `MetricBatch`es (`schema.MetricsSubject`,
+  `Batch.Interval`) split at 512KB of samples. Strings made valid UTF-8 (U+FFFD). Record kind
+  3: frames (uvarint-prefixed subject, msg id, envelope) = one unit each, so requests are
+  lists of messages. `natsClient` connects lazily (New/-check never connect), reconnects
+  forever, no reconnect buffer; publishes each frame with JetStream (`Nats-Msg-Id` = envelope
+  id, ack = sent); not connected / no stream = retry ("not connected to the analyzer" error,
+  never nats' confusing ones); max payload or JetStream 400 = dropped. Its tests check the
+  encoder against the schema's fixtures (`TestAirtgFixtures`).
 - **SNMP**: v1, v2c, v3. v3 supports context name / context engine ID, all security levels
   (noAuthNoPriv, authNoPriv, authPriv), all auth protocols (MD5, SHA, SHA224, SHA256, SHA384, SHA512)
   and all priv protocols (DES, AES, AES192, AES256, AES192C, AES256C). UDP and TCP transports,
@@ -193,6 +209,14 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   never a bare pattern (it matches the calling shell).
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
+- airtg sink tests run an embedded `nats-server` (test-only dependency) and point
+  `AnalyzerURL` at it. For a real E2E: `go build -o ~/.cache/snmp-poller-e2e/bin/nats-server
+  github.com/nats-io/nats-server/v2` (pinned in go.mod), run it with `-a 127.0.0.1 -p 4222 -js
+  -sd <dir>`, plus a small consumer (scratch module requiring the schema and nats.go) that
+  creates a stream on `airtg.v1.>` and decodes envelopes. net-snmp is extracted under
+  `~/.cache/snmp-poller-e2e/net-snmp/root`; give snmpd its address on the command line only
+  (an `agentaddress` line too makes it fail to bind). After a run, the device file holds the
+  encrypted community: restore it in clear text when wiping `data/`.
 
 ## Layout
 
@@ -201,7 +225,8 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - `internal/logging` - slog setup (console + rotating file), per-device level override.
 - `internal/snmp` - gosnmp wrapper (version/auth/priv mapping, chunked GET, walks, v1 error handling).
 - `internal/state` - on-disk previous-value store and delta/rate math.
-- `internal/sink` - sinks: encoders (`encode.go`), HTTP client, FIFO and disk buffer (`queue.go`).
+- `internal/sink` - sinks: encoders (`encode.go`), HTTP client, FIFO and disk buffer (`queue.go`),
+  AIrtg analyzer encoder and NATS publisher (`airtg.go`).
 - `internal/vault` - Vault KV client (login, token reuse/renewal).
 - `internal/poller` - scheduler, worker pool, discovery, polling, configuration reload, stats.
 - `internal/testagent` - in-process SNMP agent used by integration tests (v1/v2c/v3).

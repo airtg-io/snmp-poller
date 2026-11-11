@@ -14,6 +14,11 @@
 # device credentials.
 
 sinks:
+  # The AIrtg analyzer, over NATS JetStream at nats://127.0.0.1:4222: the
+  # analyzer runs on the same host. Nothing else to set.
+  - id: analyzer
+    type: airtg
+
   # Prometheus remote write: Prometheus (started with
   # --web.enable-remote-write-receiver), Grafana Mimir, VictoriaMetrics,
   # Thanos Receive, Cortex, ...

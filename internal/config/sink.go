@@ -24,10 +24,14 @@ const (
 	// endpoint of InfluxDB 3 (Core, Enterprise, Cloud), also served by
 	// InfluxDB 2.
 	SinkInfluxDB = "influxdb"
+	// SinkAirtg publishes to the AIrtg analyzer over NATS JetStream, in the
+	// AIrtg schema (github.com/airtg-io/schema). It takes no settings
+	// besides its id: the address and every other parameter are fixed.
+	SinkAirtg = "airtg"
 )
 
 // SinkTypes lists the sink types.
-var SinkTypes = []string{SinkInfluxDB, SinkPrometheus}
+var SinkTypes = []string{SinkAirtg, SinkInfluxDB, SinkPrometheus}
 
 // SinksDir is the directory of the data directory holding the disk
 // buffers of the sinks, one subdirectory per sink id. It survives restarts.
@@ -78,6 +82,9 @@ type Sink struct {
 
 	file  string
 	index int
+	// settings lists the settings written for an airtg sink, which takes
+	// none: recorded by applyDefaults, reported by validate.
+	settings []string
 }
 
 // KeyFilter selects keys by regular expression (unanchored, like table
@@ -234,6 +241,10 @@ func (b ByteSize) String() string {
 }
 
 func (s *Sink) applyDefaults() {
+	if s.Type == SinkAirtg {
+		s.settings = s.writtenSettings()
+		s.Tags = TagList{} // every label is sent: no tags to resolve
+	}
 	if s.Timeout == 0 {
 		s.Timeout = 10 * time.Second
 	}
@@ -263,14 +274,44 @@ var (
 	promMetric = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
 )
 
+// writtenSettings returns the names of the settings written in the file
+// besides id and type, before defaults apply.
+func (s *Sink) writtenSettings() []string {
+	var set []string
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"url", s.URL != ""}, {"database", s.Database != ""}, {"token", s.Token.written()},
+		{"username", s.Username != ""}, {"password", s.Password.written()}, {"headers", s.Headers != nil},
+		{"timeout", s.Timeout != 0}, {"ca_cert", s.CACert != ""}, {"client_cert", s.ClientCert != ""},
+		{"client_key", s.ClientKey != ""}, {"tls_skip_verify", s.TLSSkipVerify}, {"prefix", s.Prefix != nil},
+		{"keys", len(s.Keys.Include)+len(s.Keys.Exclude) > 0}, {"tags", s.Tags != nil},
+		{"batch_size", s.BatchSize != 0}, {"flush_interval", s.FlushInterval != 0},
+		{"disk_buffer", s.DiskBuffer.Set},
+	} {
+		if f.set {
+			set = append(set, f.name)
+		}
+	}
+	return set
+}
+
 // validate checks a sink and resolves its tags and key filters against the
 // capabilities.
 func (s *Sink) validate(caps []*Capability) error {
+	if s.Type == SinkAirtg {
+		if len(s.settings) > 0 {
+			return fmt.Errorf("type airtg takes no settings besides id: remove %s", strings.Join(s.settings, ", "))
+		}
+		return nil
+	}
 	if !slices.Contains(SinkTypes, s.Type) {
 		if s.Type == "null" {
 			return errors.New(`type "null" was removed: a configuration without sinks sends data nowhere`)
 		}
-		return fmt.Errorf("type %q: must be %s", s.Type, strings.Join(SinkTypes, " or "))
+		return fmt.Errorf("type %q: must be %s or %s", s.Type,
+			strings.Join(SinkTypes[:len(SinkTypes)-1], ", "), SinkTypes[len(SinkTypes)-1])
 	}
 	u, err := url.Parse(s.URL)
 	switch {

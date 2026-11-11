@@ -459,6 +459,8 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 	batch = &sink.Batch{
 		DeviceID:     d.spec.ID,
 		Address:      d.spec.Address,
+		Interval:     d.spec.PollInterval,
+		DiscoveredAt: disc.Time,
 		Capabilities: disc.Capabilities,
 		Discovery:    disc.Scalars,
 		Columns:      disc.Columns,
