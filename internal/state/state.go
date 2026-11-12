@@ -94,13 +94,28 @@ type entry struct {
 	Time  int64     `json:"t"`
 }
 
+// file is the content of the state file.
+type file struct {
+	// Uptime is the agent's sysUpTime (TimeTicks) read by that poll.
+	Uptime *uint64 `json:"uptime,omitempty"`
+	// Restarted reports that the agent had restarted before that poll.
+	Restarted bool             `json:"restarted,omitempty"`
+	Values    map[string]entry `json:"values"`
+}
+
 // Device is the state of one device during one poll. Obtain it with Load,
-// call Delta for every rate/volume value, then Save.
+// call AgentUptime when the poll read it, then Delta for every rate/volume
+// value, then Save.
 type Device struct {
 	store *Store
 	id    string
 	prev  map[string]entry
 	next  map[string]entry
+
+	prevUptime    *uint64
+	prevRestarted bool
+	uptime        *uint64
+	restarted     bool
 }
 
 // Load reads a device's previous values. A missing or unreadable file
@@ -114,11 +129,40 @@ func (s *Store) Load(id string) (*Device, error) {
 	if err != nil {
 		return d, err
 	}
-	if err := json.Unmarshal(data, &d.prev); err != nil {
-		d.prev = map[string]entry{}
+	var f file
+	if err := json.Unmarshal(data, &f); err != nil {
 		return d, fmt.Errorf("corrupt %s, starting over: %w", stateFile, err)
 	}
+	if f.Values == nil {
+		// Before 0.4 the file held the values only: read it as such.
+		if err := json.Unmarshal(data, &d.prev); err != nil {
+			d.prev = map[string]entry{}
+			return d, fmt.Errorf("corrupt %s, starting over: %w", stateFile, err)
+		}
+		return d, nil
+	}
+	d.prev, d.prevUptime, d.prevRestarted = f.Values, f.Uptime, f.Restarted
 	return d, nil
+}
+
+// AgentUptime records the agent's uptime read by this poll (sysUpTime, in
+// hundredths of a second), before any Delta, and reports whether the agent
+// restarted since the previous poll: its uptime went backwards or, without
+// a previous uptime, is shorter than interval (the agent started since the
+// previous poll could have run).
+//
+// Deltas are not computed at a restart poll, whose previous values predate
+// the restart, nor at the poll after it: some agents report wrong counters
+// on their first read after starting (net-snmp gives 0 for ifInUcastPkts),
+// which would make the first rate a huge spike.
+func (d *Device) AgentUptime(ticks uint64, interval time.Duration) (restarted bool) {
+	d.uptime = &ticks
+	if d.prevUptime != nil {
+		d.restarted = ticks < *d.prevUptime
+	} else {
+		d.restarted = time.Duration(ticks)*10*time.Millisecond < interval
+	}
+	return d.restarted
 }
 
 // Delta records v as the current value of key and returns the difference
@@ -132,6 +176,9 @@ func (d *Device) Delta(key string, v snmp.Value, t time.Time) (volume, seconds f
 	}
 	cur := entry{Kind: v.Kind, Uint: v.Uint, Int: v.Int, Float: v.Float, Time: t.UnixNano()}
 	d.next[key] = cur
+	if d.restarted || d.prevRestarted {
+		return 0, 0, false // see AgentUptime
+	}
 	p, found := d.prev[key]
 	if !found || p.Kind != cur.Kind || cur.Time <= p.Time {
 		return 0, 0, false
@@ -164,13 +211,17 @@ func (d *Device) Delta(key string, v snmp.Value, t time.Time) (volume, seconds f
 // Len returns the number of values recorded during this poll.
 func (d *Device) Len() int { return len(d.next) }
 
-// Save writes the values recorded during this poll, replacing the previous
-// file. Keys not seen during this poll are dropped.
+// Save writes the values and agent uptime recorded during this poll,
+// replacing the previous file. Keys not seen during this poll are dropped.
 func (d *Device) Save() error {
-	if len(d.next) == 0 && len(d.prev) == 0 {
+	if len(d.next) == 0 && len(d.prev) == 0 && d.uptime == nil && d.prevUptime == nil {
 		return nil
 	}
-	return d.store.writeJSON(d.id, stateFile, d.next)
+	uptime := d.uptime
+	if uptime == nil {
+		uptime = d.prevUptime // not read this time: the last one known is still a lower bound
+	}
+	return d.store.writeJSON(d.id, stateFile, file{Uptime: uptime, Restarted: d.restarted, Values: d.next})
 }
 
 // writeJSON atomically replaces <device dir>/<name>.

@@ -113,3 +113,89 @@ func TestCorruptStateStartsOver(t *testing.T) {
 		t.Error("corrupt state must yield an empty, usable state")
 	}
 }
+
+// TestAgentRestart: no delta at the poll that sees the agent restarted nor
+// at the next one, normal deltas after.
+func TestAgentRestart(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const day = 8_640_000 // TimeTicks
+	t0 := time.Unix(1000, 0)
+	type poll struct {
+		uptime  uint64 // 0: not read
+		counter uint64
+		restart bool // AgentUptime's answer
+		delta   bool // a delta is computed
+	}
+	for i, p := range []poll{
+		{uptime: day, counter: 100},                     // first poll: nothing to compare
+		{uptime: day + 1000, counter: 200, delta: true}, // normal
+		{uptime: 500, counter: 0, restart: true},        // restarted: previous value is pre-restart
+		{uptime: 1500, counter: 742_000},                // first read after start may be wrong
+		{uptime: 2500, counter: 742_100, delta: true},   // back to normal
+		{counter: 742_200, delta: true},                 // uptime not read: deltas go on
+		{uptime: 3500, counter: 742_300, delta: true},   // still normal
+	} {
+		d, err := store.Load("dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.uptime != 0 {
+			if got := d.AgentUptime(p.uptime, time.Minute); got != p.restart {
+				t.Errorf("poll %d: restart = %v, want %v", i, got, p.restart)
+			}
+		}
+		_, _, ok := d.Delta("c", snmp.Value{Kind: snmp.KindCounter64, Uint: p.counter}, t0.Add(time.Duration(i)*10*time.Second))
+		if ok != p.delta {
+			t.Errorf("poll %d: delta computed = %v, want %v", i, ok, p.delta)
+		}
+		if err := d.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestAgentJustStarted: without a previous uptime (first poll, or after a
+// rediscovery), an agent up for less than one poll interval counts as just
+// started; one up longer does not.
+func TestAgentJustStarted(t *testing.T) {
+	for _, tc := range []struct {
+		ticks   uint64
+		restart bool
+	}{{100, true}, {5999, true}, {6000, false}, {8_640_000, false}} {
+		store, err := New(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, _ := store.Load("dev")
+		if got := d.AgentUptime(tc.ticks, time.Minute); got != tc.restart {
+			t.Errorf("uptime %d ticks, interval 1m: restart = %v, want %v", tc.ticks, got, tc.restart)
+		}
+	}
+}
+
+// TestStateFileBeforeUptime: a state file written before 0.4 (values only)
+// is read as such.
+func TestStateFileBeforeUptime(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.DeviceDir("dev"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"c":{"k":"counter64","u":100,"t":1000000000000}}`
+	if err := os.WriteFile(filepath.Join(store.DeviceDir("dev"), "state.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := store.Load("dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol, _, ok := d.Delta("c", snmp.Value{Kind: snmp.KindCounter64, Uint: 150}, time.Unix(1010, 0))
+	if !ok || vol != 50 {
+		t.Errorf("delta from an old state file = %v, %v", vol, ok)
+	}
+}

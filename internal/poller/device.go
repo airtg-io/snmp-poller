@@ -522,10 +522,34 @@ func (d *device) collect(c *snmp.Client, store *state.Store, disc *Discovery, no
 			}
 		}
 	}
+	// The agent's uptime tells its restarts, after which rates are not
+	// computed for two polls (see state.Device.AgentUptime): fetched with
+	// the rest, even when no metric uses it.
+	targeted := len(oids)
+	if _, ok := targets[sysUpTimeOID]; !ok {
+		oids = append(oids, sysUpTimeOID)
+	}
 	pdus, err := c.Get(oids)
 	if err != nil {
 		return nil, 0, err
 	}
+	gotUptime := false
+	for _, p := range pdus {
+		if p.Name != sysUpTimeOID {
+			continue
+		}
+		if v, ok := snmp.Convert(p); ok && v.Numeric() {
+			gotUptime = true
+			if st.AgentUptime(v.Uint, d.spec.PollInterval) {
+				d.log.Info("agent restarted: rates and volumes of this poll and the next are not computed",
+					"uptime", (time.Duration(v.Uint) * 10 * time.Millisecond).Round(time.Second))
+			}
+		}
+	}
+	if len(oids) > targeted && gotUptime {
+		pdus = slices.DeleteFunc(pdus, func(p gosnmp.SnmpPDU) bool { return p.Name == sysUpTimeOID })
+	}
+	oids = oids[:targeted]
 	missing = len(oids) - len(pdus)
 	if missing > 0 && d.log.Enabled(context.Background(), slog.LevelDebug) {
 		got := make(map[string]bool, len(pdus))
@@ -869,3 +893,6 @@ func trimDot(s string) string {
 	}
 	return s
 }
+
+// sysUpTimeOID is SNMPv2-MIB sysUpTime.0, the agent's uptime.
+const sysUpTimeOID = ".1.3.6.1.2.1.1.3.0"

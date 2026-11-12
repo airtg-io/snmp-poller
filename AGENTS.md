@@ -170,6 +170,13 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - **Value modes**: `raw` (value as-is), `rate` ((v2-v1)/(t2-t1), per second) and `volume` (v2-v1).
   Previous values for rate/volume are **stored on disk, not in memory**, in `data/<device_id>/state.json`, keyed by OID.
   Counter32 wraps are handled; Counter64 going backwards is treated as a reset.
+  **Agent restarts** (user decision): every poll GETs sysUpTime.0 (`sysUpTimeOID`, added to the
+  GET if no metric uses it, not counted as missing); `state.Device.AgentUptime` detects a
+  restart (uptime went back, or without previous uptime: shorter than the poll interval) and
+  Delta returns no delta at that poll and the next (net-snmp's first read after start returns
+  0 for some counters: found E2E). One info line per restart. state.json is
+  `{uptime, restarted, values}` (last known uptime carried forward when a poll misses it);
+  the pre-0.4 values-only format is still read.
   Device dirs of the data dir are cleaned on startup (files like key.dat and the `sinks` dir kept), and a device's
   state is wiped on each rediscovery.
 - **Row based polling**: tables with an inclusive regex pattern list (`include`) matched against the

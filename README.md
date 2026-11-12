@@ -130,6 +130,15 @@ Each poll:
    value, so it emits only `raw`. Counter32 wraps are handled. A Counter64 that goes
    backwards is treated as a reset (no sample). Gauges and integers may give negative deltas.
    Rate/volume on non-numeric values (strings) are ignored.
+
+   **Agent restarts.** Every poll also reads the agent's `sysUpTime`, kept in `state.json`.
+   When it goes back, the agent restarted: the rates and volumes of that poll are not computed
+   (the previous values predate the restart, and a counter that restarted from 0 would look
+   like a Counter32 wrap), and neither are those of the next poll, because some agents report
+   wrong counters on their first read after starting (net-snmp reports 0 for
+   `ifInUcastPkts`, which made the next rate a huge spike). Without a previous uptime (first
+   poll, or after a discovery), an agent up for less than one poll interval counts as just
+   started. An `info` line `agent restarted` says so, and rates come back two polls later.
 4. **Sinks**: the batch (device id, address, discovery scalars and columns, samples) is handed
    to every [sink](#sinks) of the device. Each sink picks its keys and tags, encodes the batch
    and returns at once: sending happens in the background, sink by sink.

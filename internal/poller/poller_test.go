@@ -98,7 +98,7 @@ func sysMIB(name string) map[string]testagent.Value {
 	return map[string]testagent.Value{
 		"1.3.6.1.2.1.1.1.0": {Type: gosnmp.OctetString, Value: "Test agent " + name},
 		"1.3.6.1.2.1.1.2.0": {Type: gosnmp.ObjectIdentifier, Value: "1.3.6.1.4.1.99999"},
-		"1.3.6.1.2.1.1.3.0": {Type: gosnmp.TimeTicks, Value: uint32(1000)},
+		"1.3.6.1.2.1.1.3.0": {Type: gosnmp.TimeTicks, Value: uint32(upDay)}, // up for a day
 		"1.3.6.1.2.1.1.4.0": {Type: gosnmp.OctetString, Value: "noc@example.net"},
 		"1.3.6.1.2.1.1.5.0": {Type: gosnmp.OctetString, Value: name},
 		"1.3.6.1.2.1.1.6.0": {Type: gosnmp.OctetString, Value: "rack 1"},
@@ -272,7 +272,7 @@ devices:
 				t.Errorf("sysName = %q, want %q", b.Discovery["sysName"], want)
 			}
 			s, ok := find(b, "sysUpTime", "", config.ModeRaw)
-			if !ok || s.Value != uint64(1000) || s.Type != "TimeTicks" {
+			if !ok || s.Value != uint64(upDay) || s.Type != "TimeTicks" {
 				t.Errorf("sysUpTime sample = %+v, %v", s, ok)
 			}
 		})
@@ -381,7 +381,7 @@ tables:
 	clk.advance(10 * time.Second)
 	mib.Set("1.3.6.1.2.1.31.1.1.1.6.1", uint64(1_050_000))
 	mib.Set("1.3.6.1.2.1.2.2.1.10.1", uint32(500))
-	mib.Set("1.3.6.1.2.1.1.3.0", uint32(2000))
+	mib.Set("1.3.6.1.2.1.1.3.0", uint32(upDay+1000))
 	res, err = d.poll(context.Background(), store, clk.now)
 	if err != nil {
 		t.Fatal(err)
@@ -601,8 +601,8 @@ devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", commu
 				}
 				for metric, w := range map[string]want{
 					// TimeTicks are sent in seconds; the rest as the agent reports it.
-					"uptime":            {"", 50.0, "second"}, // hrSystemUptime
-					"sysUpTime":         {"", 10.0, "second"}, // the agent
+					"uptime":            {"", 50.0, "second"},    // hrSystemUptime
+					"sysUpTime":         {"", 86400.0, "second"}, // the agent
 					"hrSystemProcesses": {"", uint64(42), "process"},
 					"hrMemorySize":      {"", int64(2048), "kilobyte"},
 				} {
@@ -679,7 +679,7 @@ devices: [{ id: sw, address: 127.0.0.1, port: %d, snmp: { version: "%s", communi
 				if got := fmt.Sprint(disc.Capabilities); got != "[interfaces system]" {
 					t.Errorf("capabilities = %s", got)
 				}
-				if s, ok := find(out.batches[0], "uptime", "", config.ModeRaw); !ok || s.Value != 10.0 {
+				if s, ok := find(out.batches[0], "uptime", "", config.ModeRaw); !ok || s.Value != 86400.0 {
 					t.Errorf("uptime = %+v (found %v), want sysUpTime", s, ok)
 				}
 			})
@@ -1062,7 +1062,7 @@ devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, communit
 	if s, ok := find(b, "nameText", "", config.ModeRaw); !ok || s.Unit != "" {
 		t.Errorf("nameText = %+v (found %v), want a string without unit", s, ok)
 	}
-	if s, ok := find(b, "upSeconds", "", config.ModeRaw); !ok || s.Value != 10.0 || s.Unit != "second" {
+	if s, ok := find(b, "upSeconds", "", config.ModeRaw); !ok || s.Value != 86400.0 || s.Unit != "second" {
 		t.Errorf("upSeconds = %+v (found %v)", s, ok)
 	}
 	if s, ok := find(b, "up", "", config.ModeRate); !ok || s.Unit != "second/s" {
@@ -1188,7 +1188,7 @@ tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6
 		}
 		if i == 0 {
 			clk.advance(10 * time.Second)
-			mib.Set("1.3.6.1.2.1.1.3.0", uint32(2000))
+			mib.Set("1.3.6.1.2.1.1.3.0", uint32(upDay+1000))
 			mib.Set("1.3.6.1.2.1.25.2.3.1.6.2.1", 25)
 		}
 	}
@@ -1202,7 +1202,7 @@ tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6
 		mode        config.Mode
 		want        any
 	}{
-		{"upA", "", config.ModeRaw, uint64(2000)},
+		{"upA", "", config.ModeRaw, uint64(upDay + 1000)},
 		{"upA", "", config.ModeRate, 100.0},
 		{"upA", "", config.ModeVolume, 1000.0},
 		{"upB", "", config.ModeRate, 100.0},
@@ -1225,11 +1225,17 @@ tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6
 	if err != nil {
 		t.Fatal(err)
 	}
-	var st map[string]any
+	var st struct {
+		Uptime *uint64        `json:"uptime"`
+		Values map[string]any `json:"values"`
+	}
 	if err := json.Unmarshal(data, &st); err != nil {
 		t.Fatal(err)
 	}
-	if got := fmt.Sprint(slices.Sorted(maps.Keys(st))); got != "[.1.3.6.1.2.1.1.3.0 .1.3.6.1.2.1.25.2.3.1.6.1.1 .1.3.6.1.2.1.25.2.3.1.6.2.1]" {
+	if st.Uptime == nil || *st.Uptime != upDay+1000 {
+		t.Errorf("state uptime = %v, want the agent's last sysUpTime", st.Uptime)
+	}
+	if got := fmt.Sprint(slices.Sorted(maps.Keys(st.Values))); got != "[.1.3.6.1.2.1.1.3.0 .1.3.6.1.2.1.25.2.3.1.6.1.1 .1.3.6.1.2.1.25.2.3.1.6.2.1]" {
 		t.Errorf("state keys = %s, want one per OID", got)
 	}
 }
@@ -1530,7 +1536,7 @@ devices:
 	}
 	lp := all(influxRec)
 	for _, want := range []string{
-		"system,device=sw,host=sw uptime=10,sysUpTime=10 ", // TimeTicks in seconds
+		"system,device=sw,host=sw uptime=86400,sysUpTime=86400 ", // TimeTicks in seconds
 		"interfaces,device=sw,host=sw,ifAlias=",
 		",ifDescr=TenGigE0/1,ifName=",
 		",index=1 ifInOctets_rate=", // second poll: rates
@@ -1554,5 +1560,75 @@ devices:
 	}
 	if strings.Contains(text, "level=WARN") {
 		t.Errorf("warnings:\n%s", text)
+	}
+}
+
+// upDay is the sysUpTime of test agents: a day, in hundredths of a second.
+const upDay = 8_640_000
+
+// TestAgentRestart: when the agent restarts (sysUpTime goes back), the
+// rates and volumes of that poll and of the next are not computed: the
+// previous values predate the restart, and the first read after a start
+// can be wrong (net-snmp reports 0 for some counters). They come back after.
+func TestAgentRestart(t *testing.T) {
+	mib := ifMIB()
+	agent := testagent.Start(t, nil, mib, nil)
+	out := &capture{}
+	d, store := newDevice(t, fmt.Sprintf(`
+devices:
+  - id: router
+    address: 127.0.0.1
+    port: %d
+    poll_interval: 10s
+    discovery_interval: 1h
+    snmp: { version: 2c, community: %s }
+`, agent.Port, testagent.Community), map[string]string{
+		"metrics": `
+tables:
+  - name: if
+    columns:
+      - { name: in32, oid: 1.3.6.1.2.1.2.2.1.10, modes: [rate, volume], unit: octet }
+`}, out)
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	uptime, in := uint32(upDay), uint32(1000)
+	poll := func() *sink.Batch {
+		t.Helper()
+		mib.Set("1.3.6.1.2.1.1.3.0", uptime)
+		mib.Set("1.3.6.1.2.1.2.2.1.10.1", in)
+		if _, err := d.poll(context.Background(), store, clk.now); err != nil {
+			t.Fatal(err)
+		}
+		clk.advance(10 * time.Second)
+		uptime += 1000
+		return out.batches[len(out.batches)-1]
+	}
+	rate := func(b *sink.Batch) (float64, bool) {
+		s, ok := find(b, "in32", "1", config.ModeRate)
+		if !ok {
+			return 0, false
+		}
+		return s.Value.(float64), true
+	}
+
+	poll() // first: nothing to compare with
+	in += 500
+	if r, ok := rate(poll()); !ok || r != 50 {
+		t.Fatalf("normal rate = %v (found %v), want 50", r, ok)
+	}
+	// The agent restarts: its uptime goes back, its first read says 0.
+	uptime, in = 300, 0
+	if _, ok := rate(poll()); ok {
+		t.Error("rate computed across the agent restart")
+	}
+	if _, ok := find(out.batches[len(out.batches)-1], "in32", "1", config.ModeVolume); ok {
+		t.Error("volume computed across the agent restart")
+	}
+	in = 742_000 // the real counter, read for the first time
+	if r, ok := rate(poll()); ok {
+		t.Errorf("rate computed from the first read after the restart: %v", r)
+	}
+	in += 1000
+	if r, ok := rate(poll()); !ok || r != 100 {
+		t.Errorf("rate after the restart = %v (found %v), want 100", r, ok)
 	}
 }
