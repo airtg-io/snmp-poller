@@ -45,7 +45,7 @@ func TestEncryptCmd(t *testing.T) {
 
 	// The poller reads it back.
 	os.Mkdir(filepath.Join(dir, "capabilities.d"), 0o755)
-	os.WriteFile(filepath.Join(dir, "capabilities.d", "uptime.yaml"), []byte(`scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0 }]`), 0o644)
+	os.WriteFile(filepath.Join(dir, "capabilities.d", "uptime.yaml"), []byte(`scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0, unit: second }]`), 0o644)
 	os.WriteFile(cfgPath, []byte("global: { data_dir: "+dataDir+" }\ndevices: [{ address: x, snmp: { version: 2c, community: "+strings.TrimSpace(out.String())+" } }]\n"), 0o644)
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestEncryptCmdArgument(t *testing.T) {
 	enc := strings.TrimSpace(out.String())
 	dir := t.TempDir()
 	os.Mkdir(filepath.Join(dir, "capabilities.d"), 0o755)
-	os.WriteFile(filepath.Join(dir, "capabilities.d", "uptime.yaml"), []byte(`scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0 }]`), 0o644)
+	os.WriteFile(filepath.Join(dir, "capabilities.d", "uptime.yaml"), []byte(`scalars: [{ name: up, oid: 1.3.6.1.2.1.1.3.0, unit: second }]`), 0o644)
 	os.Rename(keyPath, filepath.Join(dir, "key.dat"))
 	cfgPath := filepath.Join(dir, "c.yaml")
 	os.WriteFile(cfgPath, []byte("global: { data_dir: "+dir+" }\ndevices: [{ address: x, snmp: { version: 2c, community: "+enc+" } }]\n"), 0o644)

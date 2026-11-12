@@ -343,7 +343,7 @@ func TestAirtgSplit(t *testing.T) {
 		b.Samples = append(b.Samples, Sample{
 			Capability: "interfaces", Table: "interfaces", Index: fmt.Sprint(i), Metric: "ifInOctets",
 			Labels: map[string]string{"ifDescr": fmt.Sprintf("GigabitEthernet1/0/%d", i), "ifAlias": strings.Repeat("a", 40)},
-			Mode:   config.ModeRate, Unit: "bytes/s", Value: float64(i), Time: t0,
+			Mode:   config.ModeRate, Unit: "octet/s", Value: float64(i), Time: t0,
 		})
 	}
 	buf, units, n := newAirtgEncoder().encode(nil, b, nil)
@@ -411,16 +411,16 @@ func TestAirtgFixtures(t *testing.T) {
 			"ifAlias": {"1": "uplink to core-sw2", "2": ""},
 		},
 		Samples: []Sample{
-			{Capability: "system", Metric: "sysUpTime", Mode: config.ModeRaw, Type: "TimeTicks", Value: uint64(864000000), Time: ft0},
+			{Capability: "system", Metric: "sysUpTime", Mode: config.ModeRaw, Type: TypeFormula, Unit: "second", Value: 8640000.0, Time: ft0},
 			{Capability: "interfaces", Metric: "ifHCInOctets", Table: "ifTable", Index: "1", Labels: if1, Mode: config.ModeRaw,
-				Type: "Counter64", Unit: "bytes", Value: uint64(18446744073709551000), Time: sec},
+				Type: "Counter64", Unit: "octet", Value: uint64(18446744073709551000), Time: sec},
 			{Capability: "interfaces", Metric: "ifHCInOctets", Table: "ifTable", Index: "1", Labels: if1, Mode: config.ModeRate,
-				Type: "Counter64", Unit: "bytes/s", Value: 1250000.5, Time: sec},
+				Type: "Counter64", Unit: "octet/s", Value: 1250000.5, Time: sec},
 			{Capability: "interfaces", Metric: "ifHCInOctets", Table: "ifTable", Index: "1", Labels: if1, Mode: config.ModeVolume,
-				Type: "Counter64", Unit: "bytes", Value: 75000030.0, Time: sec},
-			{Capability: "host-resources", Metric: "hrStorageSizeBytes", Table: "hrStorageTable", Index: "1", Labels: mem,
-				Mode: config.ModeRaw, Type: TypeFormula, Unit: "bytes", Value: int64(17179869184), Time: sec},
-			{Capability: "host-resources", Metric: "hrStorageUsedPercent", Table: "hrStorageTable", Index: "1", Labels: mem,
+				Type: "Counter64", Unit: "octet", Value: 75000030.0, Time: sec},
+			{Capability: "host-resources", Metric: "storageSize", Table: "hrStorageTable", Index: "1", Labels: mem,
+				Mode: config.ModeRaw, Type: TypeFormula, Unit: "byte", Value: int64(17179869184), Time: sec},
+			{Capability: "host-resources", Metric: "storageUsedPercent", Table: "hrStorageTable", Index: "1", Labels: mem,
 				Mode: config.ModeRaw, Type: TypeFormula, Unit: "percent", Value: 42.5, Time: sec},
 			{Capability: "entity", Metric: "entPhysicalSoftwareRev", Table: "entPhysicalTable", Index: "1",
 				Labels: map[string]string{"entPhysicalName": "Chassis"}, Mode: config.ModeRaw, Type: "OctetString",

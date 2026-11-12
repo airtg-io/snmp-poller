@@ -751,6 +751,9 @@ type delta struct {
 func (e *emitter) emit(oid, capability, metric, table, idx string, labels map[string]string,
 	modes []config.Mode, unit string, v snmp.Value, ts time.Time,
 ) {
+	if unit == config.UnitNone {
+		unit = "" // a string: no unit
+	}
 	sample := sink.Sample{Capability: capability, Metric: metric, Table: table, Index: idx, Labels: labels, Type: v.Type, Unit: unit, Time: ts}
 	needDelta := false
 	for _, m := range modes {

@@ -15,7 +15,7 @@ import (
 )
 
 // uptime is a minimal capability, for tests that need one.
-const uptime = `scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0 }]`
+const uptime = `scalars: [{ name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0, unit: second }]`
 
 // writeCaps creates dir/capabilities.d with one file per capability and returns dir.
 func writeCaps(t *testing.T, caps map[string]string) string {
@@ -346,11 +346,11 @@ tables:
     include: ["^eth"]
     high_capacity: { probe: 1.3.6.1.2.1.31.1.1.1.1, speed: ifSpeed }
     columns:
-      - { name: in, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume, rate] }
+      - { name: in, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume, rate], unit: octet }
 `,
 		"vendor.yml": `
 detect: [1.3.6.1.4.1.9]
-scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 }]
+scalars: [{ name: cpu, oid: .1.3.6.1.4.1.9.9.109.1.1.1.1.8.1, unit: percent }]
 `,
 		"README.txt": "not a capability",
 	})
@@ -515,39 +515,47 @@ func TestCapabilityErrors(t *testing.T) {
 		{map[string]string{"bad name.yaml": uptime}, "may only contain"},
 		{map[string]string{"a.yaml": uptime, "a.yml": uptime}, "defined by both a.yaml and a.yml"},
 		{map[string]string{"a.yaml": `detect: [x]` + "\n" + uptime}, "detect: invalid oid"},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: x.y }]`}, "invalid oid"},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, modes: [delta] }]`}, "invalid mode"},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3 }, { name: a, oid: 1.4 }]`}, "duplicate scalar"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: x.y, unit: enum }]`}, "invalid oid"},
+		// Units: required on emitted values, from the AIrtg vocabulary.
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3 }]`}, `scalar "a": unit is required`},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3 }] }]`}, `column "c": unit is required`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, unit: bytes }]`}, `unit "bytes" is not in the AIrtg unit vocabulary`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, unit: "%" }]`}, `unit "%" is not in the AIrtg unit vocabulary`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, unit: centisecond }]`}, `unit "centisecond" is not in`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, unit: bit/s, modes: [rate] }]`}, `unit "bit/s" is already per second`},
+		{map[string]string{"a.yaml": `scalars: [{ name: b, oid: 1.3, unit: octet }, { name: a, formula: "b", unit: none }]`}, `scalar "a": a formula gives a number`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, modes: [delta], unit: enum }]`}, "invalid mode"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, unit: enum }, { name: a, oid: 1.4, unit: enum }]`}, "duplicate scalar"},
 		{map[string]string{"a.yaml": `tables: [{ name: t }]`}, "at least one column"},
-		{map[string]string{"a.yaml": `tables: [{ name: t, include: ["("], columns: [{ name: c, oid: 1.3 }] }]`}, "include"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, include: ["("], columns: [{ name: c, oid: 1.3, unit: enum }] }]`}, "include"},
 		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c }] }]`}, "oid, hc_oid or formula is required"},
 		{map[string]string{"a.yaml": `scalars: [{ name: a }]`}, "exactly one of oid, oids and formula"},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, oids: [1.4] }]`}, "exactly one of oid, oids and formula"},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, oids: [1.3, x] }]`}, `oids: invalid oid "x"`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "1 +" }]`}, `formula "1 +": at column 4: expected a number`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "(1" }]`}, `expected ")"`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "2 % 1" }]`}, `unexpected "%"`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "1.2.3" }]`}, `invalid number "1.2.3"`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "a * 2" }]`}, `"a" is not a scalar defined above it`},
-		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "b" }, { name: b, oid: 1.3 }]`}, `"b" is not a scalar defined above it`},
-		{map[string]string{"a.yaml": "scalars: [{ name: b, oid: 1.3 }, { name: a, formula: \"b\", modes: [rate] }]"}, "modes cannot be used with formula"},
-		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, formula: "1" }] }]`}, "formula cannot be used with oid"},
-		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3 }, { name: d, formula: "c / e" }] }]`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oid: 1.3, oids: [1.4], unit: enum }]`}, "exactly one of oid, oids and formula"},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, oids: [1.3, x], unit: enum }]`}, `oids: invalid oid "x"`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "1 +", unit: enum }]`}, `formula "1 +": at column 4: expected a number`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "(1", unit: enum }]`}, `expected ")"`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "2 % 1", unit: enum }]`}, `unexpected "%"`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "1.2.3", unit: enum }]`}, `invalid number "1.2.3"`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "a * 2", unit: enum }]`}, `"a" is not a scalar defined above it`},
+		{map[string]string{"a.yaml": `scalars: [{ name: a, formula: "b", unit: enum }, { name: b, oid: 1.3, unit: enum }]`}, `"b" is not a scalar defined above it`},
+		{map[string]string{"a.yaml": "scalars: [{ name: b, oid: 1.3, unit: enum }, { name: a, formula: \"b\", modes: [rate], unit: enum }]"}, "modes cannot be used with formula"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, formula: "1", unit: enum }] }]`}, "formula cannot be used with oid"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, unit: enum }, { name: d, formula: "c / e", unit: enum }] }]`},
 			`"e" is not a column defined above it in this table`},
-		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: d, formula: "2" }] }]`}, "at least one column needs an oid"},
-		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, hc_oid: 1.4 }] }]`}, "hc_oid requires high_capacity"},
-		{map[string]string{"a.yaml": `tables: [{ name: t, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3 }] }]`}, "high_capacity requires a label"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: d, formula: "2", unit: enum }] }]`}, "at least one column needs an oid"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, columns: [{ name: c, oid: 1.3, hc_oid: 1.4, unit: enum }] }]`}, "hc_oid requires high_capacity"},
+		{map[string]string{"a.yaml": `tables: [{ name: t, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3, unit: enum }] }]`}, "high_capacity requires a label"},
 		{map[string]string{"a.yaml": `
 discovery: { columns: { n: 1.3.1 } }
-tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3 }] }]`}, `high_capacity.speed "s" is not a discovery column`},
+tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: [{ name: c, oid: 1.3, unit: enum }] }]`}, `high_capacity.speed "s" is not a discovery column`},
 		// Labels must come from the same capability: another one may not apply.
 		{map[string]string{
 			"a.yaml": `discovery: { columns: { ifName: 1.3.1 } }`,
-			"b.yaml": `tables: [{ name: t, label: ifName, columns: [{ name: c, oid: 1.3 }] }]`,
+			"b.yaml": `tables: [{ name: t, label: ifName, columns: [{ name: c, oid: 1.3, unit: enum }] }]`,
 		}, `label "ifName" is not a discovery column of this capability`},
-		{map[string]string{"a.yaml": `scalars: [{ name: x, oid: 1.3 }]`, "b.yaml": `scalars: [{ name: x, oid: 1.4 }]`},
+		{map[string]string{"a.yaml": `scalars: [{ name: x, oid: 1.3, unit: enum }]`, "b.yaml": `scalars: [{ name: x, oid: 1.4, unit: enum }]`},
 			`scalar "x" is defined by both "a" and "b"`},
-		{map[string]string{"a.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.3 }] }]`, "b.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.4 }] }]`},
+		{map[string]string{"a.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.3, unit: enum }] }]`, "b.yaml": `tables: [{ name: x, columns: [{ name: c, oid: 1.4, unit: enum }] }]`},
 			`table "x" is defined by both "a" and "b"`},
 		{map[string]string{"a.yaml": `discovery: { scalars: { x: 1.3 } }`, "b.yaml": `discovery: { scalars: { x: 1.4 } }`},
 			`discovery scalar "x" has different oids`},
@@ -567,7 +575,7 @@ tables: [{ name: t, label: n, high_capacity: { probe: 1.3, speed: s }, columns: 
 		{map[string]string{"a.yaml": `discovery: { columns: { p: 1.2, n: { oid: 1.3, index: p, index_part: 1 } } }`}, "index_part must be at least 1, without index"},
 		{map[string]string{"a.yaml": `
 discovery: { columns: { n: 1.3.1 } }
-tables: [{ name: t, label: n, high_capacity: { probe: 1.3, above: 10 }, columns: [{ name: c, oid: 1.3 }] }]`}, "high_capacity.above requires high_capacity.speed"},
+tables: [{ name: t, label: n, high_capacity: { probe: 1.3, above: 10 }, columns: [{ name: c, oid: 1.3, unit: enum }] }]`}, "high_capacity.above requires high_capacity.speed"},
 		// replaced_by
 		{map[string]string{"a.yaml": "replaced_by: [b]\n" + uptime}, `capability "a": replaced_by: no capability "b"`},
 		{map[string]string{"a.yaml": "replaced_by: [a b]\n" + uptime}, `replaced_by: invalid capability name "a b"`},
@@ -575,8 +583,8 @@ tables: [{ name: t, label: n, high_capacity: { probe: 1.3, above: 10 }, columns:
 		{map[string]string{"a.yaml": "replaced_by: [a]\n" + uptime}, "capabilities replace each other: a replaced by a"},
 		{map[string]string{
 			"a.yaml": "replaced_by: [b]\n" + uptime,
-			"b.yaml": "replaced_by: [c]\nscalars: [{ name: b, oid: 1.3 }]",
-			"c.yaml": "replaced_by: [a]\nscalars: [{ name: c, oid: 1.3 }]",
+			"b.yaml": "replaced_by: [c]\nscalars: [{ name: b, oid: 1.3, unit: enum }]",
+			"c.yaml": "replaced_by: [a]\nscalars: [{ name: c, oid: 1.3, unit: enum }]",
 		}, "capabilities replace each other: a replaced by b replaced by c replaced by a"},
 	} {
 		_, err := parseWith(t, `devices: []`, tc.caps)

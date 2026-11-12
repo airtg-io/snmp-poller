@@ -12,10 +12,11 @@
 # discovery by their jnxOperatingDescr ("Routing Engine 0", "FPC: MPC7E 3D
 # 40XGE @ 0/*/*", ...). A device can poll other rows with its own include.
 #
-# The agent reports the installed memory in MiB (jnxOperatingMemory) and
-# its utilization as a whole percentage (jnxOperatingBuffer, the "Memory
-# utilization" of the CLI), so the bytes in use are computed from both,
-# to 1% of the size. FPCs also report the utilization of their heap.
+# The agent reports the installed memory in megabytes (jnxOperatingMemory)
+# and its utilization as a whole percentage (jnxOperatingBuffer, the "Memory
+# utilization" of the CLI): both are sent as they are, and the memory in use
+# is computed from them in megabytes, to 1% of the size. FPCs also report
+# the utilization of their heap.
 description: Juniper JUNIPER-MIB memory of every Routing Engine and FPC
 
 detect:
@@ -30,10 +31,9 @@ tables:
     label: jnxOperatingDescr
     include: ["^Routing Engine", "^FPC"]
     columns:
-      - { name: jnxOperatingMemory, oid: 1.3.6.1.4.1.2636.3.1.13.1.15, unit: MiB, emit: false }
+      - { name: jnxOperatingMemory, oid: 1.3.6.1.4.1.2636.3.1.13.1.15, unit: megabyte }
       # Share of the memory in use (0 to 100).
       - { name: jnxOperatingBuffer, oid: 1.3.6.1.4.1.2636.3.1.13.1.11, unit: percent }
       # Share of the heap in use (0 to 100), 0 where there is none.
       - { name: jnxOperatingHeap,   oid: 1.3.6.1.4.1.2636.3.1.13.1.12, unit: percent }
-      - { name: jnxMemorySize, formula: "jnxOperatingMemory * 1048576", unit: bytes }
-      - { name: jnxMemoryUsed, formula: "jnxMemorySize * jnxOperatingBuffer / 100", unit: bytes }
+      - { name: jnxMemoryUsed, formula: "jnxOperatingMemory * jnxOperatingBuffer / 100", unit: megabyte }

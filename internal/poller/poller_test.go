@@ -323,21 +323,21 @@ discovery:
     ifName: 1.3.6.1.2.1.31.1.1.1.1
     ifAlias: 1.3.6.1.2.1.31.1.1.1.18
 scalars:
-  - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate] }
-  - { name: absent, oid: 1.3.6.1.2.1.1.77.0 }
+  - { name: sysUpTime, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate], unit: second }
+  - { name: absent, oid: 1.3.6.1.2.1.1.77.0, unit: enum }
 tables:
   - name: if
     label: ifName
     labels: [ifAlias]
     include: ["^eth"]
     columns:
-      - { name: hcIn, oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [raw, rate, volume] }
-      - { name: in32, oid: 1.3.6.1.2.1.2.2.1.10, modes: [volume] }
-      - { name: oper, oid: 1.3.6.1.2.1.2.2.1.8 }
+      - { name: hcIn, oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [raw, rate, volume], unit: octet }
+      - { name: in32, oid: 1.3.6.1.2.1.2.2.1.10, modes: [volume], unit: octet }
+      - { name: oper, oid: 1.3.6.1.2.1.2.2.1.8, unit: enum }
   - name: storage
     include: ["^2\\."]
     columns:
-      - { name: used, oid: 1.3.6.1.2.1.25.2.3.1.6 }
+      - { name: used, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation unit }
 `}, out)
 	clk := &clock{t: time.Unix(1_700_000_000, 0)}
 
@@ -505,8 +505,8 @@ devices:
 						delete(wantType, "3") // filtered out by the device's include
 					}
 					highSpeed := map[string]uint64{"1": 4294, "2": 1000}
-					if s, ok := find(b, "sysUpTime", "", config.ModeRaw); !ok || s.Type != "TimeTicks" {
-						t.Errorf("sysUpTime must be polled every cycle: %+v", s)
+					if s, ok := find(b, "sysUpTime", "", config.ModeRaw); !ok || s.Type != sink.TypeFormula || s.Unit != "second" {
+						t.Errorf("sysUpTime must be polled every cycle, in seconds: %+v", s)
 					}
 					for idx, typ := range wantType {
 						for _, m := range []string{"ifInOctets", "ifOutOctets", "ifInUcastPkts", "ifOutUcastPkts"} {
@@ -590,7 +590,7 @@ devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", commu
 				if got := fmt.Sprint(disc.Capabilities); got != "[host-resources interfaces system]" {
 					t.Errorf("capabilities = %s", got)
 				}
-				if got := disc.Sources["uptime"]; got != ".1.3.6.1.2.1.25.1.1.0" {
+				if got := disc.Sources["uptimeTicks"]; got != ".1.3.6.1.2.1.25.1.1.0" {
 					t.Errorf("uptime source = %q, want hrSystemUptime", got)
 				}
 				b := out.batches[0]
@@ -600,10 +600,11 @@ devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", commu
 					unit  string
 				}
 				for metric, w := range map[string]want{
-					"uptime":            {"", uint64(5000), "centiseconds"}, // hrSystemUptime
-					"sysUpTime":         {"", uint64(1000), "centiseconds"}, // the agent
-					"hrSystemProcesses": {"", uint64(42), "processes"},
-					"memorySize":        {"", int64(2048 * 1024), "bytes"},
+					// TimeTicks are sent in seconds; the rest as the agent reports it.
+					"uptime":            {"", 50.0, "second"}, // hrSystemUptime
+					"sysUpTime":         {"", 10.0, "second"}, // the agent
+					"hrSystemProcesses": {"", uint64(42), "process"},
+					"hrMemorySize":      {"", int64(2048), "kilobyte"},
 				} {
 					if s, ok := find(b, metric, w.idx, config.ModeRaw); !ok || s.Value != w.value || s.Unit != w.unit {
 						t.Errorf("%s = %+v (found %v), want %v %s", metric, s, ok, w.value, w.unit)
@@ -634,13 +635,21 @@ devices: [{ id: host, address: 127.0.0.1, port: %d, snmp: { version: "%s", commu
 					s.Labels["hrStorageDescr"] != "Physical memory" || s.Labels["hrStorageType"] != ".1.3.6.1.2.1.25.2.1.4" {
 					t.Errorf("storage sample = %+v", s)
 				}
-				// Inputs of formulas are polled but not emitted.
-				for _, m := range []string{"hrMemorySize", "hrStorageAllocationUnits", "hrStorageSize", "hrStorageUsed"} {
-					for _, s := range b.Samples {
-						if s.Metric == m {
-							t.Errorf("input %s emitted: %+v", m, s)
-						}
+				// The source values are sent too, in the agent's units.
+				for _, w := range []struct {
+					metric, idx, unit string
+					value             any
+				}{
+					{"hrStorageAllocationUnits", "1", "byte", int64(1024)},
+					{"hrStorageSize", "1", "allocation unit", int64(2048)},
+					{"hrStorageUsed", "1", "allocation unit", int64(512)},
+				} {
+					if s, ok := find(b, w.metric, w.idx, config.ModeRaw); !ok || s.Value != w.value || s.Unit != w.unit {
+						t.Errorf("%s.%s = %+v (found %v), want %v %s", w.metric, w.idx, s, ok, w.value, w.unit)
 					}
+				}
+				if s, _ := find(b, "storageSize", "1", config.ModeRaw); s.Unit != "byte" {
+					t.Errorf("storageSize unit = %q, want byte", s.Unit)
 				}
 				var cpus []string
 				for _, s := range b.Samples {
@@ -670,7 +679,7 @@ devices: [{ id: sw, address: 127.0.0.1, port: %d, snmp: { version: "%s", communi
 				if got := fmt.Sprint(disc.Capabilities); got != "[interfaces system]" {
 					t.Errorf("capabilities = %s", got)
 				}
-				if s, ok := find(out.batches[0], "uptime", "", config.ModeRaw); !ok || s.Value != uint64(1000) {
+				if s, ok := find(out.batches[0], "uptime", "", config.ModeRaw); !ok || s.Value != 10.0 {
 					t.Errorf("uptime = %+v (found %v), want sysUpTime", s, ok)
 				}
 			})
@@ -880,7 +889,7 @@ devices: [{ id: rtr, address: 127.0.0.1, port: %d, exclude: [%s], snmp: { versio
 				if s.Table != "enhanced_mempool" && s.Table != "memory_pool" {
 					continue
 				}
-				if want := "bytes"; strings.HasSuffix(s.Metric, "Percent") {
+				if want := "byte"; strings.HasSuffix(s.Metric, "Percent") {
 					want = "percent"
 					if s.Unit != want {
 						t.Errorf("%s unit = %q", s.Metric, s.Unit)
@@ -971,8 +980,8 @@ devices: [{ id: mx, address: 127.0.0.1, port: %d, snmp: { version: "2c", communi
 					continue
 				}
 				want := "percent"
-				if strings.HasPrefix(s.Metric, "jnxMemory") {
-					want = "bytes"
+				if s.Metric == "jnxOperatingMemory" || s.Metric == "jnxMemoryUsed" {
+					want = "megabyte" // as the agent reports it
 				}
 				if s.Unit != want {
 					t.Errorf("%s unit = %q, want %q", s.Metric, s.Unit, want)
@@ -981,12 +990,12 @@ devices: [{ id: mx, address: 127.0.0.1, port: %d, snmp: { version: "2c", communi
 			}
 			slices.Sort(got)
 			want := []string{
-				"jnxMemorySize.7.1.0.0=2147483648 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
-				"jnxMemorySize.9.1.0.0=17179869184 (Routing Engine 0)",
-				"jnxMemorySize.9.2.0.0=17179869184 (Routing Engine 1)",
-				"jnxMemoryUsed.7.1.0.0=3.221225472e+08 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
-				"jnxMemoryUsed.9.1.0.0=4.294967296e+09 (Routing Engine 0)",
-				"jnxMemoryUsed.9.2.0.0=1.7179869184e+09 (Routing Engine 1)",
+				"jnxOperatingMemory.7.1.0.0=2048 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxOperatingMemory.9.1.0.0=16384 (Routing Engine 0)",
+				"jnxOperatingMemory.9.2.0.0=16384 (Routing Engine 1)",
+				"jnxMemoryUsed.7.1.0.0=307.2 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
+				"jnxMemoryUsed.9.1.0.0=4096 (Routing Engine 0)",
+				"jnxMemoryUsed.9.2.0.0=1638.4 (Routing Engine 1)",
 				"jnxOperatingBuffer.7.1.0.0=15 (FPC: MPC7E 3D 40XGE @ 0/*/*)",
 				"jnxOperatingBuffer.9.1.0.0=25 (Routing Engine 0)",
 				"jnxOperatingBuffer.9.2.0.0=10 (Routing Engine 1)",
@@ -1023,17 +1032,18 @@ devices: [{ id: mx, address: 127.0.0.1, port: %d, snmp: { version: "2c", communi
 func TestFormulas(t *testing.T) {
 	caps := map[string]string{"f": `
 scalars:
-  - { name: up, oid: 1.3.6.1.2.1.1.3.0, unit: centiseconds, modes: [raw, rate] }
-  - { name: upSeconds, formula: "up / 100", unit: seconds }
+  - { name: up, oid: 1.3.6.1.2.1.1.3.0, unit: second, modes: [raw, rate] }
+  - { name: upSeconds, formula: "up / 100", unit: second }
   - { name: gone, oid: 1.3.6.1.2.1.1.99.0, emit: false }
-  - { name: needsGone, formula: "gone + up" }
+  - { name: needsGone, formula: "gone + up", unit: enum }
   - { name: name, oid: 1.3.6.1.2.1.1.5.0, emit: false }
-  - { name: notNumber, formula: "name * 2" }
+  - { name: nameText, oid: 1.3.6.1.2.1.1.5.0, unit: none }
+  - { name: notNumber, formula: "name * 2", unit: enum }
 tables:
   - name: walked
     columns:
       - { name: v, oid: 1.3.6.1.2.1.25.2.3.1.6, emit: false }
-      - { name: double, formula: "v * 2" }
+      - { name: double, formula: "v * 2", unit: enum }
 `}
 	agent := testagent.Start(t, nil, ifMIB(), nil)
 	out := &capture{}
@@ -1048,11 +1058,15 @@ devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, communit
 		clk.advance(10 * time.Second)
 	}
 	b := out.batches[1]
-	if s, ok := find(b, "upSeconds", "", config.ModeRaw); !ok || s.Value != 10.0 || s.Unit != "seconds" {
+	// unit: none (a string) is sent as no unit.
+	if s, ok := find(b, "nameText", "", config.ModeRaw); !ok || s.Unit != "" {
+		t.Errorf("nameText = %+v (found %v), want a string without unit", s, ok)
+	}
+	if s, ok := find(b, "upSeconds", "", config.ModeRaw); !ok || s.Value != 10.0 || s.Unit != "second" {
 		t.Errorf("upSeconds = %+v (found %v)", s, ok)
 	}
-	if s, ok := find(b, "up", "", config.ModeRate); !ok || s.Unit != "centiseconds/s" {
-		t.Errorf("up rate = %+v (found %v), want unit centiseconds/s", s, ok)
+	if s, ok := find(b, "up", "", config.ModeRate); !ok || s.Unit != "second/s" {
+		t.Errorf("up rate = %+v (found %v), want unit second/s", s, ok)
 	}
 	for _, m := range []string{"gone", "needsGone", "name", "notNumber", "v"} {
 		for _, s := range b.Samples {
@@ -1072,12 +1086,12 @@ devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, communit
 // MIB, absent with a following subtree) and exclude, on v1 and v2c.
 func TestCapabilityDetection(t *testing.T) {
 	caps := map[string]string{
-		"always":   `scalars: [{ name: always, oid: 1.3.6.1.2.1.1.3.0 }]`,
-		"present":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.31.1.1.1.1]\nscalars: [{ name: present, oid: 1.3.6.1.2.1.1.3.0 }]",
-		"partial":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.88]\nscalars: [{ name: partial, oid: 1.3.6.1.2.1.1.3.0 }]",
-		"next":     "detect: [1.3.6.1.2.1.1.50]\nscalars: [{ name: next, oid: 1.3.6.1.2.1.1.3.0 }]",
-		"end":      "detect: [1.3.6.1.4.1.99999.1]\nscalars: [{ name: end, oid: 1.3.6.1.2.1.1.3.0 }]",
-		"excluded": `scalars: [{ name: excluded, oid: 1.3.6.1.2.1.1.3.0 }]`,
+		"always":   `scalars: [{ name: always, oid: 1.3.6.1.2.1.1.3.0, unit: second }]`,
+		"present":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.31.1.1.1.1]\nscalars: [{ name: present, oid: 1.3.6.1.2.1.1.3.0, unit: second }]",
+		"partial":  "detect: [1.3.6.1.2.1.1, 1.3.6.1.2.1.88]\nscalars: [{ name: partial, oid: 1.3.6.1.2.1.1.3.0, unit: second }]",
+		"next":     "detect: [1.3.6.1.2.1.1.50]\nscalars: [{ name: next, oid: 1.3.6.1.2.1.1.3.0, unit: second }]",
+		"end":      "detect: [1.3.6.1.4.1.99999.1]\nscalars: [{ name: end, oid: 1.3.6.1.2.1.1.3.0, unit: second }]",
+		"excluded": `scalars: [{ name: excluded, oid: 1.3.6.1.2.1.1.3.0, unit: second }]`,
 	}
 	agent := testagent.Start(t, nil, ifMIB(), nil)
 	for _, version := range []string{"1", "2c"} {
@@ -1158,13 +1172,13 @@ devices: [{ id: dev, address: 127.0.0.1, port: %d, snmp: { version: 2c, communit
 `, agent.Port, testagent.Community), map[string]string{
 		"a": `
 discovery: { scalars: { name1: 1.3.6.1.2.1.1.5.0 } }
-scalars: [{ name: upA, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate, volume] }]
-tables: [{ name: storeA, columns: [{ name: usedA, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [volume] }] }]
+scalars: [{ name: upA, oid: 1.3.6.1.2.1.1.3.0, modes: [raw, rate, volume], unit: second }]
+tables: [{ name: storeA, columns: [{ name: usedA, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [volume], unit: allocation unit }] }]
 `,
 		"b": `
 discovery: { scalars: { name2: 1.3.6.1.2.1.1.5.0 } }
-scalars: [{ name: upB, oid: 1.3.6.1.2.1.1.3.0, modes: [rate] }]
-tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [raw, volume] }] }]
+scalars: [{ name: upB, oid: 1.3.6.1.2.1.1.3.0, modes: [rate], unit: second }]
+tables: [{ name: storeB, include: ["^2\\."], columns: [{ name: usedB, oid: 1.3.6.1.2.1.25.2.3.1.6, modes: [raw, volume], unit: allocation unit }] }]
 `,
 	}, out)
 	clk := &clock{t: time.Unix(1_700_000_000, 0)}
@@ -1231,9 +1245,9 @@ devices:
     snmp: { version: 1, community: %s }
 `, agent.Port, testagent.Community), map[string]string{"v1": `
 scalars:
-  - { name: a, oid: 1.3.6.1.2.1.1.77.0 }
-  - { name: up, oid: 1.3.6.1.2.1.1.3.0 }
-  - { name: b, oid: 1.3.6.1.2.1.1.78.0 }
+  - { name: a, oid: 1.3.6.1.2.1.1.77.0, unit: enum }
+  - { name: up, oid: 1.3.6.1.2.1.1.3.0, unit: second }
+  - { name: b, oid: 1.3.6.1.2.1.1.78.0, unit: enum }
 `}, out)
 	res, err := d.poll(context.Background(), store, time.Now)
 	if err != nil {
@@ -1516,7 +1530,7 @@ devices:
 	}
 	lp := all(influxRec)
 	for _, want := range []string{
-		"system,device=sw,host=sw uptime=1000i,sysUpTime=1000i ",
+		"system,device=sw,host=sw uptime=10,sysUpTime=10 ", // TimeTicks in seconds
 		"interfaces,device=sw,host=sw,ifAlias=",
 		",ifDescr=TenGigE0/1,ifName=",
 		",index=1 ifInOctets_rate=", // second poll: rates

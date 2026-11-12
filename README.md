@@ -122,7 +122,8 @@ Each poll:
    - `rate`: `(v2 - v1) / (t2 - t1)`, per second.
 
    Then [formulas](#formulas) compute their values from the values of this poll (e.g. storage
-   bytes from allocation units).
+   bytes from allocation units). Every value is sent with its [unit](#units), the one the
+   device reports it in.
 
    Rates and volumes need the previous value, which is read from and written to
    `data/<device_id>/state.json`. The first poll after startup or discovery has no previous
@@ -457,15 +458,15 @@ ignored. Shipped in `etc/capabilities.d`:
 
 | Capability | Detect | Collects |
 |------------|--------|----------|
-| `system` | every device | Discovery: `sysDescr`, `sysObjectID`, `sysUpTime`, `sysContact`, `sysName`, `sysLocation` (SNMPv2-MIB system group, `1.3.6.1.2.1.1`). Polled every cycle: `uptime`, the system uptime (HOST-RESOURCES-MIB `hrSystemUptime` when the agent has it, else `sysUpTime`), and `sysUpTime`, the agent uptime. |
+| `system` | every device | Discovery: `sysDescr`, `sysObjectID`, `sysUpTime`, `sysContact`, `sysName`, `sysLocation` (SNMPv2-MIB system group, `1.3.6.1.2.1.1`). Polled every cycle, in seconds: `uptime`, the system uptime (HOST-RESOURCES-MIB `hrSystemUptime` when the agent has it, else `sysUpTime`), and `sysUpTime`, the agent uptime. |
 | `interfaces` | every device | IF-MIB counters, status and speed of every interface, with 64-bit ifXTable counters on interfaces faster than 100 Mbit/s when available (v2c and v3). |
 | `entity` | `entPhysicalModelName` | Discovery: ENTITY-MIB name, model and serial number of every physical entity. |
-| `host-resources` | HOST-RESOURCES-MIB (`1.3.6.1.2.1.25`) | Number of processes, memory size, size, used and free bytes and used and free percentages of every storage (RAM, swap, file systems), load of every processor. See [below](#the-host-resources-capability). |
+| `host-resources` | HOST-RESOURCES-MIB (`1.3.6.1.2.1.25`) | Number of processes, memory size in kilobytes, size and use of every storage (RAM, swap, file systems) in allocation units as reported plus size, used and free bytes and used and free percentages, load of every processor. See [below](#the-host-resources-capability). |
 | `cisco-cpu` | `cpmCPUTotal5minRev` | CISCO-PROCESS-MIB busy percentage of every CPU over 5 seconds, 1 minute and 5 minutes, named after its ENTITY-MIB entry. See [below](#the-cisco-cpu-capability). |
 | `cisco-enhanced-mempool` | `cempMemPoolUsed` | CISCO-ENHANCED-MEMPOOL-MIB used, free and largest free bytes and used percentage of every memory pool of every card, 64-bit when available. See [below](#the-cisco-memory-capabilities). |
 | `cisco-memory-pool` | `ciscoMemoryPoolUsed`, unless `cisco-enhanced-mempool` applies | CISCO-MEMORY-POOL-MIB used, free and largest free bytes and used percentage of every memory pool, for older Cisco devices. See [below](#the-cisco-memory-capabilities). |
 | `juniper-cpu` | `jnxOperatingCPU` | JUNIPER-MIB busy percentage of every Routing Engine and FPC, current and over 1, 5 and 15 minutes. See [below](#the-juniper-capabilities). |
-| `juniper-memory` | `jnxOperatingMemory` | JUNIPER-MIB memory size, used bytes and used percentage, and heap used percentage, of every Routing Engine and FPC. See [below](#the-juniper-capabilities). |
+| `juniper-memory` | `jnxOperatingMemory` | JUNIPER-MIB memory size and used memory in megabytes, used percentage, and heap used percentage, of every Routing Engine and FPC. See [below](#the-juniper-capabilities). |
 
 Every device gets every capability discovery finds, except those listed in its `exclude` and
 those replaced by a capability that applies to it (`replaced_by`).
@@ -496,7 +497,7 @@ A table can only use discovery columns of its own capability as labels.
 | `oid` | Full OID, including the instance (`.0` for scalars). Leading dot optional. |
 | `oids` | Instead of `oid`: candidate OIDs, in order of preference. Discovery picks the first one the agent has, and only that one is polled until the next discovery (none: the scalar is not polled). |
 | `formula` | Instead of `oid`: computes the value from scalars of the same capability defined above it. See [Formulas](#formulas). |
-| `unit` | Optional free text sent with every sample (e.g. `bytes`, `percent`). `/s` is appended for `rate`. |
+| `unit` | The unit the device reports the value in, sent with every sample: a word of the [unit vocabulary](#units) (e.g. `octet`, `kilobyte`, `percent`), `none` for a string. Required when the value is emitted. `/s` is appended for `rate`. |
 | `modes` | List of `raw`, `rate`, `volume`. Default `[raw]`. Not allowed with `formula`, always `raw`. |
 | `emit` | `false` makes the scalar an input of formulas only: polled, not sent to outputs. Default `true`. |
 
@@ -532,15 +533,41 @@ tables:
       speed: ifSpeed
       above: 100000000                  # 100 Mbit/s
     columns:
-      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume] }
-      - { name: ifHighSpeed, hc_oid: 1.3.6.1.2.1.31.1.1.1.15 }   # high-capacity rows only
+      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, hc_oid: 1.3.6.1.2.1.31.1.1.1.6, modes: [rate, volume], unit: octet }
+      - { name: ifHighSpeed, hc_oid: 1.3.6.1.2.1.31.1.1.1.15, unit: megabit/s }   # high-capacity rows only
 ```
+
+### Units
+
+Every emitted value has a unit, sent with each sample: the unit **the device reports it
+in**. Values are collected as close to their source as possible and never normalized across
+products: a Cisco memory pool reported in bytes is in `byte`, a Juniper memory size reported in
+megabytes stays in `megabyte`. Whoever reads the data converts if it needs to.
+
+- Units are lowercase singular words of the AIrtg unit vocabulary, shared by every AIrtg
+  collector so that the same unit is always written the same way (`percent`, never `%`): see
+  the [AIrtg schema](https://github.com/airtg-io/schema#rules-every-producer-and-consumer-follows).
+  The most used: `octet`, `packet`, `segment`, `datagram`, `bit`, `byte`, `kilobyte`,
+  `megabyte`, `allocation unit`, `percent`, `second`, `process`, `volt`, `celsius`, `watt`, and
+  `enum` for a number that names a state or a thing (`ifOperStatus`: 1 up, 2 down, ...; a
+  process id). A unit outside the vocabulary is an error.
+- The unit names what the MIB counts: `ifInOctets` is in `octet`.
+- `/s` is appended for `rate` (`octet/s`). A value that is a rate itself is written with `/s`
+  (`ifSpeed` in `bit/s`), and cannot also have the `rate` mode.
+- A [formula](#formulas) gives the unit of its inputs, or the one their combination gives
+  (`hrStorageSize` allocation units times `hrStorageAllocationUnits` bytes is in `byte`). A
+  formula that would only scale a value (kilobytes to bytes) is not written: the value is sent
+  as the device reports it.
+- SNMP time ticks (hundredths of a second) are the exception: they are converted to `second`
+  by a formula, the unit every tool uses for durations.
+- A value with no unit, a string, is written `unit: none`.
 
 ### Formulas
 
 A scalar or a column with a `formula` is not polled: it is computed on every poll from other
-values, so the configuration shows every operation applied to the data. Typical uses are unit
-conversions (to bytes, to seconds) and derived values (free space, percentages).
+values, so the configuration shows every operation applied to the data. Typical uses are
+derived values (bytes from allocation units, free space, percentages) and time ticks in
+seconds. A formula never only scales a value to another unit (see [Units](#units)).
 
 - Operators: `+`, `-`, `*`, `/`, unary `-`, parentheses, with the usual precedence. Numbers
   are decimal (`1024`, `0.5`).
@@ -554,22 +581,27 @@ conversions (to bytes, to seconds) and derived values (free space, percentages).
 - When a value it reads is missing (not returned by the agent, or not a number), or a divisor
   is zero (a storage of size 0), the formula gives no sample on that poll (a `debug` line
   says why).
-- `emit: false` on its inputs keeps raw values in device units out of the outputs.
+- `emit: false` on its inputs keeps them out of the outputs. Prefer emitting them: the source
+  values are what the device really reports. The shipped capabilities hide only time ticks,
+  sent in seconds instead.
 
 ### The `host-resources` capability
 
 Detected on agents that implement HOST-RESOURCES-MIB (RFC 2790), mostly servers (net-snmp,
-Windows SNMP service) and some appliances. Every size is in **bytes**: the agent counts storage
-in allocation units of `hrStorageAllocationUnits` bytes and memory in KiB, so those raw values
-are inputs only, and formulas convert them:
+Windows SNMP service) and some appliances. Values are sent as the agent reports them: memory
+in kilobytes, storage in allocation units of `hrStorageAllocationUnits` bytes. Per storage
+row, formulas also give the size, used and free space in bytes and as percentages:
 
 | Metric | Table | Unit | From |
 |--------|-------|------|------|
-| `hrSystemProcesses` | | processes | `hrSystemProcesses` |
-| `memorySize` | | bytes | `hrMemorySize * 1024` |
-| `storageSize` | `storage` | bytes | `hrStorageSize * hrStorageAllocationUnits` |
-| `storageUsed` | `storage` | bytes | `hrStorageUsed * hrStorageAllocationUnits` |
-| `storageFree` | `storage` | bytes | `storageSize - storageUsed` |
+| `hrSystemProcesses` | | process | `hrSystemProcesses` |
+| `hrMemorySize` | | kilobyte | `hrMemorySize`: the memory of the host |
+| `hrStorageAllocationUnits` | `storage` | byte | Size of one allocation unit |
+| `hrStorageSize` | `storage` | allocation unit | `hrStorageSize` |
+| `hrStorageUsed` | `storage` | allocation unit | `hrStorageUsed` |
+| `storageSize` | `storage` | byte | `hrStorageSize * hrStorageAllocationUnits` |
+| `storageUsed` | `storage` | byte | `hrStorageUsed * hrStorageAllocationUnits` |
+| `storageFree` | `storage` | byte | `storageSize - storageUsed` |
 | `storageUsedPercent` | `storage` | percent | `storageUsed * 100 / storageSize` |
 | `storageFreePercent` | `storage` | percent | `storageFree * 100 / storageSize` |
 | `hrProcessorLoad` | `processors` | percent | `hrProcessorLoad`: share of the last minute the processor was busy |
@@ -587,18 +619,17 @@ discovery:
   columns:
     hrStorageDescr: 1.3.6.1.2.1.25.2.3.1.3
 scalars:
-  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: KiB, emit: false }
-  - { name: memorySize, formula: "hrMemorySize * 1024", unit: bytes }
+  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: kilobyte }
 tables:
   - name: storage
     label: hrStorageDescr
     columns:
-      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: bytes, emit: false }
-      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation units, emit: false }
-      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation units, emit: false }
-      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: bytes }
-      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: bytes }
-      - { name: storageFree, formula: "storageSize - storageUsed", unit: bytes }
+      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: byte }
+      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation unit }
+      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation unit }
+      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: byte }
+      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: byte }
+      - { name: storageFree, formula: "storageSize - storageUsed", unit: byte }
       - { name: storageUsedPercent, formula: "storageUsed * 100 / storageSize", unit: percent }
       - { name: storageFreePercent, formula: "storageFree * 100 / storageSize", unit: percent }
 ```
@@ -652,13 +683,13 @@ the device has it, CISCO-MEMORY-POOL-MIB otherwise. A device that excludes
 
 | Metric | Table | Unit | From |
 |--------|-------|------|------|
-| `cempMemPoolUsed` | `enhanced_mempool` | bytes | Bytes in use: `cempMemPoolHCUsed` (64-bit) when the agent has it, else `cempMemPoolUsed` |
-| `cempMemPoolFree` | `enhanced_mempool` | bytes | Free bytes: `cempMemPoolHCFree` or `cempMemPoolFree` |
-| `cempMemPoolLargestFree` | `enhanced_mempool` | bytes | Largest contiguous free block: `cempMemPoolHCLargestFree` or `cempMemPoolLargestFree` |
+| `cempMemPoolUsed` | `enhanced_mempool` | byte | Bytes in use: `cempMemPoolHCUsed` (64-bit) when the agent has it, else `cempMemPoolUsed` |
+| `cempMemPoolFree` | `enhanced_mempool` | byte | Free bytes: `cempMemPoolHCFree` or `cempMemPoolFree` |
+| `cempMemPoolLargestFree` | `enhanced_mempool` | byte | Largest contiguous free block: `cempMemPoolHCLargestFree` or `cempMemPoolLargestFree` |
 | `cempMemPoolUsedPercent` | `enhanced_mempool` | percent | `cempMemPoolUsed * 100 / (cempMemPoolUsed + cempMemPoolFree)` |
-| `ciscoMemoryPoolUsed` | `memory_pool` | bytes | Bytes in use |
-| `ciscoMemoryPoolFree` | `memory_pool` | bytes | Free bytes |
-| `ciscoMemoryPoolLargestFree` | `memory_pool` | bytes | Largest contiguous free block |
+| `ciscoMemoryPoolUsed` | `memory_pool` | byte | Bytes in use |
+| `ciscoMemoryPoolFree` | `memory_pool` | byte | Free bytes |
+| `ciscoMemoryPoolLargestFree` | `memory_pool` | byte | Largest contiguous free block |
 | `ciscoMemoryPoolUsedPercent` | `memory_pool` | percent | `ciscoMemoryPoolUsed * 100 / (ciscoMemoryPoolUsed + ciscoMemoryPoolFree)` |
 
 `enhanced_mempool` rows are indexed by `<entPhysicalIndex>.<cempMemPoolIndex>`, labelled by
@@ -682,7 +713,7 @@ tables:
   - name: memory_pool
     label: ciscoMemoryPoolName
     columns:
-      - { name: ciscoMemoryPoolUsed, oid: 1.3.6.1.4.1.9.9.48.1.1.1.5, unit: bytes }
+      - { name: ciscoMemoryPoolUsed, oid: 1.3.6.1.4.1.9.9.48.1.1.1.5, unit: byte }
 ```
 
 ```yaml
@@ -701,7 +732,7 @@ tables:
     high_capacity:
       probe: 1.3.6.1.4.1.9.9.221.1.1.1.1.18           # cempMemPoolHCUsed: no speed, every pool
     columns:
-      - { name: cempMemPoolUsed, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: bytes }
+      - { name: cempMemPoolUsed, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: byte }
 ```
 
 ### The Juniper capabilities
@@ -719,8 +750,8 @@ JUNIPER-MIB `jnxOperatingTable`, the table behind `show chassis routing-engine` 
 | `jnxOperating15MinAvgCPU` | `juniper_cpu` | percent | Same, over the last 15 minutes |
 | `jnxOperatingBuffer` | `juniper_memory` | percent | Share of the memory in use (the CLI's "Memory utilization") |
 | `jnxOperatingHeap` | `juniper_memory` | percent | Share of the heap in use (FPCs; 0 on Routing Engines) |
-| `jnxMemorySize` | `juniper_memory` | bytes | `jnxOperatingMemory * 1048576`: the agent reports MiB |
-| `jnxMemoryUsed` | `juniper_memory` | bytes | `jnxMemorySize * jnxOperatingBuffer / 100`, to 1% of the size: the agent reports a whole percentage |
+| `jnxOperatingMemory` | `juniper_memory` | megabyte | Installed memory, as the agent reports it |
+| `jnxMemoryUsed` | `juniper_memory` | megabyte | `jnxOperatingMemory * jnxOperatingBuffer / 100`, to 1% of the size: the agent reports a whole percentage |
 
 `jnxOperatingTable` has one row per component of the chassis (Routing Engines, FPCs, PICs,
 fans, power supplies, ...), indexed by `<jnxOperatingContentsIndex>.<L1>.<L2>.<L3>` (e.g.
@@ -745,10 +776,9 @@ tables:
     label: jnxOperatingDescr
     include: ["^Routing Engine", "^FPC"]
     columns:
-      - { name: jnxOperatingMemory, oid: 1.3.6.1.4.1.2636.3.1.13.1.15, unit: MiB, emit: false }
+      - { name: jnxOperatingMemory, oid: 1.3.6.1.4.1.2636.3.1.13.1.15, unit: megabyte }
       - { name: jnxOperatingBuffer, oid: 1.3.6.1.4.1.2636.3.1.13.1.11, unit: percent }
-      - { name: jnxMemorySize, formula: "jnxOperatingMemory * 1048576", unit: bytes }
-      - { name: jnxMemoryUsed, formula: "jnxMemorySize * jnxOperatingBuffer / 100", unit: bytes }
+      - { name: jnxMemoryUsed, formula: "jnxOperatingMemory * jnxOperatingBuffer / 100", unit: megabyte }
 ```
 
 ### Capability examples
@@ -763,9 +793,9 @@ description: TCP statistics (MIB-II)
 detect: [1.3.6.1.2.1.6]
 scalars:
   # Segments: volume since the previous poll and per-second rate.
-  - { name: tcpInSegs, oid: 1.3.6.1.2.1.6.10.0, modes: [rate, volume] }
+  - { name: tcpInSegs, oid: 1.3.6.1.2.1.6.10.0, modes: [rate, volume], unit: segment }
   # Gauge: current established connections.
-  - { name: tcpCurrEstab, oid: 1.3.6.1.2.1.6.9.0 }
+  - { name: tcpCurrEstab, oid: 1.3.6.1.2.1.6.9.0, unit: connection }
 ```
 
 A table without label: columns are walked on every poll and `include` matches the row index
@@ -779,13 +809,14 @@ detect: [1.3.6.1.4.1.2021.10]
 tables:
   - name: load
     columns:
-      # laLoadInt is the load average times 100 (1, 5 and 15 minutes).
+      # laLoadInt is the load average times 100 (1, 5 and 15 minutes): the
+      # average number of processes running or waiting.
       - { name: laLoadInt, oid: 1.3.6.1.4.1.2021.10.1.5, emit: false }
-      - { name: loadAverage, formula: "laLoadInt / 100" }
+      - { name: loadAverage, formula: "laLoadInt / 100", unit: process }
   - name: udpListeners
     include: ['^1\.4\.0\.0\.0\.0\.']   # IPv4 0.0.0.0 listeners only
     columns:
-      - { name: udpEndpointProcess, oid: 1.3.6.1.2.1.7.7.1.8 }
+      - { name: udpEndpointProcess, oid: 1.3.6.1.2.1.7.7.1.8, unit: enum }   # a process id
 ```
 
 A labelled table filtered at discovery, with extra discovery scalars:
@@ -800,14 +831,14 @@ discovery:
   columns:
     upsInputLineIndex: 1.3.6.1.2.1.33.1.3.3.1.1
 scalars:
-  - { name: upsBatteryStatus, oid: 1.3.6.1.2.1.33.1.2.1.0 }
-  - { name: upsEstimatedChargeRemaining, oid: 1.3.6.1.2.1.33.1.2.4.0 }
+  - { name: upsBatteryStatus, oid: 1.3.6.1.2.1.33.1.2.1.0, unit: enum }
+  - { name: upsEstimatedChargeRemaining, oid: 1.3.6.1.2.1.33.1.2.4.0, unit: percent }
 tables:
   - name: ups_input
     label: upsInputLineIndex
     include: ["^[12]$"]                  # first two input lines only
     columns:
-      - { name: upsInputVoltage, oid: 1.3.6.1.2.1.33.1.3.3.1.3 }
+      - { name: upsInputVoltage, oid: 1.3.6.1.2.1.33.1.3.3.1.3, unit: volt }
 ```
 
 ## Sinks

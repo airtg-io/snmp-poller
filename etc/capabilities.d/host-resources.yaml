@@ -4,12 +4,13 @@
 # (detected at discovery). Its hrSystemUptime is the preferred source of the
 # `uptime` metric of the "system" capability.
 #
-# Every size is sent in bytes: the agent counts storage in allocation units
-# (hrStorageAllocationUnits bytes each) and memory in KiB, so the raw
-# columns are inputs only (`emit: false`) and the formulas below compute the
-# bytes and percentages, per row. A formula reads the values of the same
-# poll defined above it; when one is missing, or a size is 0, it gives no
-# sample.
+# Values are sent as the agent reports them, in its units: memory in
+# kilobytes (hrMemorySize, UNITS "KBytes"), storage in allocation units of
+# hrStorageAllocationUnits bytes each. Per storage row, formulas also give
+# the size, used and free space in bytes (allocation units x bytes per
+# allocation unit) and the used and free percentages. A formula reads the
+# values of the same poll defined above it; when one is missing, or a size
+# is 0, it gives no sample.
 description: HOST-RESOURCES-MIB processes, memory, storage and processor load
 
 detect:
@@ -22,21 +23,20 @@ discovery:
     hrDeviceDescr:  1.3.6.1.2.1.25.3.2.1.3   # e.g. the processor model
 
 scalars:
-  - { name: hrSystemProcesses, oid: 1.3.6.1.2.1.25.1.6.0, unit: processes }
-  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: KiB, emit: false }
-  - { name: memorySize, formula: "hrMemorySize * 1024", unit: bytes }
+  - { name: hrSystemProcesses, oid: 1.3.6.1.2.1.25.1.6.0, unit: process }
+  - { name: hrMemorySize, oid: 1.3.6.1.2.1.25.2.2.0, unit: kilobyte }
 
 tables:
   - name: storage
     label: hrStorageDescr
     labels: [hrStorageType]
     columns:
-      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: bytes, emit: false }
-      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation units, emit: false }
-      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation units, emit: false }
-      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: bytes }
-      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: bytes }
-      - { name: storageFree, formula: "storageSize - storageUsed", unit: bytes }
+      - { name: hrStorageAllocationUnits, oid: 1.3.6.1.2.1.25.2.3.1.4, unit: byte }
+      - { name: hrStorageSize, oid: 1.3.6.1.2.1.25.2.3.1.5, unit: allocation unit }
+      - { name: hrStorageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation unit }
+      - { name: storageSize, formula: "hrStorageSize * hrStorageAllocationUnits", unit: byte }
+      - { name: storageUsed, formula: "hrStorageUsed * hrStorageAllocationUnits", unit: byte }
+      - { name: storageFree, formula: "storageSize - storageUsed", unit: byte }
       - { name: storageUsedPercent, formula: "storageUsed * 100 / storageSize", unit: percent }
       - { name: storageFreePercent, formula: "storageFree * 100 / storageSize", unit: percent }
 

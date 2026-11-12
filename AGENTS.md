@@ -38,10 +38,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   excluded, not itself replaced; names checked, no cycles) - the only two ways to remove one. Devices may override a table's
   `include` with `include: {table: [...]}`. Names are unique across capabilities; labels must
   come from the same capability. Shipped: `system` (always; sysDescr, sysObjectID, sysUpTime,
-  sysContact, sysName, sysLocation as discovery scalars; polled: `uptime` = hrSystemUptime if
+  sysContact, sysName, sysLocation as discovery scalars; polled, in seconds by formula from
+  TimeTicks inputs `uptimeTicks`/`sysUpTimeTicks` (emit false): `uptime` = hrSystemUptime if
   the agent has it, else sysUpTime (sysUpTime is the agent's uptime, not the system's), and
   sysUpTime), `interfaces` (always), `entity` (detected), `host-resources` (detected:
-  hrSystemProcesses, memorySize, hrStorageTable size/used/free in bytes + used/free percent,
+  hrSystemProcesses, hrMemorySize in kilobyte, hrStorageTable raw size/used in allocation
+  unit + allocation units in byte, and formulas size/used/free in byte + used/free percent,
   hrProcessorLoad), `cisco-cpu` (detected: CISCO-PROCESS-MIB cpmCPUTotal5sec/1min/5minRev per
   CPU, per Cisco doc 15215; deprecated non-Rev objects not polled; rows named `cpuName` =
   entPhysicalName via cpmCPUTotalPhysicalIndex), `cisco-enhanced-mempool` (detected,
@@ -49,8 +51,8 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   and its fallback `cisco-memory-pool` (CISCO-MEMORY-POOL-MIB, `replaced_by` the enhanced one:
   never both), `juniper-cpu` / `juniper-memory` (detected: JUNIPER-MIB jnxOperatingTable,
   rows labelled jnxOperatingDescr, `include` Routing Engine/FPC only (other rows report 0);
-  jnxOperatingCPU + 1/5/15MinAvgCPU (recent MIB, missing on old Junos); memory MiB and
-  Buffer percent -> jnxMemorySize/jnxMemoryUsed bytes, Heap percent). A discovery column is an OID, `{oid, index}` (read at the index held by another
+  jnxOperatingCPU + 1/5/15MinAvgCPU (recent MIB, missing on old Junos); jnxOperatingMemory
+  megabyte, Buffer percent -> jnxMemoryUsed megabyte, Heap percent). A discovery column is an OID, `{oid, index}` (read at the index held by another
   discovery column of the same capability, itself without `index`) or `{oid, index_part: n}`
   (rows of oid, value = n-th sub-id of the row index), for cross-table names.
 - **Formulas, units, fallbacks**: a scalar is exactly one of `oid`, `oids` (candidates in
@@ -60,8 +62,16 @@ Keep it current when features are added or changed. User-facing docs live in `RE
   for columns) make every computation visible in the config. Exact `big.Rat` arithmetic;
   result float64 iff the formula has `/` or a decimal number, else int64 (type never flips);
   missing input or division by zero = no sample. Always raw (no modes), Sample.Type `Formula`.
-  `emit: false` = input only. `unit` is passed to Sample.Unit (`/s` appended for rate). Every
-  size is sent in bytes: convert device units (KiB, allocation units) with formulas.
+  `emit: false` = input only. `unit` is passed to Sample.Unit (`/s` appended for rate).
+- **Units** (user decision, every AIrtg collector): every emitted scalar/column must have a
+  `unit` (validated at load, `checkUnit`): the unit the device reports the value in, a word of
+  `schema.Units` (`schema.ValidUnit`; lowercase singular: octet, packet, byte, kilobyte,
+  megabyte, allocation unit, percent, second, enum, ...), `none` for a string (sent as "");
+  a unit already ending in `/s` cannot have mode rate. Values are never normalized across
+  products (Cisco bytes stay `byte`, Juniper megabytes `megabyte`): no scaling-only formulas;
+  formulas keep the unit of their inputs or their combination (allocation unit x byte =
+  `byte`); source values are emitted, not hidden. Only TimeTicks are converted, to `second`.
+  The unit names what the MIB counts (`ifInOctets` in `octet`). README "Units".
 - **Reload**: `global.hot_reload` (default true) checks the files' fingerprint every 2s
   (`Config.DiskFingerprint` vs `Fingerprint`, change applied once stable for one check);
   SIGHUP (`Poller.Reload`) reloads in any case. New config fully validated (Load, outputs,

@@ -39,8 +39,8 @@ var caps = map[string]string{
 discovery:
   scalars: { sysName: 1.3.6.1.2.1.1.5.0, sysLocation: 1.3.6.1.2.1.1.6.0 }
 scalars:
-  - { name: uptime, oid: 1.3.6.1.2.1.1.3.0 }
-  - { name: sysDescr, oid: 1.3.6.1.2.1.1.1.0 }
+  - { name: uptime, oid: 1.3.6.1.2.1.1.3.0, unit: second }
+  - { name: sysDescr, oid: 1.3.6.1.2.1.1.1.0, unit: none }
 `,
 	"interfaces": `
 discovery:
@@ -50,8 +50,8 @@ tables:
     label: ifDescr
     labels: [ifAlias]
     columns:
-      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, modes: [rate, volume] }
-      - { name: ifOperStatus, oid: 1.3.6.1.2.1.2.2.1.8 }
+      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, modes: [rate, volume], unit: octet }
+      - { name: ifOperStatus, oid: 1.3.6.1.2.1.2.2.1.8, unit: enum }
 `,
 	"storage": `
 discovery:
@@ -59,7 +59,7 @@ discovery:
 tables:
   - name: storage
     label: hrStorageDescr
-    columns: [{ name: storageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6 }]
+    columns: [{ name: storageUsed, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation unit }]
 `,
 }
 

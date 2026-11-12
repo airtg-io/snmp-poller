@@ -12,14 +12,14 @@ const ifCap = `
 discovery:
   scalars: { sysName: 1.3.6.1.2.1.1.5.0 }
   columns: { ifDescr: 1.3.6.1.2.1.2.2.1.2, ifAlias: 1.3.6.1.2.1.31.1.1.1.18, ifSpeed: 1.3.6.1.2.1.2.2.1.5 }
-scalars: [{ name: uptime, oid: 1.3.6.1.2.1.1.3.0 }]
+scalars: [{ name: uptime, oid: 1.3.6.1.2.1.1.3.0, unit: second }]
 tables:
   - name: interfaces
     label: ifDescr
     labels: [ifAlias]
     columns:
-      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, modes: [rate, volume] }
-      - { name: ifSpeed, oid: 1.3.6.1.2.1.2.2.1.5 }
+      - { name: ifInOctets, oid: 1.3.6.1.2.1.2.2.1.10, modes: [rate, volume], unit: octet }
+      - { name: ifSpeed, oid: 1.3.6.1.2.1.2.2.1.5, unit: bit/s }
 `
 
 const storageCap = `
@@ -28,7 +28,7 @@ discovery:
 tables:
   - name: storage
     label: hrStorageDescr
-    columns: [{ name: used, oid: 1.3.6.1.2.1.25.2.3.1.6 }]
+    columns: [{ name: used, oid: 1.3.6.1.2.1.25.2.3.1.6, unit: allocation unit }]
 `
 
 func parseSinks(t *testing.T, sinks string) (*Config, error) {
@@ -199,8 +199,8 @@ func TestAirtgSink(t *testing.T) {
 }
 
 func TestPrometheusNameCollision(t *testing.T) {
-	both := map[string]string{"a.yaml": `tables: [{ name: ta, columns: [{ name: used, oid: 1.3.6.1.2 }] }]`,
-		"b.yaml": `tables: [{ name: tb, columns: [{ name: used, oid: 1.3.6.1.3 }] }]`}
+	both := map[string]string{"a.yaml": `tables: [{ name: ta, columns: [{ name: used, oid: 1.3.6.1.2, unit: allocation unit }] }]`,
+		"b.yaml": `tables: [{ name: tb, columns: [{ name: used, oid: 1.3.6.1.3, unit: allocation unit }] }]`}
 	_, err := parseWith(t, `sinks: [{ id: p, type: prometheus, url: "http://p/w" }]`, both)
 	if err == nil || !strings.Contains(err.Error(), `metric snmp_used is emitted by table "ta" of capability "a" and table "tb" of capability "b"`) {
 		t.Errorf("err = %v", err)

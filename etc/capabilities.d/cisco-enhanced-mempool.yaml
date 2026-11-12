@@ -38,10 +38,10 @@ tables:
     high_capacity:
       probe: 1.3.6.1.4.1.9.9.221.1.1.1.1.18           # cempMemPoolHCUsed.<first pool>
     columns:
-      - { name: cempMemPoolUsed,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: bytes }
-      - { name: cempMemPoolFree,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.8, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.20, unit: bytes }
+      - { name: cempMemPoolUsed,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.7, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.18, unit: byte }
+      - { name: cempMemPoolFree,        oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.8, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.20, unit: byte }
       # Largest contiguous free block: fragmentation shows as a low value
       # next to a high cempMemPoolFree.
-      - { name: cempMemPoolLargestFree, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.9, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.22, unit: bytes }
+      - { name: cempMemPoolLargestFree, oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.9, hc_oid: 1.3.6.1.4.1.9.9.221.1.1.1.1.22, unit: byte }
       # Used + Free is the size of the pool.
       - { name: cempMemPoolUsedPercent, formula: "cempMemPoolUsed * 100 / (cempMemPoolUsed + cempMemPoolFree)", unit: percent }

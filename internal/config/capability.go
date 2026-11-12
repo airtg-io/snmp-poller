@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/airtg-io/schema"
 	"gopkg.in/yaml.v3"
 )
 
@@ -377,6 +378,12 @@ func checkCapability(f CapabilityFile) error {
 		if err := checkModes(sc.Modes); err != nil {
 			add("scalar %q: %w", sc.Name, err)
 		}
+		if err := checkUnit(sc.Unit, sc.Emitted(), sc.Modes); err != nil {
+			add("scalar %q: %w", sc.Name, err)
+		}
+		if sc.Formula != "" && sc.Unit == UnitNone {
+			add("scalar %q: a formula gives a number: its unit cannot be none", sc.Name)
+		}
 	}
 	tables := map[string]bool{}
 	isColumn := func(name string) bool { _, ok := f.Discovery.Columns[name]; return ok }
@@ -442,6 +449,12 @@ func checkCapability(f CapabilityFile) error {
 				add("table %q: column %q: invalid hc_oid %q", t.Name, col.Name, col.HCOID)
 			case col.HCOID != "" && t.HighCapacity == nil:
 				add("table %q: column %q: hc_oid requires high_capacity on the table", t.Name, col.Name)
+			}
+			if err := checkUnit(col.Unit, col.Emitted(), col.Modes); err != nil {
+				add("table %q: column %q: %w", t.Name, col.Name, err)
+			}
+			if col.Formula != "" && col.Unit == UnitNone {
+				add("table %q: column %q: a formula gives a number: its unit cannot be none", t.Name, col.Name)
 			}
 			cols[col.Name] = true
 			if err := checkModes(col.Modes); err != nil {
@@ -644,4 +657,26 @@ func compile(patterns []string) []*regexp.Regexp {
 		res = append(res, regexp.MustCompile(p)) // already checked
 	}
 	return res
+}
+
+// UnitNone is the unit of an emitted value that has none: a string. It is
+// sent as an empty unit.
+const UnitNone = "none"
+
+// checkUnit checks a metric's unit: required on every emitted value, from
+// the AIrtg unit vocabulary (schema.Units), as the source reports it.
+func checkUnit(unit string, emitted bool, modes []Mode) error {
+	switch {
+	case unit == "" && emitted:
+		return errors.New(`unit is required: the unit the device reports the value in, from the AIrtg ` +
+			`vocabulary (e.g. octet, packet, percent, second, kilobyte; "none" for a string)`)
+	case unit == "" || unit == UnitNone:
+		return nil
+	case !schema.ValidUnit(unit):
+		return fmt.Errorf("unit %q is not in the AIrtg unit vocabulary: lowercase singular words such as "+
+			"octet, packet, byte, kilobyte, percent, second, enum, with /s for a rate (see README, Units)", unit)
+	case strings.HasSuffix(unit, "/s") && slices.Contains(modes, ModeRate):
+		return fmt.Errorf("unit %q is already per second: mode rate would append another /s", unit)
+	}
+	return nil
 }
