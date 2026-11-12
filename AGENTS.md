@@ -205,15 +205,12 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 
 ## Testing notes
 
+- End-to-end testing (real net-snmp agent, real backends, NATS): the `e2e` skill,
+  `.claude/skills/e2e/SKILL.md`.
 - `internal/testagent` (GoSNMPServer) has quirks: 0-based error index, `noSuchName` on v2c.
   Keep the GET fallbacks; do not "fix" tests around them.
-- For a real-agent E2E without root: `apt-get download snmpd snmp libsnmp40t64 libsnmp-base`,
-  `dpkg -x` each into a scratch dir, run `snmpd -C -c <conf> -I -smux` on a high port with
-  `LD_LIBRARY_PATH`, `SNMP_PERSISTENT_DIR` and `MIBS=""` set. net-snmp supports every v3
-  combination above (AES192/256 = Blumenthal), and contexts via `access ... <context> ...`.
 - Never commit a sealed shipped file or a local `etc/conf.d/*.yaml` (`TestDefaultConfigFileNotSealed`,
-  `.gitignore`). For E2E, copy `etc/` to a scratch dir, add `etc/conf.d/devices.yaml` there, and
-  run the package (`go run ./cmd/snmp-poller` or a built binary), not `main.go` alone.
+  `.gitignore`).
 - Config tests never read local `etc/conf.d` files: they copy the shipped files to a temp dir
   (`shippedDir`). README ```yaml blocks: `# capabilities.d/<n>.yaml` = capability,
   `# conf.d/<n>.yaml` = include file (checked with the shipped main), `# prometheus.yml` =
@@ -221,21 +218,10 @@ Keep it current when features are added or changed. User-facing docs live in `RE
 - Sink tests decode requests with independent parsers (`protowire`, InfluxData's
   `line-protocol/v2`), test-only dependencies; poller tests inject fake sinks with
   `WithSinkFactory`.
-- Real-backend E2E (user approved, auto mode blocks it otherwise): the dev box is **arm64**
-  and /tmp is a small tmpfs, so put the linux-arm64 releases of Prometheus (with
-  `--web.enable-remote-write-receiver`), InfluxDB 3 Core (`influxdb3 create token --admin`)
-  and Grafana under `~/.cache/snmp-poller-e2e`. Kill servers with `pgrep -f "[p]attern"`,
-  never a bare pattern (it matches the calling shell).
 - `testagent.Agent.BulkRequests()` counts GETBULK requests (proves `walk: getnext`).
 - No C compiler on the dev box, so `-race` is unavailable; use `go test -count=5 ./...` for flakes.
 - airtg sink tests run an embedded `nats-server` (test-only dependency) and point
-  `AnalyzerURL` at it. For a real E2E: `go build -o ~/.cache/snmp-poller-e2e/bin/nats-server
-  github.com/nats-io/nats-server/v2` (pinned in go.mod), run it with `-a 127.0.0.1 -p 4222 -js
-  -sd <dir>`, plus a small consumer (scratch module requiring the schema and nats.go) that
-  creates a stream on `airtg.v1.>` and decodes envelopes. net-snmp is extracted under
-  `~/.cache/snmp-poller-e2e/net-snmp/root`; give snmpd its address on the command line only
-  (an `agentaddress` line too makes it fail to bind). After a run, the device file holds the
-  encrypted community: restore it in clear text when wiping `data/`.
+  `AnalyzerURL` at it.
 
 ## Layout
 
