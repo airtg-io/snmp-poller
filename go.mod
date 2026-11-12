@@ -3,7 +3,7 @@ module github.com/airtg-io/snmp-poller
 go 1.27.3
 
 require (
-	github.com/airtg-io/schema v0.1.0
+	github.com/airtg-io/schema v0.2.1
 	github.com/golang/snappy v1.0.0
 	github.com/gosnmp/gosnmp v1.47.0
 	github.com/influxdata/line-protocol/v2 v2.2.1

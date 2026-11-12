@@ -32,7 +32,7 @@ AIrtg snmp-poller: a fast, free and open source SNMP poller for AIrtg, written i
 - **Useful logs**: one stats line per minute, failures logged once per device, per-device tracing,
   console + auto-rotated file. **Credentials are never logged.**
 
-Licensed under the GNU GPL v3 (see [LICENSE](LICENSE)).
+Copyright (C) 2026 AIrtg Solutions, inc. Licensed under the GNU GPL v3 (see [LICENSE](LICENSE)).
 
 ## Contents
 
